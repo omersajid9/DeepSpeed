@@ -2,7 +2,8 @@
 
 Status: phases 0-2 and 4 implemented (graph-safe blocked decode), plus sampling in chunked prefill.
 Phase 3 is implemented for paged prefill and chunked paged prefill (one request at a time; mixed
-prefill+decode in one forward remains open). Phase 5 block hashing and ref-counted block sharing are
+prefill+decode in one forward remains open). It is opt-in via `enable_paged_prefill`; the previous
+dense-staging graph prefill remains available. Phase 5 block hashing and ref-counted block sharing are
 implemented; weight-version salts, `prefix_id` sessions, and cross-cache reuse remain open.
 Owner: rollout/graph workstream.
 Target: `deepspeed/runtime/rollout/` on the hybrid-engine path, for RL/distillation training.
@@ -86,6 +87,9 @@ Measured on Qwen3-4B, A40, bf16, no graph capture, paged cache, chunk 512, 8 new
 | 6k, batch 2, duplicate prompts | paged, prefix reuse | 1269.7 | 13 | 1875.8 | 9521.3 | `5530534d…` |
 
 The duplicate-prefix run reused 95 blocks / 6080 tokens and cut prefill forwards from 24 to 13.
+With graph capture, chunked prefill, and the sampler on the 6k four-way path, paged prefill is
+822.7 ms versus 1381.6 ms for dense-staging + copy; total is 1233.8 ms versus 1809.2 ms
+(tok/s 12.97 versus 8.84), with token-identical output (`d4a324e9…`).
 Peak memory did not drop because `PagedAttentionCache` sizes the `BlockedKVCache` pool for the
 full per-row block table; prefix reuse saves prefill compute and KV writes, not pool capacity.
 

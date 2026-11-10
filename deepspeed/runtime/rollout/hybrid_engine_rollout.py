@@ -141,6 +141,7 @@ class HybridEngineRolloutConfig:
     graph_capture_batch_sizes: Optional[Tuple[int, ...]] = None
     use_paged_cache: bool = False
     paged_block_size: Optional[int] = None
+    enable_paged_prefill: bool = False
     enable_prefix_reuse: bool = False
 
 
@@ -293,6 +294,7 @@ class HybridEngineRollout(RolloutEngine):
         self.graph_capture_batch_sizes = getattr(cfg, 'graph_capture_batch_sizes', None) if cfg else None
         self.use_paged_cache = getattr(cfg, 'use_paged_cache', False) if cfg else False
         self.paged_block_size = getattr(cfg, 'paged_block_size', None) if cfg else None
+        self.enable_paged_prefill = getattr(cfg, 'enable_paged_prefill', False) if cfg else False
         self.enable_prefix_reuse = getattr(cfg, 'enable_prefix_reuse', False) if cfg else False
         self._last_profile = None
         self._continuous_graph_state = None
@@ -1536,7 +1538,7 @@ class HybridEngineRollout(RolloutEngine):
         if not update.admitted:
             return {}, None
 
-        if self.use_paged_cache:
+        if self.use_paged_cache and self.enable_paged_prefill:
             if target_slots is None:
                 target_slots = update.admitted_slots
             admitted_ids = tuple(request.request_id for request in update.admitted)
