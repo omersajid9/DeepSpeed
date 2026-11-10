@@ -73,9 +73,15 @@ class PagedAttentionCache:
         self.dtype = dtype
         self.max_cache_len = int(max_cache_len)
         self.max_batch_size = int(batch_size)
-        self.block_size = int(block_size) if block_size is not None else get_kv_block_size(self.head_dim)
-        if self.block_size <= 0:
-            raise ValueError("block_size must be positive")
+        expected_block_size = get_kv_block_size(self.head_dim)
+        if block_size is None:
+            self.block_size = expected_block_size
+        else:
+            self.block_size = int(block_size)
+            if self.block_size != expected_block_size:
+                raise ValueError(
+                    f"blocked attention requires block_size={expected_block_size} for head_dim={self.head_dim}, "
+                    f"got {self.block_size}")
         self.max_blocks_per_row = (self.max_cache_len + self.block_size - 1) // self.block_size
         num_blocks = self.max_batch_size * self.max_blocks_per_row
 
