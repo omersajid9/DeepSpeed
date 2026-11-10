@@ -1,8 +1,39 @@
 # Paged attention for the rollout — plan
 
-Status: plan, nothing implemented. Owner: rollout/graph workstream.
+Status: phases 0-2 implemented (blocked decode path). Prefill still uses the dense static cache and
+copies into blocks; phases 3 (paged prefill/mixed), 4 (graphs), and 5 (prefix reuse) remain.
+Owner: rollout/graph workstream.
 Target: `deepspeed/runtime/rollout/` on the hybrid-engine path, for RL/distillation training.
 Read with: `plans/../optimization_strategy.md` §3.4.2, §4.1, §9 (R2/R8/R17/R20/R21) and `cuda-graph-sampling-v2.md`.
+
+---
+
+## 0 · Implementation status and 6k profile
+
+Implemented in `deepspeed/runtime/rollout/paged_cache.py`:
+
+- `PagedAttentionCache`: `BlockedKVCache`/`BlockedAllocator`, per-row `block_ids` table, grow-on-boundary
+  allocation, retire/free, dense-prefill copy, and blocked-flash decode.
+- Qwen3 attention shim: decodes with `BlockedFlashAttn`; falls back to the original HF attention for the
+  dense prefill/staging cache.
+- `HybridEngineRolloutConfig(use_paged_cache=True, paged_block_size=None)`; the benchmark flag is
+  `--use-paged-cache`. Paged decode requires continuous batching and currently excludes graph capture,
+  aligned decode fronts, and unaligned trimming (phases 3-4).
+- Atoms and block allocation are built once per decode step, not once per layer.
+
+Measured on Qwen3-4B, A40, bf16, LongBench prompt truncated to 6144 tokens, batch 1, 16 new tokens,
+no graph capture, warmup 1 (`runs/paged_attention_6k.md`):
+
+| path | prefill ms | decode ms/token | total ms | peak MiB | token SHA |
+|---|---:|---:|---:|---:|---|
+| dense static cache | 714.5 | 51.59 | 1513.8 | 9931.1 | `d4a324e9…` |
+| paged decode | 713.5 | 45.70 | 1507.2 | 9938.7 | `d4a324e9…` |
+
+The blocked kernel is faster per layer (0.167 ms vs 0.346 ms for dense SDPA with the decode mask), so
+decode improves 11.4% and the response tokens are identical. The plan's 66.5 → 25 ms target is not met:
+the measured dense baseline is 51.6 ms, the paged path saves ~6 ms of attention, and the remaining forward
+floor is model/MLP/CPU time. Phase 4 (graphs) is the likely route to the 25 ms target; phase 3 is still
+needed before paged prefill can replace the dense prefill copy.
 
 ---
 
