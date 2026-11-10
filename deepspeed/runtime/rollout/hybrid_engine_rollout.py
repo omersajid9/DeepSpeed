@@ -37,6 +37,7 @@ from deepspeed.runtime.rollout.sampling import sample
 from deepspeed.utils import logger
 
 
+@torch._dynamo.disable
 class _ForwardProfiler:
     """Measure top-level model forwards without synchronizing each call."""
 
