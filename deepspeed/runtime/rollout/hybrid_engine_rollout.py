@@ -22,6 +22,7 @@ Generation paths:
      models or option combinations the paths above do not cover.
 """
 
+import hashlib
 import time
 from copy import copy
 from dataclasses import dataclass, field
@@ -63,7 +64,7 @@ class _ForwardProfiler:
             return None, None, 0
 
         if not self.use_host_timer:
-            torch.cuda.synchronize()
+            get_accelerator().synchronize()
         durations = [self._elapsed_time(start, end) for start, end in self.measurements]
         return durations[0], sum(durations[1:]), len(durations) - 1
 
@@ -167,6 +168,10 @@ class HybridEngineRolloutConfig:
     enable_chunked_prefill: bool = False
     prefill_chunk_size: int = 512
     graph_capture_batch_sizes: Optional[Tuple[int, ...]] = None
+    use_paged_cache: bool = False
+    paged_block_size: Optional[int] = None
+    enable_paged_prefill: bool = False
+    enable_prefix_reuse: bool = False
     enable_compiled_sampler: bool = False
 
 
@@ -317,6 +322,10 @@ class HybridEngineRollout(RolloutEngine):
         self.enable_chunked_prefill = getattr(cfg, 'enable_chunked_prefill', False) if cfg else False
         self.prefill_chunk_size = getattr(cfg, 'prefill_chunk_size', 0) if cfg else 0
         self.graph_capture_batch_sizes = getattr(cfg, 'graph_capture_batch_sizes', None) if cfg else None
+        self.use_paged_cache = getattr(cfg, 'use_paged_cache', False) if cfg else False
+        self.paged_block_size = getattr(cfg, 'paged_block_size', None) if cfg else None
+        self.enable_paged_prefill = getattr(cfg, 'enable_paged_prefill', False) if cfg else False
+        self.enable_prefix_reuse = getattr(cfg, 'enable_prefix_reuse', False) if cfg else False
         self.enable_compiled_sampler = getattr(cfg, 'enable_compiled_sampler', False) if cfg else False
         if self.enable_compiled_sampler:
             configure_compiled_sampler(True)
@@ -324,11 +333,16 @@ class HybridEngineRollout(RolloutEngine):
         self._continuous_graph_state = None
         self._last_continuous_stats = None
         self._chunked_prefill_warned = False
+        if self.use_paged_cache:
+            from deepspeed.runtime.rollout.paged_cache import install_paged_attention
+            install_paged_attention(self.engine.module)
 
     @torch.no_grad()
     def generate(self, request: RolloutRequest, sampling: SamplingConfig) -> RolloutBatch:
         if sampling.continuous_batch_size is not None:
             return self._generate_continuous(request, sampling, sampling.continuous_batch_size)
+        if self.use_paged_cache:
+            raise ValueError("paged cache requires continuous batching (set SamplingConfig.continuous_batch_size)")
 
         device = request.prompt_ids.device
         B = request.prompt_ids.shape[0]
@@ -578,18 +592,37 @@ class HybridEngineRollout(RolloutEngine):
         self._profile_end(profile, "scheduler_overhead_ms", scheduler_start)
 
         cache_start = self._profile_start(profile)
-        # Layers are sized by the first prefill because AutoTP shards KV heads per rank.
-        cache = DeepSpeedStaticCache(module.config, max_cache_len=max_cache_len)
+        if self.use_paged_cache:
+            from deepspeed.runtime.rollout.paged_cache import PagedAttentionCache
+            cache = PagedAttentionCache(
+                module.config,
+                batch_size=max_batch_size,
+                max_cache_len=max_cache_len,
+                device=device,
+                dtype=model_dtype,
+                block_size=self.paged_block_size,
+            )
+        else:
+            # Layers are sized by the first prefill because AutoTP shards KV heads per rank.
+            cache = DeepSpeedStaticCache(module.config, max_cache_len=max_cache_len)
         write_positions = torch.full((max_batch_size, ), -1, dtype=torch.long, device=device)
         cache.set_write_position(write_positions)
         attention_mask = torch.zeros((max_batch_size, max_cache_len), dtype=torch.long, device=device)
         stats = {
-            "cache_capacity": max_cache_len,
-            "peak_cache_length": prompt_len,
-            "trim_count": 0,
-            "trimmed_columns": 0,
-            "trim_latency_ms": 0.0,
-            "decode_steps": 0,
+            "cache_capacity":
+            max_cache_len,
+            "peak_cache_length":
+            prompt_len,
+            "trim_count":
+            0,
+            "trimmed_columns":
+            0,
+            "trim_latency_ms":
+            0.0,
+            "decode_steps":
+            0,
+            "paged_cache":
+            self.use_paged_cache,
         }
         next_tokens = {}
         next_logprobs = {}
@@ -654,10 +687,16 @@ class HybridEngineRollout(RolloutEngine):
                     if profile_accelerator is not None:
                         profile_accelerator.synchronize()
                         trim_start = time.perf_counter()
-                    moved_bytes = sum((layer.keys[:, :, dead_prefix:, :].numel() * layer.keys.element_size() +
-                                       layer.values[:, :, dead_prefix:, :].numel() * layer.values.element_size())
-                                      for layer in cache.layers)
-                    moved_bytes += attention_mask[:, dead_prefix:].numel() * attention_mask.element_size()
+                    if self.use_paged_cache:
+                        if dead_prefix % cache.block_size:
+                            raise RuntimeError("paged cache trimming must be block aligned; increase "
+                                               "continuous_cache_capacity or disable trimming")
+                        moved_bytes = 0
+                    else:
+                        moved_bytes = sum((layer.keys[:, :, dead_prefix:, :].numel() * layer.keys.element_size() +
+                                           layer.values[:, :, dead_prefix:, :].numel() * layer.values.element_size())
+                                          for layer in cache.layers)
+                        moved_bytes += attention_mask[:, dead_prefix:].numel() * attention_mask.element_size()
                     cache.trim_left(dead_prefix)
                     remaining_columns = max_cache_len - dead_prefix
                     if remaining_columns:
@@ -759,25 +798,40 @@ class HybridEngineRollout(RolloutEngine):
                         raise self._continuous_cache_exhaustion_error(max_cache_len)
                     attention_mask[decodable_rows, row_positions[decodable_rows]] = 1
                     decode_cache_position = latest_position.reshape(1)
-                if self.align_decode_fronts:
-                    position_ids = torch.tensor([logical_positions[request_id] for request_id in active_ids],
-                                                dtype=torch.long,
-                                                device=device).unsqueeze(1)
+                if self.use_paged_cache:
+                    model_input = decode_input[decodable_rows]
+                    model_positions = row_positions[decodable_rows]
+                    cache.set_active_rows(decodable_rows)
+                    model_attention_mask = {"full_attention": None, "sliding_attention": None}
+                    model_position_ids = model_positions.unsqueeze(1)
+                    model_cache_position = model_positions
                 else:
-                    position_ids = attention_mask[:active_count].sum(dim=1, keepdim=True)
+                    model_input = decode_input
+                    model_attention_mask = attention_mask[:active_count]
+                    if self.align_decode_fronts:
+                        model_position_ids = torch.tensor([logical_positions[request_id] for request_id in active_ids],
+                                                          dtype=torch.long,
+                                                          device=device).unsqueeze(1)
+                    else:
+                        model_position_ids = attention_mask[:active_count].sum(dim=1, keepdim=True)
+                    model_cache_position = decode_cache_position
                 decode_start = self._profile_start(profile)
                 output = self._call_model(
                     module,
-                    decode_input,
-                    attention_mask=attention_mask[:active_count],
+                    model_input,
+                    attention_mask=model_attention_mask,
                     past_key_values=cache,
                     use_cache=True,
-                    cache_position=decode_cache_position,
-                    position_ids=position_ids,
+                    cache_position=model_cache_position,
+                    position_ids=model_position_ids,
                 )
                 self._profile_end(profile, "decode_forward_ms", decode_start, count="num_decode_forwards")
+                if self.use_paged_cache:
+                    decode_logits = output.logits[:, -1, :]
+                else:
+                    decode_logits = output.logits[decodable_rows, -1, :]
                 decoded, decoded_logprobs = self._continuous_next_tokens(
-                    output.logits[decodable_rows, -1, :],
+                    decode_logits,
                     decodable_ids,
                     request_by_id,
                     responses,
@@ -831,6 +885,12 @@ class HybridEngineRollout(RolloutEngine):
         stats["trim_frequency"] = (stats["trim_count"] / stats["decode_steps"] if stats["decode_steps"] else 0.0)
         stats["chunked_prefill_chunks"] = chunk_stats["chunks"]
         stats["chunked_prefill_staging_bytes"] = chunk_stats["peak_staging_bytes"]
+        if self.use_paged_cache:
+            stats["paged_block_size"] = cache.block_size
+            stats["blocks_in_use"] = cache.blocks_in_use
+            stats["block_utilization"] = cache.blocks_in_use / cache.block_ids.numel()
+            stats["prefix_reuse_blocks"] = getattr(cache, "prefix_reuse_blocks", 0)
+            stats["prefix_reuse_tokens"] = getattr(cache, "prefix_reuse_tokens", 0)
         self._last_continuous_stats = stats
         if profile is not None:
             self._finish_continuous_profile(profile, original_request, responses, max_batch_size, prompt_len,
@@ -1105,6 +1165,13 @@ class HybridEngineRollout(RolloutEngine):
             stats["prefill_bucket_steps"] = chunk_stats.get("graph_steps", 0)
             stats["prefill_padded_rows"] = chunk_stats.get("padded_rows", 0)
             stats["prefill_bucket_widths"] = dict(chunk_stats.get("bucket_widths", {}))
+        if self.use_paged_cache:
+            stats["paged_cache"] = True
+            stats["paged_block_size"] = cache.block_size
+            stats["blocks_in_use"] = cache.blocks_in_use
+            stats["block_utilization"] = cache.blocks_in_use / cache.block_ids.numel()
+            stats["prefix_reuse_blocks"] = getattr(cache, "prefix_reuse_blocks", 0)
+            stats["prefix_reuse_tokens"] = getattr(cache, "prefix_reuse_tokens", 0)
         self._last_continuous_stats = stats
         if profile is not None:
             self._finish_continuous_profile(profile, original_request, responses, max_batch_size, prompt_len,
@@ -1160,10 +1227,23 @@ class HybridEngineRollout(RolloutEngine):
         ladder = self._graph_capture_ladder(max_batch_size, self.graph_capture_batch_sizes)
         signature = self._continuous_graph_signature(module, max_batch_size, prompt_len, max_cache_len, device,
                                                      model_dtype, ladder)
+        signature = signature + (self.use_paged_cache, self.paged_block_size)
         state = self._continuous_graph_state
         if state is None or state.signature != signature:
-            # Capture sizes the layers from the model's local KV tensors.
-            cache = cache_type(module.config, max_cache_len=max_cache_len)
+            if self.use_paged_cache:
+                from deepspeed.runtime.rollout.paged_cache import PagedAttentionCache
+                cache = PagedAttentionCache(
+                    module.config,
+                    batch_size=max_batch_size,
+                    max_cache_len=max_cache_len,
+                    device=device,
+                    dtype=model_dtype,
+                    block_size=self.paged_block_size,
+                )
+                cache.enable_graph_safe()
+            else:
+                # Capture sizes the layers from the model's local KV tensors.
+                cache = cache_type(module.config, max_cache_len=max_cache_len)
             staging_cache = None
             if self.enable_chunked_prefill:
                 # One staging cache serves every staged prompt and every captured prefill
@@ -1172,8 +1252,9 @@ class HybridEngineRollout(RolloutEngine):
                 # reused across prompts, but a staged prompt always writes its own columns
                 # forward before the attention can read them, so stale columns are never
                 # read and the cache does not need to be cleared between rollouts.
-                staging_cache = self._create_static_cache(cache_type, module.config, max_batch_size, prompt_len,
-                                                          device, model_dtype)
+                from deepspeed.utils.static_cache import DeepSpeedStaticCache
+                staging_cache = self._create_static_cache(DeepSpeedStaticCache, module.config, max_batch_size,
+                                                          prompt_len, device, model_dtype)
             static_input = torch.zeros((max_batch_size, 1), dtype=torch.long, device=device)
             static_attention = torch.zeros((max_batch_size, max_cache_len), dtype=torch.long, device=device)
             static_causal_attention = torch.zeros((max_batch_size, 1, 1, max_cache_len),
@@ -1249,6 +1330,15 @@ class HybridEngineRollout(RolloutEngine):
             self._capture_bucket(module, cache, bucket, cache_position, write_position)
         return bucket
 
+    @staticmethod
+    def _bucket_attention_mask(cache, bucket):
+        """Paged decode passes a dict so Qwen skips the dense causal-mask build."""
+        from deepspeed.runtime.rollout.paged_cache import PagedAttentionCache
+        if isinstance(cache, PagedAttentionCache):
+            cache.set_graph_mode(bucket.width)
+            return {"full_attention": None, "sliding_attention": None}
+        return bucket.causal_attention
+
     def _capture_bucket(self, module, cache, bucket, cache_position, write_position):
         """Capture one bucket's forward, falling back to eager forwards if capture fails.
 
@@ -1256,9 +1346,17 @@ class HybridEngineRollout(RolloutEngine):
         replay will use, so it must be called only once the caller has filled them.
         """
         try:
-            cache.set_write_position(write_position)
+            from deepspeed.runtime.rollout.paged_cache import PagedAttentionCache
+            is_paged = isinstance(cache, PagedAttentionCache)
+            if is_paged:
+                cache.set_write_position(self._continuous_graph_state.static_write_positions)
+            else:
+                cache.set_write_position(write_position)
+            attention_mask = self._bucket_attention_mask(cache, bucket)
+            if is_paged:
+                cache.update_graph_atoms()
             bucket.graph, bucket.logits = self._capture_continuous_graph(module, cache, bucket.input_ids,
-                                                                         bucket.causal_attention, write_position,
+                                                                         attention_mask, write_position,
                                                                          cache_position, bucket.position_ids,
                                                                          self._last_logits_kwargs(module))
             self._continuous_graph_state.captures += 1
@@ -1271,16 +1369,24 @@ class HybridEngineRollout(RolloutEngine):
 
     def _run_bucket(self, module, cache, bucket, cache_position, write_position):
         """Replay a bucket's captured forward, or run the same buffers eagerly without a graph."""
+        from deepspeed.runtime.rollout.paged_cache import PagedAttentionCache
+        is_paged = isinstance(cache, PagedAttentionCache)
+        attention_mask = self._bucket_attention_mask(cache, bucket)
+        if is_paged:
+            cache.update_graph_atoms()
         if bucket.graph is not None:
             get_accelerator().replay_graph(bucket.graph)
             return bucket.logits
         # The eager fallback reads the same static buffers, so it stays token-identical
         # to a replay; only the launch overhead differs.
-        cache.set_write_position(write_position)
+        if is_paged:
+            cache.set_write_position(self._continuous_graph_state.static_write_positions)
+        else:
+            cache.set_write_position(write_position)
         output = self._call_model(
             module,
             bucket.input_ids,
-            attention_mask=bucket.causal_attention,
+            attention_mask=attention_mask,
             past_key_values=cache,
             use_cache=True,
             cache_position=cache_position,
@@ -1304,7 +1410,7 @@ class HybridEngineRollout(RolloutEngine):
     def _capture_continuous_graph(module,
                                   cache,
                                   static_input,
-                                  static_attention,
+                                  attention_mask,
                                   static_write_positions,
                                   static_cache_position,
                                   static_position_ids,
@@ -1325,7 +1431,7 @@ class HybridEngineRollout(RolloutEngine):
                 # Allocate uninitialized KV layers on the current stream, not the warmup stream.
                 module(
                     static_input,
-                    attention_mask=static_attention,
+                    attention_mask=attention_mask,
                     past_key_values=cache,
                     use_cache=True,
                     cache_position=static_cache_position,
@@ -1337,7 +1443,7 @@ class HybridEngineRollout(RolloutEngine):
                 for _ in range(3):
                     module(
                         static_input,
-                        attention_mask=static_attention,
+                        attention_mask=attention_mask,
                         past_key_values=cache,
                         use_cache=True,
                         cache_position=static_cache_position,
@@ -1349,7 +1455,7 @@ class HybridEngineRollout(RolloutEngine):
             with accelerator.capture_to_graph(graph):
                 output = module(
                     static_input,
-                    attention_mask=static_attention,
+                    attention_mask=attention_mask,
                     past_key_values=cache,
                     use_cache=True,
                     cache_position=static_cache_position,
@@ -1414,6 +1520,11 @@ class HybridEngineRollout(RolloutEngine):
             raise ValueError("prefill_chunk_size must be positive when chunked prefill is enabled")
         if self.enable_chunked_prefill and self.align_decode_fronts:
             raise ValueError("chunked prefill does not support aligned decode fronts")
+        if self.use_paged_cache:
+            if self.align_decode_fronts:
+                raise ValueError("paged cache does not support aligned decode fronts yet")
+            if self.enable_cache_trimming:
+                raise ValueError("paged cache only supports block-aligned trimming")
 
         prompt_len = requests[0].prompt_ids.shape[1]
         device = requests[0].prompt_ids.device
@@ -1468,6 +1579,24 @@ class HybridEngineRollout(RolloutEngine):
         if not update.admitted:
             return {}, None
 
+        if self.use_paged_cache and self.enable_paged_prefill:
+            if target_slots is None:
+                target_slots = update.admitted_slots
+            admitted_ids = tuple(request.request_id for request in update.admitted)
+            if len(target_slots) != len(admitted_ids):
+                raise ValueError("paged prefill needs one target slot per admitted request")
+            return self._paged_prefill(module,
+                                       cache,
+                                       request_by_id,
+                                       admitted_ids,
+                                       target_slots,
+                                       attention_mask,
+                                       write_positions,
+                                       chunk_size,
+                                       device,
+                                       profile=profile,
+                                       sampling=sampling)
+
         if not align_decode_fronts:
             admitted_ids = tuple(request.request_id for request in update.admitted)
             if target_slots is None:
@@ -1505,18 +1634,32 @@ class HybridEngineRollout(RolloutEngine):
                 cache_start = cache_position - prompt_len
                 if cache_start < 0:
                     raise ValueError("continuous batching prompt does not fit behind the decode front")
-            for layer_idx in range(self._cache_layer_count(prefill_cache)):
-                prefill_keys, prefill_values = self._cache_layer_tensors(prefill_cache, layer_idx)
-                target_layer = self._continuous_cache_layer(cache, layer_idx, prefill_keys, prefill_values,
-                                                            attention_mask.shape[0])
+            if self.use_paged_cache:
+                for layer_idx in range(self._cache_layer_count(prefill_cache)):
+                    prefill_keys, prefill_values = self._cache_layer_tensors(prefill_cache, layer_idx)
+                    for source_row, target_row in enumerate(target_slots):
+                        valid = prompt_attention[source_row].bool()
+                        cache.copy_from_dense(layer_idx, prefill_keys[source_row], prefill_values[source_row],
+                                              target_row, valid)
                 for source_row, target_row in enumerate(target_slots):
-                    target_layer.keys[target_row, :,
-                                      cache_start:cache_start + prompt_len].copy_(prefill_keys[source_row])
-                    target_layer.values[target_row, :,
-                                        cache_start:cache_start + prompt_len].copy_(prefill_values[source_row])
-            for source_row, target_row in enumerate(target_slots):
-                attention_mask[target_row, cache_start:cache_start + prompt_len].copy_(prompt_attention[source_row])
-                write_positions[target_row] = cache_start + prompt_len
+                    valid_len = int(prompt_attention[source_row].sum())
+                    attention_mask[target_row].zero_()
+                    attention_mask[target_row, :valid_len] = 1
+                    write_positions[target_row] = valid_len
+            else:
+                for layer_idx in range(self._cache_layer_count(prefill_cache)):
+                    prefill_keys, prefill_values = self._cache_layer_tensors(prefill_cache, layer_idx)
+                    target_layer = self._continuous_cache_layer(cache, layer_idx, prefill_keys, prefill_values,
+                                                            attention_mask.shape[0])
+                    for source_row, target_row in enumerate(target_slots):
+                        target_layer.keys[target_row, :,
+                                          cache_start:cache_start + prompt_len].copy_(prefill_keys[source_row])
+                        target_layer.values[target_row, :,
+                                            cache_start:cache_start + prompt_len].copy_(prefill_values[source_row])
+                for source_row, target_row in enumerate(target_slots):
+                    attention_mask[target_row,
+                                   cache_start:cache_start + prompt_len].copy_(prompt_attention[source_row])
+                    write_positions[target_row] = cache_start + prompt_len
             self._profile_end(profile, "cache_management_overhead_ms", cache_copy_start)
             tokens = dict(zip(admitted_ids, prefill_tokens.split(1, dim=0)))
             if prefill_logprobs is None:
@@ -1567,6 +1710,94 @@ class HybridEngineRollout(RolloutEngine):
         if not layer.is_initialized:
             layer.lazy_initialization(prefill_keys, prefill_values, max_batch_size=max_batch_size)
         return layer
+
+    @staticmethod
+    def _prefix_block_hashes(prompt_ids, block_size):
+        """Hash complete prompt blocks, chained so a match implies the same prefix."""
+        ids = prompt_ids[0].tolist()
+        hashes = []
+        parent = b""
+        for start in range(0, len(ids) - block_size + 1, block_size):
+            tokens = b"".join(
+                int(token).to_bytes(4, "little", signed=False) for token in ids[start:start + block_size])
+            parent = hashlib.blake2b(parent + tokens, digest_size=16).digest()
+            hashes.append(parent)
+        return hashes
+
+    def _paged_prefill(self,
+                       module,
+                       cache,
+                       request_by_id,
+                       admitted_ids,
+                       target_slots,
+                       attention_mask,
+                       write_positions,
+                       chunk_size,
+                       device,
+                       profile=None,
+                       sampling=None):
+        """Prefill prompts directly into the paged KV cache, one request at a time.
+
+        A request's prompt is stripped of its left padding and fed to the model in chunks.
+        The paged cache stores the K/V at compact columns 0..prompt_len and the blocked
+        attention kernel applies the causal mask during each chunk, so there is no dense
+        prefill cache and no prefill-to-paged copy.
+        """
+        from deepspeed.runtime.rollout.paged_cache import PagedAttentionCache
+        if not isinstance(cache, PagedAttentionCache):
+            raise TypeError("paged prefill requires a PagedAttentionCache")
+        cache.set_eager_mode()
+        paged_attention = {"full_attention": None, "sliding_attention": None}
+        tokens = {}
+        logprobs = {} if sampling is not None and sampling.temperature > 0.0 else None
+        for request_id, target_slot in zip(admitted_ids, target_slots):
+            request = request_by_id[request_id]
+            valid = request.prompt_attention_mask[0].bool()
+            prompt_ids = request.prompt_ids[:, valid]
+            prompt_len = prompt_ids.shape[1]
+            prefix_enabled = self.enable_prefix_reuse and not getattr(cache, "_graph_safe", False)
+            prompt_hashes = self._prefix_block_hashes(prompt_ids, cache.block_size) if prefix_enabled else []
+            start = 0
+            if prefix_enabled:
+                # Keep at least one query token so the suffix forward produces the
+                # logits for the first response token.
+                reusable = min(len(prompt_hashes), max(prompt_len - 1, 0) // cache.block_size)
+                reused = cache.prepare_prefix(prompt_hashes[:reusable], target_slot)
+                start = reused * cache.block_size
+                cache.prefix_reuse_blocks = getattr(cache, "prefix_reuse_blocks", 0) + reused
+                cache.prefix_reuse_tokens = getattr(cache, "prefix_reuse_tokens", 0) + start
+            elif not getattr(cache, "_graph_safe", False):
+                cache.clear_row(target_slot)
+            end = start
+            while end < prompt_len:
+                start = end
+                end = min(prompt_len, start + chunk_size) if chunk_size > 0 else prompt_len
+                write_positions[target_slot] = start
+                cache.set_write_position(write_positions)
+                cache.set_active_rows([target_slot])
+                position_ids = torch.arange(start, end, device=device).unsqueeze(0)
+                forward_start = self._profile_start(profile)
+                output = self._call_model(
+                    module,
+                    prompt_ids[:, start:end],
+                    attention_mask=paged_attention,
+                    past_key_values=cache,
+                    use_cache=True,
+                    cache_position=position_ids[0],
+                    position_ids=position_ids,
+                    **self._last_logits_kwargs(module),
+                )
+                self._profile_end(profile, "prefill_forward_ms", forward_start, count="num_prefill_forwards")
+            if prefix_enabled:
+                cache.register_prefix(prompt_hashes, target_slot, len(prompt_hashes))
+            first_token, first_logprob = self._draw_token(output.logits[:, -1, :], sampling)
+            attention_mask[target_slot].zero_()
+            attention_mask[target_slot, :prompt_len] = 1
+            write_positions[target_slot] = prompt_len
+            tokens[request_id] = first_token
+            if logprobs is not None:
+                logprobs[request_id] = first_logprob
+        return tokens, logprobs
 
     def _stage_long_prompts(self, module, admitted_ids, target_slots, request_by_id, prefill_chunks, chunk_size,
                             static_cache_type, model_dtype, device):
@@ -1638,17 +1869,24 @@ class HybridEngineRollout(RolloutEngine):
         generated token goes into.
         """
         prompt_end = chunk.prompt_len
-        for layer_idx in range(self._cache_layer_count(chunk.cache)):
-            staged_keys, staged_values = self._cache_layer_tensors(chunk.cache, layer_idx)
-            target_layer = cache.layers[layer_idx]
-            if not target_layer.is_initialized:
-                # The decode cache sizes its layers lazily from the first KV it sees; a batch whose
-                # admitted rows are all staged never runs a one-shot prefill, so initialize here.
-                target_layer.lazy_initialization(staged_keys[:1], staged_values[:1],
-                                                 max_batch_size=attention_mask.shape[0])
-            target_layer.keys[chunk.slot, :, :prompt_end].copy_(staged_keys[0])
-            target_layer.values[chunk.slot, :, :prompt_end].copy_(staged_values[0])
-        attention_mask[chunk.slot, :prompt_end].copy_(chunk.prompt_attention[0])
+        if self.use_paged_cache:
+            for layer_idx in range(self._cache_layer_count(chunk.cache)):
+                staged_keys, staged_values = self._cache_layer_tensors(chunk.cache, layer_idx)
+                cache.copy_from_dense(layer_idx, staged_keys[0], staged_values[0], chunk.slot)
+            attention_mask[chunk.slot].zero_()
+            attention_mask[chunk.slot, :prompt_end] = 1
+        else:
+            for layer_idx in range(self._cache_layer_count(chunk.cache)):
+                staged_keys, staged_values = self._cache_layer_tensors(chunk.cache, layer_idx)
+                target_layer = cache.layers[layer_idx]
+                if not target_layer.is_initialized:
+                    # The decode cache sizes its layers lazily from the first KV it sees; a batch whose
+                    # admitted rows are all staged never runs a one-shot prefill, so initialize here.
+                    target_layer.lazy_initialization(staged_keys[:1], staged_values[:1],
+                                                     max_batch_size=attention_mask.shape[0])
+                target_layer.keys[chunk.slot, :, :prompt_end].copy_(staged_keys[0])
+                target_layer.values[chunk.slot, :, :prompt_end].copy_(staged_values[0])
+            attention_mask[chunk.slot, :prompt_end].copy_(chunk.prompt_attention[0])
         write_positions[chunk.slot] = prompt_end
         return prompt_end
 
@@ -1841,18 +2079,25 @@ class HybridEngineRollout(RolloutEngine):
         function of the prompt and the response budget, never of how many chunks it took.
         """
         prompt_len = chunk.prompt_len
-        for layer_idx in range(self._cache_layer_count(state.staging_cache)):
-            staged_keys, staged_values = self._cache_layer_tensors(state.staging_cache, layer_idx)
-            target_layer = cache.layers[layer_idx]
-            if not target_layer.is_initialized:
-                # The capture cache sizes its layers lazily; when every bucket falls back to
-                # eager windows no captured warmup has allocated them yet.
-                target_layer.lazy_initialization(staged_keys[chunk.row:chunk.row + 1],
-                                                 staged_values[chunk.row:chunk.row + 1],
-                                                 max_batch_size=attention_mask.shape[0])
-            target_layer.keys[chunk.slot, :, :prompt_len].copy_(staged_keys[chunk.row, :, :prompt_len])
-            target_layer.values[chunk.slot, :, :prompt_len].copy_(staged_values[chunk.row, :, :prompt_len])
-        attention_mask[chunk.slot, :prompt_len].copy_(chunk.prompt_attention[0])
+        if self.use_paged_cache:
+            for layer_idx in range(self._cache_layer_count(state.staging_cache)):
+                staged_keys, staged_values = self._cache_layer_tensors(state.staging_cache, layer_idx)
+                cache.copy_from_dense(layer_idx, staged_keys[chunk.row], staged_values[chunk.row], chunk.slot)
+            attention_mask[chunk.slot].zero_()
+            attention_mask[chunk.slot, :prompt_len] = 1
+        else:
+            for layer_idx in range(self._cache_layer_count(state.staging_cache)):
+                staged_keys, staged_values = self._cache_layer_tensors(state.staging_cache, layer_idx)
+                target_layer = cache.layers[layer_idx]
+                if not target_layer.is_initialized:
+                    # The capture cache sizes its layers lazily; when every bucket falls back to
+                    # eager windows no captured warmup has allocated them yet.
+                    target_layer.lazy_initialization(staged_keys[chunk.row:chunk.row + 1],
+                                                     staged_values[chunk.row:chunk.row + 1],
+                                                     max_batch_size=attention_mask.shape[0])
+                target_layer.keys[chunk.slot, :, :prompt_len].copy_(staged_keys[chunk.row, :, :prompt_len])
+                target_layer.values[chunk.slot, :, :prompt_len].copy_(staged_values[chunk.row, :, :prompt_len])
+            attention_mask[chunk.slot, :prompt_len].copy_(chunk.prompt_attention[0])
         write_positions[chunk.slot] = prompt_len
 
     @staticmethod
