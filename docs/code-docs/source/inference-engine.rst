@@ -72,7 +72,9 @@ reallocation are out of the loop. Each drawn token's log-probability is recorded
 in ``RolloutBatch.response_logprobs`` (positions the attention mask retires are
 zero), which is what PPO/OPD importance ratios need. Greedy rollouts keep their
 own paths (graph capture or chunked prefill); models without cache-class support
-and rollouts using ``use_shared_prefill`` keep the ``model.generate()`` fallback.
+and rollouts using ``use_shared_prefill`` keep the ``model.generate()`` fallback,
+which asks HuggingFace for a ``StaticCache`` wherever the model supports one so
+that path also writes K/V in place instead of reallocating it every step.
 
 The draw is the Gumbel-max trick -- ``argmax(logits / temperature + Gumbel)`` --
 so the sampling parameters are masks over one vectorised ``argmax``:

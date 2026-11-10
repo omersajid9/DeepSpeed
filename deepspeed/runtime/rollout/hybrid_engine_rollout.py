@@ -368,6 +368,10 @@ class HybridEngineRollout(RolloutEngine):
                 }
                 if do_sample:
                     generate_kwargs["top_k"] = max(sampling.top_k, 0)
+                if getattr(module, "_supports_cache_class", None) is not False and not self.use_shared_prefill:
+                    # HuggingFace's default cache reallocates and concatenates K/V on every decode
+                    # step; a static cache writes in place. Shared prefill manages the cache itself.
+                    generate_kwargs["cache_implementation"] = "static"
                 output_ids = module.generate(prompt_ids, **generate_kwargs)
         finally:
             for handle in shared_prefill_handles:
