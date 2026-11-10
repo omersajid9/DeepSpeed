@@ -66,6 +66,7 @@ class PagedAttentionCache:
         self.num_layers = int(getattr(text_config, "num_hidden_layers"))
         self.num_kv_heads = int(
             getattr(text_config, "num_key_value_heads", getattr(text_config, "num_attention_heads")))
+        self.num_q_heads = int(getattr(text_config, "num_attention_heads"))
         self.head_dim = int(
             getattr(text_config, "head_dim", None)
             or (getattr(text_config, "hidden_size") // getattr(text_config, "num_attention_heads")))
@@ -115,6 +116,14 @@ class PagedAttentionCache:
         self._step_atoms: Optional[torch.Tensor] = None
         self._step_prepared = False
         self._scale = self.head_dim**-0.5
+        self._graph_safe = False
+        self._graph_mode = False
+        self._graph_width = 0
+        self._graph_active_rows: Optional[torch.Tensor] = None
+        self._graph_atoms: Optional[torch.Tensor] = None
+        self._graph_outputs: Optional[torch.Tensor] = None
+        self._graph_row_buffers: dict = {}
+        self._graph_atom_views: dict = {}
 
     @property
     def layers(self) -> list[_PagedLayer]:
@@ -152,6 +161,84 @@ class PagedAttentionCache:
         self._active_rows = rows
         self._step_prepared = False
         self._step_atoms = None
+
+    def enable_graph_safe(self) -> None:
+        """Preallocate the whole block table so replay never allocates or reads host state.
+
+        A graph replay executes only device work. The paged decode path therefore cannot
+        reserve blocks or walk host lists per step; every row owns its full block span from
+        ``reset`` to ``reset`` and the atom fields are updated from device tensors.
+        """
+        if self._graph_safe:
+            return
+        self._graph_safe = True
+        self._allocate_all_blocks()
+        self._zero_storage()
+        self._init_graph_atom_structure()
+        if self._graph_outputs is None:
+            self._graph_outputs = torch.empty((self.num_layers, self.max_batch_size, self.num_q_heads * self.head_dim),
+                                              dtype=self.dtype,
+                                              device=self.device)
+
+    def set_graph_mode(self, width: int) -> None:
+        """Address exactly ``width`` rows from device-resident buffers for a replay step."""
+        if not self._graph_safe:
+            raise RuntimeError("paged cache must be graph safe before graph replay")
+        if width <= 0 or width > self.max_batch_size:
+            raise ValueError(f"graph width {width} is outside [1, {self.max_batch_size}]")
+        # A captured graph embeds the addresses of the tensors it indexes. Keep one
+        # row/atom tensor per width instead of recreating them on every replay, or the
+        # captured index kernels would dereference freed memory after the first step.
+        self._graph_mode = True
+        self._graph_width = width
+        rows = self._graph_row_buffers.get(width)
+        if rows is None:
+            rows = torch.arange(width, dtype=torch.long, device=self.device)
+            self._graph_row_buffers[width] = rows
+        atoms = self._graph_atom_views.get(width)
+        if atoms is None:
+            atoms = self._atoms_device[:width]
+            self._graph_atom_views[width] = atoms
+        self._graph_active_rows = rows
+        self._graph_atoms = atoms
+        self._active_rows = rows
+        self._step_prepared = True
+        self._step_atoms = None
+
+    def _allocate_all_blocks(self) -> None:
+        for row in range(self.max_batch_size):
+            self._ensure_blocks(row, self.max_cache_len)
+
+    def _zero_storage(self) -> None:
+        for key, value in zip(self._key_views, self._value_views):
+            key.zero_()
+            value.zero_()
+
+    def update_graph_atoms(self) -> None:
+        """Refresh the length fields of the static atom table outside the captured graph."""
+        if not self._graph_mode or self._graph_atoms is None:
+            return
+        positions = self._write_positions[:self._graph_width]
+        atoms = self._graph_atoms
+        atoms[:, 4] = ((positions + 1 + self.block_size - 1) // self.block_size).to(torch.int32)
+        atoms[:, 5] = (positions + 1).to(torch.int32)
+        atoms[:, 6] = positions.to(torch.int32)
+
+    def _init_graph_atom_structure(self) -> None:
+        """Fill the atom fields that do not change across replay steps.
+
+        The block-table pointer is fixed for the cache's lifetime; the length fields are
+        recomputed on device in ``attention`` from ``_write_positions``.
+        """
+        atoms = self._atoms_cpu
+        pointers = torch.tensor([self.block_ids[row].data_ptr() for row in range(self.max_batch_size)],
+                                dtype=torch.int64)
+        atoms.view(torch.int64)[:, 0].copy_(pointers)
+        atoms[:, 2] = torch.arange(self.max_batch_size, dtype=torch.int32)
+        atoms[:, 3] = 1
+        atoms[:, 4:7] = 0
+        atoms[:, 7] = 0
+        self._atoms_device.copy_(atoms)
 
     def _ensure_blocks(self, row: int, num_tokens: int) -> None:
         needed = (num_tokens + self.block_size - 1) // self.block_size
@@ -198,7 +285,8 @@ class PagedAttentionCache:
             keys = keys[:, valid_mask]
             values = values[:, valid_mask]
         prompt_len = keys.shape[1]
-        self._free_row(target_row)
+        if not self._graph_safe:
+            self._free_row(target_row)
         self._ensure_blocks(target_row, prompt_len)
         positions = torch.arange(prompt_len, device=self.device)
         slots = self._slots(torch.tensor([target_row], device=self.device), positions[:1], prompt_len)[0]
@@ -228,7 +316,10 @@ class PagedAttentionCache:
             raise RuntimeError("paged cache write position was not set")
         rows = self._active_rows
         q_len = key_states.shape[2]
-        self._prepare_step(q_len)
+        if not self._graph_mode:
+            self._prepare_step(q_len)
+        elif q_len != 1:
+            raise ValueError("graph replay paged writes expect one token per row")
         positions = self._write_positions[rows]
         slots = self._slots(rows, positions, q_len)
         key_view = self._key_views[layer_idx].view(-1, self.num_kv_heads, self.head_dim)
@@ -261,13 +352,24 @@ class PagedAttentionCache:
         """Run blocked flash attention for one decode step.
 
         ``query_states`` is ``[rows, heads, 1, head_dim]`` for the active rows;
-        the return has the same shape.
+        the return has the same shape. Graph replay derives the atom lengths on device and
+        writes into a preallocated output, so the replay performs no host work.
         """
         num_rows, num_heads, q_len, head_dim = query_states.shape
         if q_len != 1:
             raise ValueError("paged decode attention expects one query token per row")
-        atoms = self._build_atoms()
-        output = torch.empty((num_rows, num_heads * head_dim), dtype=query_states.dtype, device=query_states.device)
+        if self._graph_mode:
+            if self._graph_outputs is None:
+                raise RuntimeError("graph-safe paged cache has no output buffers")
+            if num_rows != self._graph_width:
+                raise ValueError(f"graph replay row count {num_rows} does not match width {self._graph_width}")
+            atoms = self._graph_atoms
+            output = self._graph_outputs[layer_idx][:num_rows]
+        else:
+            atoms = self._build_atoms()
+            output = torch.empty((num_rows, num_heads * head_dim),
+                                 dtype=query_states.dtype,
+                                 device=query_states.device)
         query = query_states.transpose(1, 2).reshape(num_rows, num_heads * head_dim)
         self._kernel(output, query, self._key_views[layer_idx], self._value_views[layer_idx], atoms, scale)
         return output.view(num_rows, 1, num_heads, head_dim).transpose(1, 2)
@@ -314,6 +416,11 @@ class PagedAttentionCache:
         for row in range(self.max_batch_size):
             self._free_row(row)
         self.row_len.zero_()
+        if self._graph_safe:
+            self._allocate_all_blocks()
+            self._zero_storage()
+            self._init_graph_atom_structure()
+            self._graph_mode = False
 
     def trim_left(self, count: int) -> None:
         """Release a block-aligned dead prefix from every row."""

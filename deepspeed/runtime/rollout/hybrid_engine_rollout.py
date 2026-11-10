@@ -1122,6 +1122,11 @@ class HybridEngineRollout(RolloutEngine):
             stats["prefill_bucket_steps"] = chunk_stats.get("graph_steps", 0)
             stats["prefill_padded_rows"] = chunk_stats.get("padded_rows", 0)
             stats["prefill_bucket_widths"] = dict(chunk_stats.get("bucket_widths", {}))
+        if self.use_paged_cache:
+            stats["paged_cache"] = True
+            stats["paged_block_size"] = cache.block_size
+            stats["blocks_in_use"] = cache.blocks_in_use
+            stats["block_utilization"] = cache.blocks_in_use / cache.block_ids.numel()
         self._last_continuous_stats = stats
         if profile is not None:
             self._finish_continuous_profile(profile, original_request, responses, max_batch_size, prompt_len,
@@ -1177,15 +1182,28 @@ class HybridEngineRollout(RolloutEngine):
         ladder = self._graph_capture_ladder(max_batch_size, self.graph_capture_batch_sizes)
         signature = self._continuous_graph_signature(module, max_batch_size, prompt_len, max_cache_len, device,
                                                      model_dtype, ladder)
+        signature = signature + (self.use_paged_cache, self.paged_block_size)
         state = self._continuous_graph_state
         if state is None or state.signature != signature:
-            cache = cache_type(
-                module.config,
-                batch_size=max_batch_size,
-                max_cache_len=max_cache_len,
-                device=device,
-                dtype=model_dtype,
-            )
+            if self.use_paged_cache:
+                from deepspeed.runtime.rollout.paged_cache import PagedAttentionCache
+                cache = PagedAttentionCache(
+                    module.config,
+                    batch_size=max_batch_size,
+                    max_cache_len=max_cache_len,
+                    device=device,
+                    dtype=model_dtype,
+                    block_size=self.paged_block_size,
+                )
+                cache.enable_graph_safe()
+            else:
+                cache = cache_type(
+                    module.config,
+                    batch_size=max_batch_size,
+                    max_cache_len=max_cache_len,
+                    device=device,
+                    dtype=model_dtype,
+                )
             staging_cache = None
             if self.enable_chunked_prefill:
                 # One staging cache serves every staged prompt and every captured prefill
@@ -1194,8 +1212,9 @@ class HybridEngineRollout(RolloutEngine):
                 # reused across prompts, but a staged prompt always writes its own columns
                 # forward before the attention can read them, so stale columns are never
                 # read and the cache does not need to be cleared between rollouts.
-                staging_cache = self._create_static_cache(cache_type, module.config, max_batch_size, prompt_len,
-                                                          device, model_dtype)
+                from deepspeed.utils.static_cache import DeepSpeedStaticCache
+                staging_cache = self._create_static_cache(DeepSpeedStaticCache, module.config, max_batch_size,
+                                                          prompt_len, device, model_dtype)
             static_input = torch.zeros((max_batch_size, 1), dtype=torch.long, device=device)
             static_attention = torch.zeros((max_batch_size, max_cache_len), dtype=torch.long, device=device)
             static_causal_attention = torch.zeros((max_batch_size, 1, 1, max_cache_len),
@@ -1271,6 +1290,15 @@ class HybridEngineRollout(RolloutEngine):
             self._capture_bucket(module, cache, bucket, cache_position, write_position)
         return bucket
 
+    @staticmethod
+    def _bucket_attention_mask(cache, bucket):
+        """Paged decode passes a dict so Qwen skips the dense causal-mask build."""
+        from deepspeed.runtime.rollout.paged_cache import PagedAttentionCache
+        if isinstance(cache, PagedAttentionCache):
+            cache.set_graph_mode(bucket.width)
+            return {"full_attention": None, "sliding_attention": None}
+        return bucket.causal_attention
+
     def _capture_bucket(self, module, cache, bucket, cache_position, write_position):
         """Capture one bucket's forward, falling back to eager forwards if capture fails.
 
@@ -1278,9 +1306,17 @@ class HybridEngineRollout(RolloutEngine):
         replay will use, so it must be called only once the caller has filled them.
         """
         try:
-            cache.set_write_position(write_position)
+            from deepspeed.runtime.rollout.paged_cache import PagedAttentionCache
+            is_paged = isinstance(cache, PagedAttentionCache)
+            if is_paged:
+                cache.set_write_position(self._continuous_graph_state.static_write_positions)
+            else:
+                cache.set_write_position(write_position)
+            attention_mask = self._bucket_attention_mask(cache, bucket)
+            if is_paged:
+                cache.update_graph_atoms()
             bucket.graph, bucket.logits = self._capture_continuous_graph(module, cache, bucket.input_ids,
-                                                                         bucket.causal_attention, write_position,
+                                                                         attention_mask, write_position,
                                                                          cache_position, bucket.position_ids,
                                                                          self._last_logits_kwargs(module))
             self._continuous_graph_state.captures += 1
@@ -1293,16 +1329,24 @@ class HybridEngineRollout(RolloutEngine):
 
     def _run_bucket(self, module, cache, bucket, cache_position, write_position):
         """Replay a bucket's captured forward, or run the same buffers eagerly without a graph."""
+        from deepspeed.runtime.rollout.paged_cache import PagedAttentionCache
+        is_paged = isinstance(cache, PagedAttentionCache)
+        attention_mask = self._bucket_attention_mask(cache, bucket)
+        if is_paged:
+            cache.update_graph_atoms()
         if bucket.graph is not None:
             get_accelerator().replay_graph(bucket.graph)
             return bucket.logits
         # The eager fallback reads the same static buffers, so it stays token-identical
         # to a replay; only the launch overhead differs.
-        cache.set_write_position(write_position)
+        if is_paged:
+            cache.set_write_position(self._continuous_graph_state.static_write_positions)
+        else:
+            cache.set_write_position(write_position)
         output = self._call_model(
             module,
             bucket.input_ids,
-            attention_mask=bucket.causal_attention,
+            attention_mask=attention_mask,
             past_key_values=cache,
             use_cache=True,
             cache_position=cache_position,
@@ -1326,7 +1370,7 @@ class HybridEngineRollout(RolloutEngine):
     def _capture_continuous_graph(module,
                                   cache,
                                   static_input,
-                                  static_attention,
+                                  attention_mask,
                                   static_write_positions,
                                   static_cache_position,
                                   static_position_ids,
@@ -1349,7 +1393,7 @@ class HybridEngineRollout(RolloutEngine):
                 for _ in range(3):
                     module(
                         static_input,
-                        attention_mask=static_attention,
+                        attention_mask=attention_mask,
                         past_key_values=cache,
                         use_cache=True,
                         cache_position=static_cache_position,
@@ -1361,7 +1405,7 @@ class HybridEngineRollout(RolloutEngine):
             with accelerator.capture_to_graph(graph):
                 output = module(
                     static_input,
-                    attention_mask=static_attention,
+                    attention_mask=attention_mask,
                     past_key_values=cache,
                     use_cache=True,
                     cache_position=static_cache_position,
@@ -1427,8 +1471,6 @@ class HybridEngineRollout(RolloutEngine):
         if self.enable_chunked_prefill and self.align_decode_fronts:
             raise ValueError("chunked prefill does not support aligned decode fronts")
         if self.use_paged_cache:
-            if self.use_graph_capture:
-                raise ValueError("paged cache does not support graph capture yet")
             if self.align_decode_fronts:
                 raise ValueError("paged cache does not support aligned decode fronts yet")
             if self.enable_cache_trimming:
@@ -1867,12 +1909,19 @@ class HybridEngineRollout(RolloutEngine):
         function of the prompt and the response budget, never of how many chunks it took.
         """
         prompt_len = chunk.prompt_len
-        for layer_idx in range(self._cache_layer_count(state.staging_cache)):
-            staged_keys, staged_values = self._cache_layer_tensors(state.staging_cache, layer_idx)
-            target_layer = cache.layers[layer_idx]
-            target_layer.keys[chunk.slot, :, :prompt_len].copy_(staged_keys[chunk.row, :, :prompt_len])
-            target_layer.values[chunk.slot, :, :prompt_len].copy_(staged_values[chunk.row, :, :prompt_len])
-        attention_mask[chunk.slot, :prompt_len].copy_(chunk.prompt_attention[0])
+        if self.use_paged_cache:
+            for layer_idx in range(self._cache_layer_count(state.staging_cache)):
+                staged_keys, staged_values = self._cache_layer_tensors(state.staging_cache, layer_idx)
+                cache.copy_from_dense(layer_idx, staged_keys[chunk.row], staged_values[chunk.row], chunk.slot)
+            attention_mask[chunk.slot].zero_()
+            attention_mask[chunk.slot, :prompt_len] = 1
+        else:
+            for layer_idx in range(self._cache_layer_count(state.staging_cache)):
+                staged_keys, staged_values = self._cache_layer_tensors(state.staging_cache, layer_idx)
+                target_layer = cache.layers[layer_idx]
+                target_layer.keys[chunk.slot, :, :prompt_len].copy_(staged_keys[chunk.row, :, :prompt_len])
+                target_layer.values[chunk.slot, :, :prompt_len].copy_(staged_values[chunk.row, :, :prompt_len])
+            attention_mask[chunk.slot, :prompt_len].copy_(chunk.prompt_attention[0])
         write_positions[chunk.slot] = prompt_len
 
     @staticmethod
