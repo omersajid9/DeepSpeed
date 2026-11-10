@@ -61,6 +61,8 @@ class _ForwardProfiler:
         if not self.measurements:
             return None, None, 0
 
+        if not self.use_host_timer:
+            torch.cuda.synchronize()
         durations = [self._elapsed_time(start, end) for start, end in self.measurements]
         return durations[0], sum(durations[1:]), len(durations) - 1
 
