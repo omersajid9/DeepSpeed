@@ -2459,8 +2459,12 @@ def test_sampling_path_matches_greedy_with_top_k_one():
     output = rollout.generate(RolloutRequest(prompt, attention),
                               SamplingConfig(max_new_tokens=4, temperature=1.0, top_k=1))
     with torch.no_grad():
-        greedy = model.generate(prompt, attention_mask=attention, max_new_tokens=4, do_sample=False,
-                                eos_token_id=None, pad_token_id=0)
+        greedy = model.generate(prompt,
+                                attention_mask=attention,
+                                max_new_tokens=4,
+                                do_sample=False,
+                                eos_token_id=None,
+                                pad_token_id=0)
 
     assert output.input_ids.tolist() == greedy.tolist()
     # top_k=1 renormalizes the surviving token to probability 1.
@@ -2480,8 +2484,8 @@ def test_sampling_path_logprobs_match_the_model_distribution():
     with torch.no_grad():
         logits = model(output.input_ids, attention_mask=output.attention_mask).logits
     start = int(output.response_start_idx[0])
-    expected = torch.log_softmax(logits[:, start - 1:-1, :], dim=-1).gather(-1,
-                                                                           output.input_ids[:, start:].unsqueeze(-1))
+    expected = torch.log_softmax(logits[:, start - 1:-1, :], dim=-1).gather(-1, output.input_ids[:,
+                                                                                                 start:].unsqueeze(-1))
     expected = expected.squeeze(-1)
 
     assert output.response_logprobs.shape == (2, 4)
@@ -2733,3 +2737,39 @@ def test_continuous_graph_sampling_matches_greedy_with_top_k_one(mock_get_accele
     assert sampled.attention_mask.tolist() == greedy.attention_mask.tolist()
     assert sampled.response_logprobs.tolist() == [[0.0] * 4, [0.0] * 4]
     assert captures  # the decode really was replayed
+
+
+# -- eager fallback ------------------------------------------------------
+
+
+def test_eager_fallback_generates_on_a_static_cache():
+    """The eager fallback must not fall back to HuggingFace's per-step reallocating cache."""
+    from transformers import LlamaForCausalLM, StaticCache
+
+    class RecordingLlama(LlamaForCausalLM):
+
+        def __init__(self, config):
+            super().__init__(config)
+            self.cache_types = []
+
+        def forward(self, *args, **kwargs):
+            self.cache_types.append(type(kwargs.get("past_key_values")).__name__)
+            return super().forward(*args, **kwargs)
+
+    model = _tiny_llama(model_class=RecordingLlama)
+    rollout = HybridEngineRollout(SimpleNamespace(module=model), SimpleNamespace(pad_token_id=0, eos_token_id=None))
+    prompt = torch.tensor([[0, 0, 1, 2], [3, 4, 5, 6]])
+    attention = torch.tensor([[0, 0, 1, 1], [1, 1, 1, 1]])
+
+    output = rollout.generate(RolloutRequest(prompt, attention), SamplingConfig(max_new_tokens=4, temperature=0))
+    rollout_cache_types = set(model.cache_types)
+    with torch.no_grad():
+        greedy = model.generate(prompt,
+                                attention_mask=attention,
+                                max_new_tokens=4,
+                                do_sample=False,
+                                eos_token_id=None,
+                                pad_token_id=0)
+
+    assert output.input_ids.tolist() == greedy.tolist()
+    assert rollout_cache_types == {StaticCache.__name__}
