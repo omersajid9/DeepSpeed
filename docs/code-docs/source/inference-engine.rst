@@ -76,6 +76,11 @@ and rollouts using ``use_shared_prefill`` keep the ``model.generate()`` fallback
 which asks HuggingFace for a ``StaticCache`` wherever the model supports one so
 that path also writes K/V in place instead of reallocating it every step.
 
+Sampling keeps the captured forward. With ``use_graph_capture`` the decode step is one graph
+replay of the model plus one device draw on the replayed logits, so a sampling rollout no
+longer gives up CUDA graphs; greedy and sampling differ only in how the token is selected
+(``argmax`` versus the sampler).
+
 The draw is the Gumbel-max trick -- ``argmax(logits / temperature + Gumbel)`` --
 so the sampling parameters are masks over one vectorised ``argmax``:
 ``temperature`` (``<= 0`` is greedy), ``top_k`` (``<= 0`` disables it) and
@@ -127,11 +132,14 @@ configured capacity.
 
 The experimental path intentionally does not implement paged attention or change the
 default generation semantics. It currently requires one padded prompt width for
-all rows, a model with cache-class support, greedy decoding, and one sample per
-prompt. Shared prompt prefill is rejected until the scheduling semantics are
-validated on real workloads. Models that explicitly declare no cache-class
-support are rejected; models with unknown support should be validated against
-the default ``generate()`` path before use.
+all rows, a model with cache-class support, and one sample per prompt. Rows may be
+greedy (``argmax`` of each step's logits) or sampled (the device draw), but not both in
+one call: ``SamplingConfig`` is per call. Sampling rollouts prefill in a single forward --
+prompt staging is greedy-only -- so their first response token is drawn from the prefill
+logits, and they report ``RolloutBatch.response_logprobs``. Shared prompt prefill is
+rejected until the scheduling semantics are validated on real workloads. Models that
+explicitly declare no cache-class support are rejected; models with unknown support should
+be validated against the default ``generate()`` path before use.
 ``align_decode_fronts=False`` is the default equal-width padded-prompt baseline:
 all requests use the same padded prompt width. Different effective lengths
 encoded by the attention masks retain the legacy staggered logical decode
