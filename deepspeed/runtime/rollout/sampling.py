@@ -22,8 +22,20 @@ importance ratio needs.
 
 import torch
 
+_COMPILED_SAMPLE = None
+_COMPILED_SAMPLE_ENABLED = False
+_COMPILED_SAMPLE_FAILED = False
 
-def sample(logits, temperature=1.0, top_k=-1, top_p=1.0, generator=None):
+
+def configure_compiled_sampler(enabled=True):
+    """Opt into a torch.compile-fused top-k/top-p/Gumbel draw."""
+    global _COMPILED_SAMPLE_ENABLED, _COMPILED_SAMPLE
+    _COMPILED_SAMPLE_ENABLED = bool(enabled)
+    if enabled and _COMPILED_SAMPLE is None and not _COMPILED_SAMPLE_FAILED:
+        _COMPILED_SAMPLE = torch.compile(_sample_impl, fullgraph=True, dynamic=True)
+
+
+def _sample_impl(logits, temperature=1.0, top_k=-1, top_p=1.0, generator=None):
     """Draw one token per row from ``logits`` and report its log-probability.
 
     Args:
@@ -55,6 +67,18 @@ def sample(logits, temperature=1.0, top_k=-1, top_p=1.0, generator=None):
     tokens = (logits + gumbel).argmax(dim=-1)
     logprobs = torch.log_softmax(logits, dim=-1).gather(-1, tokens.unsqueeze(-1)).squeeze(-1)
     return tokens, logprobs
+
+
+def sample(logits, temperature=1.0, top_k=-1, top_p=1.0, generator=None):
+    """Draw using the compiled implementation when enabled, with eager fallback."""
+    global _COMPILED_SAMPLE_FAILED, _COMPILED_SAMPLE
+    if _COMPILED_SAMPLE_ENABLED and _COMPILED_SAMPLE is not None:
+        try:
+            return _COMPILED_SAMPLE(logits, temperature=temperature, top_k=top_k, top_p=top_p, generator=generator)
+        except Exception:
+            _COMPILED_SAMPLE_FAILED = True
+            _COMPILED_SAMPLE = None
+    return _sample_impl(logits, temperature=temperature, top_k=top_k, top_p=top_p, generator=generator)
 
 
 def _top_k(logits, k):

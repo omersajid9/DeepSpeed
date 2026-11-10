@@ -34,7 +34,7 @@ import torch
 from deepspeed.accelerator import get_accelerator
 from deepspeed.runtime.rollout.base import RolloutBatch, RolloutEngine, RolloutRequest, SamplingConfig
 from deepspeed.runtime.rollout.continuous_batching import ContinuousBatchRequest, ContinuousBatchScheduler
-from deepspeed.runtime.rollout.sampling import sample
+from deepspeed.runtime.rollout.sampling import configure_compiled_sampler, sample
 from deepspeed.utils import logger
 
 
@@ -144,6 +144,7 @@ class HybridEngineRolloutConfig:
     enable_paged_prefill: bool = False
     enable_prefix_reuse: bool = False
     enable_torch_compile: bool = False
+    enable_compiled_sampler: bool = False
 
 
 @dataclass
@@ -298,6 +299,9 @@ class HybridEngineRollout(RolloutEngine):
         self.enable_paged_prefill = getattr(cfg, 'enable_paged_prefill', False) if cfg else False
         self.enable_prefix_reuse = getattr(cfg, 'enable_prefix_reuse', False) if cfg else False
         self.enable_torch_compile = getattr(cfg, 'enable_torch_compile', False) if cfg else False
+        self.enable_compiled_sampler = getattr(cfg, 'enable_compiled_sampler', False) if cfg else False
+        if self.enable_compiled_sampler:
+            configure_compiled_sampler(True)
         self._last_profile = None
         self._continuous_graph_state = None
         self._last_continuous_stats = None
