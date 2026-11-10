@@ -60,6 +60,29 @@ For benchmark matrices, cases execute from the largest effective batch to the
 smallest because HybridEngine sizes its inference workspace on the first
 forward. Results remain in the user-requested matrix order.
 
+Device-side sampling
+--------------------
+
+Rollouts that sample (``SamplingConfig.temperature > 0``) draw their tokens on
+the device when the model supports cache classes. The engine prefills the prompt
+once into a static cache, and every decode step is one forward plus one
+``deepspeed.runtime.rollout.sampling.sample`` call, so HuggingFace's
+host-side logits warpers and ``multinomial`` and the dynamic cache's per-step
+reallocation are out of the loop. Each drawn token's log-probability is recorded
+in ``RolloutBatch.response_logprobs`` (positions the attention mask retires are
+zero), which is what PPO/OPD importance ratios need. Greedy rollouts keep their
+own paths (graph capture or chunked prefill); models without cache-class support
+and rollouts using ``use_shared_prefill`` keep the ``model.generate()`` fallback.
+
+The draw is the Gumbel-max trick -- ``argmax(logits / temperature + Gumbel)`` --
+so the sampling parameters are masks over one vectorised ``argmax``:
+``temperature`` (``<= 0`` is greedy), ``top_k`` (``<= 0`` disables it) and
+``top_p`` (``>= 1`` disables it). The nucleus filter keeps the token that
+crosses ``top_p`` (vLLM's rule), not the last token whose inclusive cumulative
+probability stays inside the threshold. Log-probabilities are taken over the
+sampling distribution (temperature-scaled, filtered, renormalized), i.e. the
+distribution the token was actually drawn from.
+
 Shared Prompt Prefill
 ---------------------
 

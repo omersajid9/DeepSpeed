@@ -1204,6 +1204,7 @@ def test_generate_keeps_ranks_in_lockstep_and_pads_after_eos():
 
 def test_generate_forwards_top_k_for_sampling_with_multiple_samples_and_eos():
     engine = _make_engine()
+    engine.module._supports_cache_class = False  # no cache classes: the HuggingFace fallback runs
     tok = _make_tokenizer()
     rollout = HybridEngineRollout(engine, tok)
     engine.module.generate.return_value = torch.tensor([
@@ -1230,6 +1231,7 @@ def test_generate_forwards_top_k_for_sampling_with_multiple_samples_and_eos():
 @pytest.mark.parametrize("top_k", [-1, 0])
 def test_generate_disables_top_k_for_sampling(top_k):
     engine = _make_engine()
+    engine.module._supports_cache_class = False  # no cache classes: the HuggingFace fallback runs
     rollout = HybridEngineRollout(engine, _make_tokenizer())
     engine.module.generate.return_value = torch.tensor([[10, 11, 5]])
     request = RolloutRequest(torch.tensor([[10, 11]]), torch.ones((1, 2), dtype=torch.long))
@@ -1638,7 +1640,7 @@ def test_eager_continuous_chunked_prefill_matches_naive():
     assert plain.get_last_continuous_stats()["chunked_prefill_chunks"] == 0
 
 
-def _tiny_llama():
+def _tiny_llama(model_class=None):
     from transformers import LlamaConfig, LlamaForCausalLM
 
     torch.manual_seed(0)
@@ -1649,7 +1651,7 @@ def _tiny_llama():
                          num_attention_heads=2,
                          num_key_value_heads=2,
                          max_position_embeddings=64)
-    return LlamaForCausalLM(config).eval()
+    return (model_class or LlamaForCausalLM)(config).eval()
 
 
 def test_chunked_prefill_cache_matches_single_forward_prefill_on_a_real_model():
@@ -1943,3 +1945,124 @@ def test_static_cache_falls_back_to_derived_head_dim():
     cache = DeepSpeedStaticCache(_cache_config(), batch_size=1, max_cache_len=8, device="cpu", dtype=torch.float32)
 
     assert tuple(cache.layers[0].keys.shape) == (1, 2, 8, 16)
+
+
+# -- device-side sampling path ------------------------------------------
+
+
+def test_sampling_path_matches_greedy_with_top_k_one():
+    """top_k=1 leaves one token per row, so the sampling loop must reproduce greedy decoding."""
+    model = _tiny_llama()
+    rollout = HybridEngineRollout(SimpleNamespace(module=model), SimpleNamespace(pad_token_id=0, eos_token_id=None))
+    prompt = torch.tensor([[0, 0, 1, 2, 3], [4, 5, 6, 7, 8]])
+    attention = torch.tensor([[0, 0, 1, 1, 1], [1, 1, 1, 1, 1]])
+
+    torch.manual_seed(0)
+    output = rollout.generate(RolloutRequest(prompt, attention),
+                              SamplingConfig(max_new_tokens=4, temperature=1.0, top_k=1))
+    with torch.no_grad():
+        greedy = model.generate(prompt, attention_mask=attention, max_new_tokens=4, do_sample=False,
+                                eos_token_id=None, pad_token_id=0)
+
+    assert output.input_ids.tolist() == greedy.tolist()
+    # top_k=1 renormalizes the surviving token to probability 1.
+    assert output.response_logprobs.tolist() == [[0.0] * 4, [0.0] * 4]
+
+
+def test_sampling_path_logprobs_match_the_model_distribution():
+    """Every reported log-probability is the model's own log-softmax at the drawn token."""
+    model = _tiny_llama()
+    rollout = HybridEngineRollout(SimpleNamespace(module=model), SimpleNamespace(pad_token_id=0, eos_token_id=None))
+    prompt = torch.tensor([[1, 2, 3], [4, 5, 6]])  # unpadded: cache column and rotary position coincide
+    attention = torch.ones_like(prompt)
+
+    torch.manual_seed(7)
+    output = rollout.generate(RolloutRequest(prompt, attention), SamplingConfig(max_new_tokens=4, temperature=1.0))
+
+    with torch.no_grad():
+        logits = model(output.input_ids, attention_mask=output.attention_mask).logits
+    start = int(output.response_start_idx[0])
+    expected = torch.log_softmax(logits[:, start - 1:-1, :], dim=-1).gather(-1,
+                                                                           output.input_ids[:, start:].unsqueeze(-1))
+    expected = expected.squeeze(-1)
+
+    assert output.response_logprobs.shape == (2, 4)
+    assert torch.allclose(output.response_logprobs, expected, atol=1e-5)
+
+
+def test_sampling_path_owns_the_decode_loop():
+    """One prefill, then a single-token forward per step, all writing into a static cache."""
+    from transformers import LlamaForCausalLM, StaticCache
+
+    class RecordingLlama(LlamaForCausalLM):
+
+        def __init__(self, config):
+            super().__init__(config)
+            self.widths = []
+            self.masks = []
+            self.cache_types = []
+
+        def forward(self, *args, **kwargs):
+            input_ids = kwargs.get("input_ids", args[0] if args else None)
+            self.widths.append(int(input_ids.shape[1]))
+            self.masks.append(kwargs["attention_mask"].tolist())
+            self.cache_types.append(type(kwargs.get("past_key_values")).__name__)
+            return super().forward(*args, **kwargs)
+
+        def generate(self, *args, **kwargs):
+            raise AssertionError("sampling must not fall back to HuggingFace generate")
+
+    model = _tiny_llama(model_class=RecordingLlama)
+    rollout = HybridEngineRollout(SimpleNamespace(module=model), SimpleNamespace(pad_token_id=0, eos_token_id=None))
+    prompt = torch.tensor([[0, 1, 2], [3, 4, 5]])
+    attention = torch.tensor([[0, 1, 1], [1, 1, 1]])
+    request = RolloutRequest(prompt, attention)
+
+    torch.manual_seed(1)
+    output = rollout.generate(request, SamplingConfig(max_new_tokens=4, temperature=1.0))
+
+    assert output.input_ids.shape == (2, 7)
+    assert model.widths == [3, 1, 1, 1]
+    assert set(model.cache_types) == {StaticCache.__name__}
+    # The prefill carries the prompt mask, and the decode masks hide the pad column while
+    # adding exactly one column per step.
+    assert model.masks[0] == attention.tolist()
+    for index, mask in enumerate(model.masks[1:], start=1):
+        assert mask[0] == [0, 1, 1] + [1] * index + [0] * (4 - index)
+
+
+def test_sampling_path_pads_after_eos_and_zeroes_retired_logprobs():
+    """The first EOS ends the response; later tokens and their log-probabilities are retired."""
+
+    class ScriptedModel(torch.nn.Module):
+        _supports_cache_class = True
+
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(1))
+            self.config = PretrainedConfig(max_position_embeddings=32,
+                                           num_hidden_layers=1,
+                                           num_attention_heads=1,
+                                           num_key_value_heads=1,
+                                           hidden_size=1,
+                                           head_dim=1)
+            self.script = [5, 2, 9, 9]
+            self.step = 0
+
+        def forward(self, input_ids, attention_mask=None, past_key_values=None, use_cache=True, **kwargs):
+            keys = input_ids[:, None, :, None].float()
+            past_key_values.update(keys, keys, layer_idx=0, cache_kwargs=kwargs)
+            logits = torch.full((input_ids.shape[0], input_ids.shape[1], 16), -1e9)
+            logits[:, -1, self.script[self.step]] = 20.0
+            self.step += 1
+            return SimpleNamespace(logits=logits)
+
+    rollout = HybridEngineRollout(SimpleNamespace(module=ScriptedModel()),
+                                  SimpleNamespace(pad_token_id=1, eos_token_id=2))
+    request = RolloutRequest(torch.tensor([[1, 2, 3]]), torch.ones((1, 3), dtype=torch.long))
+
+    output = rollout.generate(request, SamplingConfig(max_new_tokens=4, temperature=1.0))
+
+    assert output.input_ids[:, 3:].tolist() == [[5, 2, 1, 1]]
+    assert output.attention_mask[:, 3:].tolist() == [[1, 1, 0, 0]]
+    assert output.response_logprobs[:, 2:].tolist() == [[0.0, 0.0]]
