@@ -279,6 +279,9 @@ class DeepSpeedStaticCache:
             positions[:count].copy_(compacted)
             if count < positions.numel():
                 positions[count:].fill_(-1)
+        # The physical capacity stays fixed; only the active prefix shrinks.
+        # Hybrid linear-attention state is read through the active prefix.
+        self._active_batch_size = active_indices.numel()
 
     def trim_left(self, count: int) -> None:
         """Shift all cache layers left to reclaim an unused prefix span."""

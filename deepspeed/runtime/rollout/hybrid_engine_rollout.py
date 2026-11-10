@@ -124,6 +124,19 @@ class HybridEngineRolloutConfig:
     Cache trimming is opt-in because it copies the live cache columns after
     each reclaim. Without it, the rollout trims only when the cache would
     otherwise exhaust and a dead prefix can be reclaimed.
+
+    Chunked prefill is opt-in and covers every greedy generation path: both
+    continuous-batching paths, the captured-graph static path, and the plain
+    ``model.generate()`` path (which is handed a cache that already holds the
+    prompt). When enabled, a prompt whose effective length exceeds
+    ``prefill_chunk_size`` is staged in a private cache and its prefill advances by at
+    most ``prefill_chunk_size`` tokens per forward, so rows that are already decoding
+    keep making progress while a long prompt fills. Staging is decided on real tokens,
+    so a batch padded to a wide common width does not stage prompts that are actually
+    short, and a staged request spends no generation budget until its prompt is
+    complete. Sampling rollouts prefill in a single forward and log a warning. The
+    cost is one staging cache per prompt being filled, sized to that prompt's
+    effective length.
     """
     use_graph_capture: bool = False
     enable_profiling: bool = False
@@ -131,6 +144,8 @@ class HybridEngineRolloutConfig:
     align_decode_fronts: bool = False
     enable_cache_trimming: bool = False
     continuous_cache_capacity: Optional[int] = None
+    enable_chunked_prefill: bool = False
+    prefill_chunk_size: int = 512
 
 
 @dataclass
@@ -145,6 +160,50 @@ class _ContinuousGraphState:
     static_cache_position: torch.Tensor
     graph: object
     static_logits: torch.Tensor
+
+
+@dataclass
+class _PrefillChunk:
+    """State of a prompt whose prefill is split across scheduler steps.
+
+    ``cache`` holds the prefix computed by the chunks so far; the next chunk's
+    attention reads it, so the two only ever move forward together. ``offset`` is
+    the first prompt column the next chunk writes, which is also the number of
+    columns already staged.
+    """
+
+    slot: int
+    cache: object
+    prompt_ids: torch.Tensor
+    prompt_attention: torch.Tensor
+    position_ids: torch.Tensor
+    offset: int = 0
+
+    @property
+    def prompt_len(self):
+        return self.prompt_ids.shape[1]
+
+    @property
+    def remaining(self):
+        return self.prompt_len - self.offset
+
+    def staging_bytes(self):
+        """Bytes held by the staging cache, mirroring the main cache accounting.
+
+        Transformers allocates a static layer's key/value tensors on first use, so a
+        cache that has not run a chunk yet reports zero here.
+        """
+        layers = getattr(self.cache, "layers", None)
+        if layers is None:
+            return 0
+        total = 0
+        for layer in layers:
+            keys = getattr(layer, "keys", None)
+            values = getattr(layer, "values", None)
+            if keys is None or values is None:
+                continue
+            total += keys.numel() * keys.element_size() + values.numel() * values.element_size()
+        return total
 
 
 class HybridEngineRollout(RolloutEngine):
@@ -165,9 +224,12 @@ class HybridEngineRollout(RolloutEngine):
         self.align_decode_fronts = getattr(cfg, 'align_decode_fronts', False) if cfg else False
         self.enable_cache_trimming = getattr(cfg, 'enable_cache_trimming', False) if cfg else False
         self.continuous_cache_capacity = getattr(cfg, 'continuous_cache_capacity', None) if cfg else None
+        self.enable_chunked_prefill = getattr(cfg, 'enable_chunked_prefill', False) if cfg else False
+        self.prefill_chunk_size = getattr(cfg, 'prefill_chunk_size', 0) if cfg else 0
         self._last_profile = None
         self._continuous_graph_state = None
         self._last_continuous_stats = None
+        self._chunked_prefill_warned = False
 
     @torch.no_grad()
     def generate(self, request: RolloutRequest, sampling: SamplingConfig) -> RolloutBatch:
@@ -205,6 +267,7 @@ class HybridEngineRollout(RolloutEngine):
             accelerator.synchronize()
             expansion_end = time.perf_counter()
 
+        is_greedy = sampling.temperature <= 0.0
         use_graph_capture = self.use_graph_capture
         if use_graph_capture and not get_accelerator().is_graph_capture_supported():
             # Same opt-in as the HybridEngine graph cache and the continuous
@@ -230,6 +293,10 @@ class HybridEngineRollout(RolloutEngine):
             if use_graph_capture:
                 output_ids = self._generate_graph(prompt_ids, prompt_attn, max_new_tokens, pad_token_id, module,
                                                   device, sampling)
+            elif (self.enable_chunked_prefill and is_greedy and prompt_len > self.prefill_chunk_size
+                  and getattr(module, "_supports_cache_class", None) is not False):
+                output_ids = self._generate_from_staged_prefill(prompt_ids, prompt_attn, max_new_tokens, pad_token_id,
+                                                                module, device)
             else:
                 zero3_sync = self._zero3_work_remaining()
                 stopping_criteria = None
@@ -237,6 +304,10 @@ class HybridEngineRollout(RolloutEngine):
                     stopping_criteria = [
                         _GlobalEosStoppingCriteria(prompt_len, self.tokenizer.eos_token_id, zero3_sync)
                     ]
+                if self.enable_chunked_prefill and not is_greedy and not self._chunked_prefill_warned:
+                    logger.warning("Rollout chunked prefill currently covers greedy generation only; "
+                                   "sampling rollouts prefill the prompt in a single forward.")
+                    self._chunked_prefill_warned = True
                 generate_kwargs = {
                     "attention_mask": prompt_attn,
                     "max_new_tokens": max_new_tokens,
@@ -417,6 +488,9 @@ class HybridEngineRollout(RolloutEngine):
         logical_positions = dict(prompt_lengths)
         cache_position = prompt_len
         span_starts = [0] * max_batch_size
+        prefill_chunks = {}
+        chunk_stats = {"chunks": 0, "peak_staging_bytes": 0}
+        chunk_size = self.prefill_chunk_size if self.enable_chunked_prefill else 0
 
         self._profile_end(profile, "cache_management_overhead_ms", cache_start)
         scheduler_start = self._profile_start(profile)
@@ -432,6 +506,12 @@ class HybridEngineRollout(RolloutEngine):
             if survivor_count:
                 if update.retired:
                     cache.compact(keep_slots)
+                    # Compaction moves surviving rows down, so a staged prompt's recorded slot
+                    # has to move with its data or it would keep writing to another row.
+                    if prefill_chunks:
+                        row_map = {old: new for new, old in enumerate(keep_slots.tolist())}
+                        for chunk in prefill_chunks.values():
+                            chunk.slot = row_map[chunk.slot]
                     identity = torch.arange(survivor_count, dtype=torch.long, device=device)
                     if not torch.equal(keep_slots, identity):
                         survivor_attention = attention_mask.index_select(0, keep_slots).clone()
@@ -490,7 +570,7 @@ class HybridEngineRollout(RolloutEngine):
                 span_starts = [0] * max_batch_size
 
             self._profile_end(profile, "cache_management_overhead_ms", cache_start)
-            if survivor_count and cache_position >= max_cache_len:
+            if self.align_decode_fronts and survivor_count and cache_position >= max_cache_len:
                 raise self._continuous_cache_exhaustion_error(max_cache_len)
             admitted_tokens = self._continuous_prefill(
                 module,
@@ -507,62 +587,104 @@ class HybridEngineRollout(RolloutEngine):
                 sampling,
                 self.align_decode_fronts,
                 profile,
+                prefill_chunks=prefill_chunks,
+                chunk_size=chunk_size,
             )
+            published_ids = set()
+            if prefill_chunks:
+                published = self._run_chunked_prefill(module, prefill_chunks, chunk_size, device, cache,
+                                                      attention_mask, write_positions, chunk_stats, profile)
+                admitted_tokens.update(published)
+                # A prompt that completed in this step starts decoding next step, exactly
+                # like a freshly admitted row: this step's token is the first response token.
+                published_ids = set(published)
             if self.align_decode_fronts:
                 for admitted, target_row in zip(update.admitted, update.admitted_slots):
                     span_starts[target_row] = cache_position - prompt_lengths[admitted.request_id]
 
             decoded_tokens = {}
-            if survivor_count:
-                survivor_ids = update.active_ids[:survivor_count]
-                decode_input = torch.cat([next_tokens[request_id] for request_id in survivor_ids], dim=0)
-                if cache_position >= max_cache_len:
-                    raise self._continuous_cache_exhaustion_error(max_cache_len)
-                write_positions[:survivor_count].fill_(cache_position)
+            active_ids = update.active_ids
+            # Only rows that were already generating decode: this step's admissions and rows
+            # still staging their prompt hold a slot but own no decode column yet. Each row
+            # writes to its own column, so a row that joins the batch later does not push the
+            # others forward.
+            admitted_ids = set(request.request_id for request in update.admitted)
+            decodable_ids = tuple(request_id for request_id in active_ids if request_id not in admitted_ids
+                                  and request_id not in prefill_chunks and request_id not in published_ids)
+            if decodable_ids:
+                active_count = len(active_ids)
+                decodable_rows = [row for row, request_id in enumerate(active_ids) if request_id in set(decodable_ids)]
+                staged_rows = [row for row, request_id in enumerate(active_ids) if request_id in prefill_chunks]
+                dummy_token = torch.zeros(1, 1, dtype=torch.long, device=device)
+                decode_input = torch.cat([next_tokens.get(request_id, dummy_token) for request_id in active_ids],
+                                         dim=0)
+                row_positions = write_positions[:active_count]
                 if self.align_decode_fronts:
-                    position_ids = torch.tensor([logical_positions[request_id] for request_id in survivor_ids],
+                    # The aligned layout packs every survivor behind one front and re-derives
+                    # their positions from it each step; chunked prefill does not combine with it.
+                    row_positions[:survivor_count].fill_(cache_position)
+                    if cache_position >= max_cache_len:
+                        raise self._continuous_cache_exhaustion_error(max_cache_len)
+                    attention_mask[:survivor_count, cache_position] = 1
+                    decode_cache_position = torch.tensor([cache_position], dtype=torch.long, device=device)
+                else:
+                    # Every row advances its own column, so a row that joins the batch later
+                    # neither pushes the others forward nor inherits their position.
+                    if staged_rows:
+                        row_positions[staged_rows] = max_cache_len - 1
+                    latest_position = row_positions[decodable_rows].max()
+                    if int(latest_position) >= max_cache_len:
+                        raise self._continuous_cache_exhaustion_error(max_cache_len)
+                    attention_mask[decodable_rows, row_positions[decodable_rows]] = 1
+                    decode_cache_position = latest_position.reshape(1)
+                if self.align_decode_fronts:
+                    position_ids = torch.tensor([logical_positions[request_id] for request_id in active_ids],
                                                 dtype=torch.long,
                                                 device=device).unsqueeze(1)
                 else:
-                    position_ids = attention_mask[:survivor_count, :cache_position].sum(dim=1, keepdim=True)
-                attention_mask[:survivor_count, cache_position] = 1
+                    position_ids = attention_mask[:active_count].sum(dim=1, keepdim=True)
                 decode_start = self._profile_start(profile)
                 output = self._call_model(
                     module,
                     decode_input,
-                    attention_mask=attention_mask[:survivor_count],
+                    attention_mask=attention_mask[:active_count],
                     past_key_values=cache,
                     use_cache=True,
-                    cache_position=torch.tensor([cache_position], dtype=torch.long, device=device),
+                    cache_position=decode_cache_position,
                     position_ids=position_ids,
                 )
                 self._profile_end(profile, "decode_forward_ms", decode_start, count="num_decode_forwards")
                 decoded = self._continuous_next_tokens(
-                    output.logits[:, -1, :],
-                    survivor_ids,
+                    output.logits[decodable_rows, -1, :],
+                    decodable_ids,
                     request_by_id,
                     responses,
                     module,
                     select_next_tokens,
                 )
                 stats["decode_steps"] += 1
-                decoded_tokens = dict(zip(survivor_ids, decoded.split(1, dim=0)))
-                for request_id in survivor_ids:
+                decoded_tokens = dict(zip(decodable_ids, decoded.split(1, dim=0)))
+                if not self.align_decode_fronts:
+                    row_positions[decodable_rows] += 1
+                for request_id in decodable_ids:
                     logical_positions[request_id] += 1
 
             next_tokens = decoded_tokens | admitted_tokens
             finished_ids = []
             for request_id in update.active_ids:
-                token = next_tokens[request_id]
+                token = next_tokens.get(request_id)
+                if token is None:
+                    # Still staging its prompt in chunks: nothing to append or retire yet.
+                    continue
                 responses[request_id].append(token)
                 if self._is_eos(token):
                     finished_ids.append(request_id)
 
-            if survivor_count:
+            if decodable_ids:
                 cache_position += 1
             stats["peak_cache_length"] = max(stats["peak_cache_length"], cache_position)
             scheduler_start = self._profile_start(profile)
-            update = scheduler.advance(finished_ids)
+            update = scheduler.advance(finished_ids, prefilling_ids=tuple(prefill_chunks))
             self._profile_end(profile, "scheduler_overhead_ms", scheduler_start)
 
         stats["cache_memory_bytes"] = self._continuous_cache_memory_bytes(cache, attention_mask, write_positions)
@@ -581,6 +703,8 @@ class HybridEngineRollout(RolloutEngine):
             stats["tokens_per_second"] = None
         stats.setdefault("trim_bytes_moved", 0)
         stats["trim_frequency"] = (stats["trim_count"] / stats["decode_steps"] if stats["decode_steps"] else 0.0)
+        stats["chunked_prefill_chunks"] = chunk_stats["chunks"]
+        stats["chunked_prefill_staging_bytes"] = chunk_stats["peak_staging_bytes"]
         self._last_continuous_stats = stats
         if profile is not None:
             self._finish_continuous_profile(profile, original_request, responses, max_batch_size, prompt_len,
@@ -595,6 +719,10 @@ class HybridEngineRollout(RolloutEngine):
         lifetime. Retired rows are masked until a new prompt is prefetched into
         them, so the captured decode always receives the same batch shape and
         static tensor addresses.
+
+        With ``enable_chunked_prefill``, prompts longer than ``prefill_chunk_size``
+        are staged and filled across steps instead of in a single forward, so the
+        decode rows in the batch keep producing tokens while a long prompt fills.
         """
         module = self.engine.module
         select_next_tokens = self._token_selector(sampling)
@@ -650,11 +778,16 @@ class HybridEngineRollout(RolloutEngine):
             "trim_latency_ms": 0.0,
             "trim_bytes_moved": 0,
             "decode_steps": 0,
+            "chunked_prefill_chunks": 0,
+            "chunked_prefill_staging_bytes": 0,
         }
 
         slot_by_request = {}
         write_positions = {}
         next_tokens = {}
+        prefill_chunks = {}
+        chunk_stats = {"chunks": 0, "peak_staging_bytes": 0}
+        chunk_size = self.prefill_chunk_size if self.enable_chunked_prefill else 0
         update = scheduler.schedule()
         while update.active:
             if profile is not None:
@@ -692,11 +825,31 @@ class HybridEngineRollout(RolloutEngine):
                     sampling,
                     profile=profile,
                     target_slots=tuple(admitted_slots),
+                    prefill_chunks=prefill_chunks,
+                    chunk_size=chunk_size,
                 )
                 next_tokens.update(admitted_tokens)
+            published_ids = set()
+            if prefill_chunks:
+                chunked_tokens = self._run_chunked_prefill(module,
+                                                           prefill_chunks,
+                                                           chunk_size,
+                                                           device,
+                                                           cache,
+                                                           static_attention,
+                                                           static_write_positions,
+                                                           chunk_stats,
+                                                           profile,
+                                                           request_write_positions=write_positions)
+                next_tokens.update(chunked_tokens)
+                # A prompt that completed in this step starts decoding next step, exactly
+                # like a freshly admitted row: this step's token is the first response token
+                # and must not be overwritten by a decode of the same row.
+                published_ids = set(chunked_tokens)
             self._profile_end(profile, "cache_management_overhead_ms", cache_start)
 
-            decode_ids = tuple(request_id for request_id in update.active_ids if request_id not in admitted_ids)
+            decode_ids = tuple(request_id for request_id in update.active_ids if request_id not in admitted_ids
+                               and request_id not in prefill_chunks and request_id not in published_ids)
             static_input.zero_()
             static_position_ids.zero_()
             # Captured replay always executes every physical row. Keep non-decoding
@@ -735,13 +888,17 @@ class HybridEngineRollout(RolloutEngine):
 
             finished_ids = []
             for request_id in update.active_ids:
-                token = next_tokens[request_id]
+                token = next_tokens.get(request_id)
+                if token is None:
+                    # This row is still prefilling its prompt in chunks: it holds a slot
+                    # but has nothing to append or retire in this step.
+                    continue
                 responses[request_id].append(token)
                 if self._is_eos(token):
                     finished_ids.append(request_id)
 
             scheduler_start = self._profile_start(profile)
-            update = scheduler.advance(finished_ids)
+            update = scheduler.advance(finished_ids, prefilling_ids=tuple(prefill_chunks))
             self._profile_end(profile, "scheduler_overhead_ms", scheduler_start)
             if write_positions:
                 stats["peak_cache_length"] = max(stats["peak_cache_length"], max(write_positions.values()))
@@ -759,6 +916,8 @@ class HybridEngineRollout(RolloutEngine):
             stats["end_to_end_ms"] = None
             stats["tokens_per_second"] = None
         stats["trim_frequency"] = 0.0
+        stats["chunked_prefill_chunks"] = chunk_stats["chunks"]
+        stats["chunked_prefill_staging_bytes"] = chunk_stats["peak_staging_bytes"]
         self._last_continuous_stats = stats
         if profile is not None:
             self._finish_continuous_profile(profile, original_request, responses, max_batch_size, prompt_len,
@@ -770,6 +929,8 @@ class HybridEngineRollout(RolloutEngine):
             raise ValueError("continuous graph capture does not support aligned decode fronts")
         if self.enable_cache_trimming:
             raise ValueError("continuous graph capture does not support cache trimming")
+        if self.enable_chunked_prefill and self.prefill_chunk_size <= 0:
+            raise ValueError("prefill_chunk_size must be positive when chunked prefill is enabled")
         if (self.continuous_cache_capacity is not None
                 and self.continuous_cache_capacity < prompt_len + sampling.max_new_tokens):
             raise ValueError("continuous_cache_capacity must fit the prompt and all generated tokens")
@@ -933,6 +1094,10 @@ class HybridEngineRollout(RolloutEngine):
             raise ValueError("max_batch_size must be positive")
         if self.use_shared_prefill:
             raise ValueError("continuous batching does not support shared prompt prefill")
+        if self.enable_chunked_prefill and self.prefill_chunk_size <= 0:
+            raise ValueError("prefill_chunk_size must be positive when chunked prefill is enabled")
+        if self.enable_chunked_prefill and self.align_decode_fronts:
+            raise ValueError("chunked prefill does not support aligned decode fronts")
 
         prompt_len = requests[0].prompt_ids.shape[1]
         device = requests[0].prompt_ids.device
@@ -974,7 +1139,9 @@ class HybridEngineRollout(RolloutEngine):
                             sampling,
                             align_decode_fronts=False,
                             profile=None,
-                            target_slots=None):
+                            target_slots=None,
+                            prefill_chunks=None,
+                            chunk_size=0):
         if not update.admitted:
             return {}
 
@@ -984,6 +1151,12 @@ class HybridEngineRollout(RolloutEngine):
                 target_slots = update.admitted_slots
             if len(target_slots) != len(admitted_ids):
                 raise ValueError("continuous prefill needs one target slot per admitted request")
+            if prefill_chunks is not None and chunk_size > 0:
+                admitted_ids, target_slots = self._stage_long_prompts(module, admitted_ids, target_slots,
+                                                                      request_by_id, prefill_chunks, chunk_size,
+                                                                      static_cache_type, model_dtype, device)
+                if not admitted_ids:
+                    return {}
             prompt_ids = torch.cat([request_by_id[request_id].prompt_ids for request_id in admitted_ids], dim=0)
             prompt_attention = torch.cat(
                 [request_by_id[request_id].prompt_attention_mask for request_id in admitted_ids], dim=0)
@@ -1000,19 +1173,27 @@ class HybridEngineRollout(RolloutEngine):
             )
             self._profile_end(profile, "prefill_forward_ms", prefill_start, count="num_prefill_forwards")
             cache_copy_start = self._profile_start(profile)
-            cache_start = cache_position - prompt_len
-            if cache_start < 0:
-                raise ValueError("continuous batching prompt does not fit behind the decode front")
+            if chunk_size > 0:
+                # With chunked prefill every row lives behind its own column zero: a row
+                # admitted mid-run must not be placed relative to a front that staged rows
+                # have already pushed past the room it needs for its response.
+                cache_start = 0
+            else:
+                cache_start = cache_position - prompt_len
+                if cache_start < 0:
+                    raise ValueError("continuous batching prompt does not fit behind the decode front")
             for layer_idx in range(self._cache_layer_count(prefill_cache)):
                 prefill_keys, prefill_values = self._cache_layer_tensors(prefill_cache, layer_idx)
                 target_layer = self._continuous_cache_layer(cache, layer_idx, prefill_keys, prefill_values,
                                                             attention_mask.shape[0])
                 for source_row, target_row in enumerate(target_slots):
-                    target_layer.keys[target_row, :, cache_start:cache_position].copy_(prefill_keys[source_row])
-                    target_layer.values[target_row, :, cache_start:cache_position].copy_(prefill_values[source_row])
+                    target_layer.keys[target_row, :,
+                                      cache_start:cache_start + prompt_len].copy_(prefill_keys[source_row])
+                    target_layer.values[target_row, :,
+                                        cache_start:cache_start + prompt_len].copy_(prefill_values[source_row])
             for source_row, target_row in enumerate(target_slots):
-                attention_mask[target_row, cache_start:cache_position].copy_(prompt_attention[source_row])
-                write_positions[target_row] = cache_position
+                attention_mask[target_row, cache_start:cache_start + prompt_len].copy_(prompt_attention[source_row])
+                write_positions[target_row] = cache_start + prompt_len
             self._profile_end(profile, "cache_management_overhead_ms", cache_copy_start)
             return dict(zip(admitted_ids, prefill_tokens.split(1, dim=0)))
 
@@ -1063,6 +1244,171 @@ class HybridEngineRollout(RolloutEngine):
         if not layer.is_initialized:
             layer.lazy_initialization(prefill_keys, prefill_values, max_batch_size=max_batch_size)
         return layer
+
+    def _stage_long_prompts(self, module, admitted_ids, target_slots, request_by_id, prefill_chunks, chunk_size,
+                            static_cache_type, model_dtype, device):
+        """Divert prompts that do not fit one chunk out of this step's prefill batch.
+
+        A staged prompt keeps its slot and is advanced by ``_run_chunked_prefill`` on later
+        steps, so the decode batch keeps running while a long prompt fills. The staged window
+        only ever covers real tokens, so the staged length is the prompt's effective length:
+        a batch padded to a wide common width does not stage prompts that are actually short.
+
+        Returns the ids and slots that still take the one-shot prefill path.
+        """
+        batched_ids, batched_slots = [], []
+        for request_id, target_slot in zip(admitted_ids, target_slots):
+            request = request_by_id[request_id]
+            valid = request.prompt_attention_mask[0].bool()
+            prompt_ids = request.prompt_ids[:, valid]
+            prompt_len = prompt_ids.shape[1]
+            if prompt_len <= chunk_size:
+                batched_ids.append(request_id)
+                batched_slots.append(target_slot)
+                continue
+            prompt_attention = torch.ones_like(prompt_ids)
+            staging_cache = self._create_static_cache(static_cache_type, module.config, prompt_ids.shape[0],
+                                                      prompt_len, device, model_dtype)
+            prefill_chunks[request_id] = _PrefillChunk(slot=target_slot,
+                                                       cache=staging_cache,
+                                                       prompt_ids=prompt_ids,
+                                                       prompt_attention=prompt_attention,
+                                                       position_ids=self._prefill_position_ids(prompt_attention))
+        return tuple(batched_ids), tuple(batched_slots)
+
+    def _advance_prefill_chunk(self, module, chunk, width, device, profile=None):
+        """Prefill the next chunk of a staged prompt.
+
+        Returns the first response token once the prompt is complete, else ``None``. The
+        window ends at the chunk boundary but the attention mask covers the whole staged
+        prefix, which is what lets a later chunk read the KV written by earlier ones.
+        """
+        end = min(chunk.prompt_len, chunk.offset + width)
+        validity = torch.zeros_like(chunk.prompt_attention)
+        validity[:, :end] = chunk.prompt_attention[:, :end]
+        forward_start = self._profile_start(profile)
+        output = self._call_model(
+            module,
+            chunk.prompt_ids[:, chunk.offset:end],
+            attention_mask=validity,
+            past_key_values=chunk.cache,
+            use_cache=True,
+            cache_position=torch.arange(chunk.offset, end, device=device),
+            position_ids=chunk.position_ids[:, chunk.offset:end],
+            **self._last_logits_kwargs(module),
+        )
+        self._profile_end(profile, "prefill_forward_ms", forward_start, count="num_prefill_forwards")
+        chunk.offset = end
+        if end < chunk.prompt_len:
+            return None
+        # The chunk that completes the prompt also predicts the first response token.
+        return output.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+
+    def _publish_prefill_chunk(self, chunk, cache, attention_mask, write_positions):
+        """Move a completed staged prompt into its row of the decode cache.
+
+        The prompt lands at column zero of its own row: the cache is row-major, so a row's
+        columns are its own and do not compete with the decode front of the rows around it.
+        That keeps the cache capacity a function of the prompt and the response budget only,
+        never of how long the prompt spent staging. Returns the column the row's first
+        generated token goes into.
+        """
+        prompt_end = chunk.prompt_len
+        for layer_idx in range(self._cache_layer_count(chunk.cache)):
+            staged_keys, staged_values = self._cache_layer_tensors(chunk.cache, layer_idx)
+            target_layer = cache.layers[layer_idx]
+            if not target_layer.is_initialized:
+                # The decode cache sizes its layers lazily from the first KV it sees; a batch whose
+                # admitted rows are all staged never runs a one-shot prefill, so initialize here.
+                target_layer.lazy_initialization(staged_keys[:1], staged_values[:1],
+                                                 max_batch_size=attention_mask.shape[0])
+            target_layer.keys[chunk.slot, :, :prompt_end].copy_(staged_keys[0])
+            target_layer.values[chunk.slot, :, :prompt_end].copy_(staged_values[0])
+        attention_mask[chunk.slot, :prompt_end].copy_(chunk.prompt_attention[0])
+        write_positions[chunk.slot] = prompt_end
+        return prompt_end
+
+    def _run_chunked_prefill(self,
+                             module,
+                             prefill_chunks,
+                             chunk_size,
+                             device,
+                             cache,
+                             attention_mask,
+                             write_positions,
+                             chunk_stats,
+                             profile=None,
+                             request_write_positions=None):
+        """Advance the staged prompts by at most ``chunk_size`` tokens in total.
+
+        The budget is spent in admission order, so the number of extra forwards in a step
+        is bounded no matter how many prompts are waiting. Returns the first response
+        token of every prompt that completed in this step, keyed by request id.
+        """
+        budget = chunk_size
+        completed = {}
+        for request_id in list(prefill_chunks):
+            if budget <= 0:
+                break
+            chunk = prefill_chunks[request_id]
+            width = min(chunk.remaining, budget)
+            first_token = self._advance_prefill_chunk(module, chunk, width, device, profile)
+            budget -= width
+            chunk_stats["chunks"] += 1
+            chunk_stats["peak_staging_bytes"] = max(chunk_stats["peak_staging_bytes"], chunk.staging_bytes())
+            if first_token is None:
+                continue
+            prompt_end = self._publish_prefill_chunk(chunk, cache, attention_mask, write_positions)
+            if request_write_positions is not None:
+                request_write_positions[request_id] = prompt_end
+            completed[request_id] = first_token
+            del prefill_chunks[request_id]
+        return completed
+
+    def _chunked_prefill_cache(self,
+                               module,
+                               static_cache_type,
+                               prompt_ids,
+                               prompt_attention,
+                               model_dtype,
+                               device,
+                               chunk_size,
+                               max_cache_len=None,
+                               profile=None):
+        """Prefill a prompt batch in windows and return its first response token and cache.
+
+        This is the whole-prompt counterpart of ``_advance_prefill_chunk``: the static
+        generation paths own no scheduler, so they consume the chunks in one pass and then
+        hand the filled cache to their decode loop. Windows advance by at most
+        ``chunk_size`` tokens, which bounds the largest forward a caller can be made to run.
+        ``max_cache_len`` sizes the cache for callers that keep decoding into it.
+        """
+        prompt_len = prompt_ids.shape[1]
+        if max_cache_len is None:
+            max_cache_len = prompt_len
+        position_ids = self._prefill_position_ids(prompt_attention)
+        prefill_cache = self._create_static_cache(static_cache_type, module.config, prompt_ids.shape[0], max_cache_len,
+                                                  device, model_dtype)
+        output = None
+        for start in range(0, prompt_len, chunk_size):
+            end = min(prompt_len, start + chunk_size)
+            # Validity covers the whole staged prefix, so a later chunk reads the KV that
+            # the earlier ones wrote while only the current window is queried.
+            validity = torch.zeros_like(prompt_attention)
+            validity[:, :end] = prompt_attention[:, :end]
+            forward_start = self._profile_start(profile)
+            output = self._call_model(
+                module,
+                prompt_ids[:, start:end],
+                attention_mask=validity,
+                past_key_values=prefill_cache,
+                use_cache=True,
+                cache_position=torch.arange(start, end, device=device),
+                position_ids=position_ids[:, start:end],
+                **self._last_logits_kwargs(module),
+            )
+            self._profile_end(profile, "prefill_forward_ms", forward_start, count="num_prefill_forwards")
+        return output.logits[:, -1, :].argmax(dim=-1, keepdim=True), prefill_cache
 
     def _start_continuous_profile(self):
         accelerator = get_accelerator()
@@ -1432,6 +1778,42 @@ class HybridEngineRollout(RolloutEngine):
     # Graph capture decode loop
     # ------------------------------------------------------------------
 
+    def _generate_from_staged_prefill(self, prompt_ids, prompt_attn, max_new_tokens, pad_token_id, module, device):
+        """Stage a long prompt in chunks, then let HuggingFace generate from the filled cache.
+
+        This path hands the decode loop to ``module.generate``, so the only forward this
+        layer can split is the prompt's. Passing a cache that already holds the prompt keeps
+        the token stream identical to a single-forward prefill while bounding the largest
+        forward the caller has to run. The first response token comes out of the staging
+        chunks, so the continuation asks for one token less.
+        """
+        from transformers import StaticCache
+
+        prompt_len = prompt_ids.shape[1]
+        model_dtype = next(module.parameters()).dtype
+        first_token, cache = self._chunked_prefill_cache(module,
+                                                         StaticCache,
+                                                         prompt_ids,
+                                                         prompt_attn,
+                                                         model_dtype,
+                                                         device,
+                                                         self.prefill_chunk_size,
+                                                         max_cache_len=prompt_len + max_new_tokens)
+        if max_new_tokens == 1:
+            return torch.cat([prompt_ids, first_token], dim=1)
+        continuation_mask = torch.cat(
+            [prompt_attn, torch.ones(prompt_ids.shape[0], 1, dtype=prompt_attn.dtype, device=device)], dim=1)
+        continuation = module.generate(
+            first_token,
+            past_key_values=cache,
+            attention_mask=continuation_mask,
+            max_new_tokens=max_new_tokens - 1,
+            do_sample=False,
+            eos_token_id=None,
+            pad_token_id=pad_token_id,
+        )
+        return torch.cat([prompt_ids, continuation], dim=1)
+
     def _generate_graph(self, prompt_ids, prompt_attn, max_new_tokens, pad_token_id, module, device, sampling):
         """Decode with DeepSpeedStaticCache + graph capture, greedy or sampled per ``sampling``."""
         from transformers import StaticCache
@@ -1455,19 +1837,24 @@ class HybridEngineRollout(RolloutEngine):
             return select_next_tokens(logits)
 
         # --- Prefill with HF StaticCache (correct attention semantics) ---
-        prefill_cache = self._create_static_cache(StaticCache, module.config, batch_size, max_len, device, model_dtype)
         prefill_attn = torch.ones(batch_size, prompt_len, dtype=torch.long, device=device)
         prefill_attn[:, :prompt_len] = prompt_attn
-        prefill_out = module(
-            prompt_ids,
-            attention_mask=prefill_attn,
-            past_key_values=prefill_cache,
-            use_cache=True,
-            cache_position=torch.arange(prompt_len, device=device),
-            **self._last_logits_kwargs(module),
-        )
-        next_token = next_tokens(prefill_out.logits[:, -1, :])
-        output_ids.append(next_token)
+        is_greedy = sampling.temperature <= 0.0
+        if self.enable_chunked_prefill and is_greedy and prompt_len > self.prefill_chunk_size:
+            next_token, prefill_cache = self._chunked_prefill_cache(module, StaticCache, prompt_ids, prefill_attn,
+                                                                    model_dtype, device, self.prefill_chunk_size)
+        else:
+            prefill_cache = self._create_static_cache(StaticCache, module.config, batch_size, max_len, device,
+                                                      model_dtype)
+            prefill_out = module(
+                prompt_ids,
+                attention_mask=prefill_attn,
+                past_key_values=prefill_cache,
+                use_cache=True,
+                cache_position=torch.arange(prompt_len, device=device),
+                **self._last_logits_kwargs(module),
+            )
+            next_token = next_tokens(prefill_out.logits[:, -1, :])
 
         # --- Copy prefill KV into DeepSpeedStaticCache ---
         write_pos = torch.tensor(prompt_len - 1, dtype=torch.long, device=device)
