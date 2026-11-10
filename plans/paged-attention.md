@@ -1,7 +1,8 @@
 # Paged attention for the rollout — plan
 
-Status: phases 0-2 implemented (blocked decode path). Prefill still uses the dense static cache and
-copies into blocks; phases 3 (paged prefill/mixed), 4 (graphs), and 5 (prefix reuse) remain.
+Status: phases 0-2 and 4 implemented (graph-safe blocked decode), plus sampling in chunked prefill.
+Prefill still uses the dense static cache and copies into blocks; phase 3 (paged prefill/mixed) and
+phase 5 (prefix reuse) remain.
 Owner: rollout/graph workstream.
 Target: `deepspeed/runtime/rollout/` on the hybrid-engine path, for RL/distillation training.
 Read with: `plans/../optimization_strategy.md` §3.4.2, §4.1, §9 (R2/R8/R17/R20/R21) and `cuda-graph-sampling-v2.md`.
@@ -17,12 +18,12 @@ Implemented in `deepspeed/runtime/rollout/paged_cache.py`:
 - Qwen3 attention shim: decodes with `BlockedFlashAttn`; falls back to the original HF attention for the
   dense prefill/staging cache.
 - `HybridEngineRolloutConfig(use_paged_cache=True, paged_block_size=None)`; the benchmark flag is
-  `--use-paged-cache`. Paged decode requires continuous batching and currently excludes graph capture,
-  aligned decode fronts, and unaligned trimming (phases 3-4).
+  `--use-paged-cache`. Paged decode supports graph capture/replay, requires continuous batching, and
+  excludes aligned decode fronts and unaligned trimming.
 - Atoms and block allocation are built once per decode step, not once per layer.
 
 Measured on Qwen3-4B, A40, bf16, LongBench prompt truncated to 6144 tokens, batch 1, 16 new tokens,
-no graph capture, warmup 1 (`runs/paged_attention_6k.md`):
+no graph capture, warmup 1 (`DeepSpeedExamples/training/opsd/runs/paged_attention_6k.md`):
 
 | path | prefill ms | decode ms/token | total ms | peak MiB | token SHA |
 |---|---:|---:|---:|---:|---|
@@ -30,10 +31,31 @@ no graph capture, warmup 1 (`runs/paged_attention_6k.md`):
 | paged decode | 713.5 | 45.70 | 1507.2 | 9938.7 | `d4a324e9…` |
 
 The blocked kernel is faster per layer (0.167 ms vs 0.346 ms for dense SDPA with the decode mask), so
-decode improves 11.4% and the response tokens are identical. The plan's 66.5 → 25 ms target is not met:
-the measured dense baseline is 51.6 ms, the paged path saves ~6 ms of attention, and the remaining forward
-floor is model/MLP/CPU time. Phase 4 (graphs) is the likely route to the 25 ms target; phase 3 is still
-needed before paged prefill can replace the dense prefill copy.
+eager decode improves 11.4% and the response tokens are identical.
+
+### Four-way: graph + chunked prefill + Gumbel sampler + paged
+
+Same model and 6k prompt, now with graph capture, chunked prefill (chunk 512), and the Gumbel
+device sampler (`temperature=0.7`, `top_p=0.9`, seed 0), warmup 1
+(`DeepSpeedExamples/training/opsd/runs/fourway_6k.md`):
+
+| cache | prefill ms | decode ms/token | total ms | tokens/s | peak MiB |
+|---|---:|---:|---:|---:|---:|
+| dense static | 1379.3 | 39.73 | 2011.7 | 7.95 | 9503.6 |
+| paged | 1381.5 | **25.86** | 1820.4 | 8.79 | 9511.6 |
+
+Paged decode is **1.54x** faster and end-to-end is 1.10x; 97/97 blocks (64 tokens each) are used.
+The plan's 25 ms decode target is essentially met (within 3.4%) once graphs remove the launch/CPU
+overhead. The accuracy verifier reports identical response tokens and a 1.5e-3 max logprob drift
+on the two recorded positions; the current graph path records logprobs only for the final two
+response steps, a pre-existing logging gap shared by both rows.
+
+Graph capture required one non-obvious invariant: the per-width row-index and atom tensors embedded
+in a captured kernel must stay alive across replays. Recreating them in `set_graph_mode` invalidated
+the captured index pointers and caused a device-side `index out of bounds` on the second replay;
+`PagedAttentionCache` now caches those buffers per width.
+
+Phase 3 is still needed before paged prefill can replace the dense prefill copy; phase 5 remains.
 
 ---
 
