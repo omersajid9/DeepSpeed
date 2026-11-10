@@ -87,15 +87,19 @@ Measured on Qwen3-4B, A40, bf16, no graph capture, paged cache, chunk 512, 8 new
 | 6k, batch 2, duplicate prompts | paged, prefix reuse | 1269.7 | 13 | 1875.8 | 9521.3 | `5530534d…` |
 
 The duplicate-prefix run reused 95 blocks / 6080 tokens and cut prefill forwards from 24 to 13.
-With graph capture, chunked prefill, and the sampler on the 6k four-way path, paged prefill is
-822.7 ms versus 1381.6 ms for dense-staging + copy; total is 1233.8 ms versus 1809.2 ms
-(tok/s 12.97 versus 8.84), with token-identical output (`d4a324e9…`).
+With graph capture and chunking disabled, paged decode is the main 6k win: dense eager
+1515.6 ms -> graph 1325.8 -> paged decode 1147.8; paged prefill is time-neutral at 1128.6 ms
+but cuts peak memory 8.7% (9931 -> 9092 MiB). At 20k, dense graph 3777.5 -> paged decode
+3397.9 ms (decode 2.53x); paged prefill is 3421.5 ms and cuts peak memory 18.6%. Chunked
+prefill is not the fastest setting for these single-prompt workloads: it adds 9.3% at 6k and
+13.3% at 20k versus no chunk, though it lowers peak memory and enables more concurrent rows.
 
-A head-to-head vLLM 0.33.0 run (same Qwen3-4B, prompt, tokenizer, chunk 512, batch 1, sampler,
-and generated-token count; vLLM KV pool capped to 1.1 GiB at 6k) is 954.8 ms / 16.76 tok/s at
-6k and 3363.6 ms / 2.38 tok/s at 20k greedy. The DeepSpeed paged path is **1.29x slower at 6k**
-and **1.15x slower at 20k**, with identical 6k and 20k greedy tokens; details in
-`DeepSpeedExamples/training/opsd/runs/vllm_comparison.md`.
+A head-to-head vLLM 0.33.0 run (same Qwen3-4B, prompt, tokenizer, batch 1, no chunked prefill,
+sampler, and generated-token count; vLLM KV pool capped to match) is 823.6 ms / 19.43 tok/s at
+6k and 2794.4 ms / 2.86 tok/s at 20k greedy. The best DeepSpeed path is **1.37x slower at 6k**
+and **1.22x slower at 20k**, with identical 6k and 20k greedy tokens; details in
+`DeepSpeedExamples/training/opsd/runs/optimization_ablation.md` and
+`runs/vllm_comparison.md`.
 Peak memory did not drop because `PagedAttentionCache` sizes the `BlockedKVCache` pool for the
 full per-row block table; prefix reuse saves prefill compute and KV writes, not pool capacity.
 
