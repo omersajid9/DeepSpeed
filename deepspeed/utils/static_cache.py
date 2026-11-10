@@ -304,6 +304,24 @@ class DeepSpeedStaticCache:
             return length.max()
         return length
 
+    def get_query_offset(self, layer_idx: int = 0) -> int | torch.Tensor:
+        """Column the next query block starts at, as the mask builder expects it.
+
+        The offset is the write position itself, not the length: a query written at
+        column ``p`` may attend up to and including column ``p``. Rows can sit at
+        different columns (a row that joined the batch later starts behind the front),
+        so the furthest advanced row is reported, exactly like ``get_seq_length``;
+        per-row validity travels in the attention mask instead.
+        """
+        if layer_idx >= len(self._layers):
+            return 0
+        position = self._write_position
+        if position is None:
+            return 0
+        if isinstance(position, torch.Tensor) and position.dim() == 1:
+            return position.max()
+        return position
+
     def get_max_cache_shape(self, layer_idx: int = 0) -> int:
         if layer_idx >= len(self._layers):
             return self._max_cache_len

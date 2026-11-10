@@ -20,6 +20,7 @@ from transformers import PretrainedConfig
 from deepspeed.accelerator import get_accelerator
 from deepspeed.ops.transformer.inference.op_binding.workspace import WorkspaceOp
 from deepspeed.runtime.hybrid_engine import DeepSpeedHybridEngine
+from deepspeed.runtime.rollout import hybrid_engine_rollout as rollout_module
 from deepspeed.runtime.rollout.base import RolloutRequest, SamplingConfig
 from deepspeed.runtime.rollout.hybrid_engine_rollout import (
     HybridEngineRollout,
@@ -1278,6 +1279,301 @@ def test_generate_accepts_zero_pad_token_id():
     rollout.generate(req, sampling)
 
     assert engine.module.generate.call_args.kwargs['pad_token_id'] == 0
+
+
+# -- chunked prefill ----------------------------------------------------
+
+
+def test_chunked_prefill_config_defaults_to_disabled():
+    cfg = HybridEngineRolloutConfig()
+
+    assert cfg.enable_chunked_prefill is False
+    assert cfg.prefill_chunk_size > 0
+
+
+def test_chunked_prefill_requires_positive_chunk_size():
+    rollout = HybridEngineRollout(
+        _make_engine(),
+        _make_tokenizer(),
+        cfg=HybridEngineRolloutConfig(use_graph_capture=True, enable_chunked_prefill=True, prefill_chunk_size=0),
+    )
+
+    with pytest.raises(ValueError, match="prefill_chunk_size must be positive"):
+        rollout.generate(_make_request(), SamplingConfig(max_new_tokens=2, temperature=0, continuous_batch_size=2))
+
+
+class _ChunkedCacheModel(torch.nn.Module):
+    """Minimal cache-class model that records the prefill windows it is asked to run."""
+
+    _supports_cache_class = True
+
+    def __init__(self, preferred_token=3):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.zeros(1))
+        self.prefill_windows = []
+        self.preferred_token = preferred_token
+        self.config = PretrainedConfig(
+            max_position_embeddings=64,
+            num_hidden_layers=1,
+            num_attention_heads=1,
+            num_key_value_heads=1,
+            hidden_size=1,
+            head_dim=1,
+        )
+
+    def forward(self,
+                input_ids,
+                attention_mask=None,
+                past_key_values=None,
+                use_cache=True,
+                cache_position=None,
+                position_ids=None,
+                **kwargs):
+        if input_ids.shape[1] > 1:
+            self.prefill_windows.append((input_ids.shape[1], int(cache_position[0].item())))
+        states = input_ids[:, None, :, None].to(dtype=torch.float32)
+        past_key_values.update(states, states, layer_idx=0, cache_position=cache_position)
+        logits = torch.zeros((input_ids.shape[0], input_ids.shape[1], 8))
+        logits[:, :, self.preferred_token] = 1
+        return SimpleNamespace(logits=logits, past_key_values=past_key_values)
+
+
+def _mock_graph_accelerator(mock_get_accelerator, module=None, replay_marks=None, replay_logits=None):
+    stream = MagicMock()
+    accelerator = mock_get_accelerator.return_value
+    accelerator.Stream.return_value = stream
+    accelerator.current_stream.return_value = stream
+    accelerator.stream.side_effect = lambda _stream: nullcontext()
+    accelerator.capture_to_graph.side_effect = lambda _graph: nullcontext()
+    if replay_marks is not None:
+        accelerator.replay_graph.side_effect = lambda _graph: replay_marks.append(len(module.prefill_windows))
+    return accelerator
+
+
+@patch("deepspeed.runtime.rollout.hybrid_engine_rollout.get_accelerator")
+def test_chunked_prefill_stages_long_prompts_across_steps(mock_get_accelerator):
+    replay_marks = []
+    model = _ChunkedCacheModel()
+    _mock_graph_accelerator(mock_get_accelerator, module=model, replay_marks=replay_marks)
+
+    rollout = HybridEngineRollout(
+        SimpleNamespace(module=model),
+        SimpleNamespace(pad_token_id=0, eos_token_id=2),
+        cfg=HybridEngineRolloutConfig(use_graph_capture=True, enable_chunked_prefill=True, prefill_chunk_size=4),
+    )
+    prompt = torch.tensor([[1, 2, 3, 4, 5, 6], [1, 2, 3, 4, 5, 7], [1, 2, 3, 4, 5, 8]])
+    request = RolloutRequest(prompt, torch.ones_like(prompt))
+
+    output = rollout.generate(request, SamplingConfig(max_new_tokens=2, temperature=0, continuous_batch_size=3))
+
+    # Six token prompts on a four token budget, advanced in admission order. The leftover
+    # budget of a step flows to the next staged prompt, so the chunks interleave prompts.
+    assert model.prefill_windows == [(4, 0), (2, 4), (2, 0), (4, 2), (4, 0), (2, 4)]
+    stats = rollout.get_last_continuous_stats()
+    assert stats["chunked_prefill_chunks"] == 6
+    assert stats["chunked_prefill_staging_bytes"] > 0
+    # The first prompt decodes while the other prompts are still being staged.
+    assert replay_marks and replay_marks[0] < len(model.prefill_windows)
+    assert output.input_ids[:, :6].tolist() == prompt.tolist()
+    assert output.input_ids[:, 6:].tolist() == [[3, 3], [3, 3], [3, 3]]
+
+
+@patch("deepspeed.runtime.rollout.hybrid_engine_rollout.get_accelerator")
+def test_chunked_prefill_matches_single_forward_prefill(mock_get_accelerator):
+    _mock_graph_accelerator(mock_get_accelerator)
+    prompt = torch.tensor([[1, 2, 3, 4, 5, 6]])
+    request = RolloutRequest(prompt, torch.ones_like(prompt))
+    sampling = SamplingConfig(max_new_tokens=2, temperature=0, continuous_batch_size=1)
+
+    chunked_model = _ChunkedCacheModel()
+    chunked = HybridEngineRollout(
+        SimpleNamespace(module=chunked_model),
+        SimpleNamespace(pad_token_id=0, eos_token_id=2),
+        cfg=HybridEngineRolloutConfig(use_graph_capture=True, enable_chunked_prefill=True, prefill_chunk_size=4),
+    )
+    chunked_output = chunked.generate(request, sampling)
+
+    plain_model = _ChunkedCacheModel()
+    plain = HybridEngineRollout(
+        SimpleNamespace(module=plain_model),
+        SimpleNamespace(pad_token_id=0, eos_token_id=2),
+        cfg=HybridEngineRolloutConfig(use_graph_capture=True),
+    )
+    plain_output = plain.generate(request, sampling)
+
+    assert chunked_model.prefill_windows == [(4, 0), (2, 4)]
+    assert plain_model.prefill_windows == [(6, 0)]
+    assert chunked_output.input_ids.tolist() == plain_output.input_ids.tolist()
+    assert chunked_output.attention_mask.tolist() == plain_output.attention_mask.tolist()
+    assert plain.get_last_continuous_stats()["chunked_prefill_chunks"] == 0
+
+
+def test_eager_continuous_chunked_prefill_matches_naive():
+    prompt = torch.tensor([[1, 2, 3, 4, 5, 6]])
+    request = RolloutRequest(prompt, torch.ones_like(prompt))
+    sampling = SamplingConfig(max_new_tokens=2, temperature=0, continuous_batch_size=1)
+
+    chunked_model = _ChunkedCacheModel()
+    chunked = HybridEngineRollout(
+        SimpleNamespace(module=chunked_model),
+        SimpleNamespace(pad_token_id=0, eos_token_id=2),
+        cfg=HybridEngineRolloutConfig(enable_chunked_prefill=True, prefill_chunk_size=2),
+    )
+    chunked_output = chunked.generate(request, sampling)
+
+    plain_model = _ChunkedCacheModel()
+    plain = HybridEngineRollout(SimpleNamespace(module=plain_model), SimpleNamespace(pad_token_id=0, eos_token_id=2))
+    plain_output = plain.generate(request, sampling)
+
+    assert chunked_model.prefill_windows == [(2, 0), (2, 2), (2, 4)]
+    assert plain_model.prefill_windows == [(6, 0)]
+    assert chunked_output.input_ids.tolist() == plain_output.input_ids.tolist()
+    assert chunked.get_last_continuous_stats()["chunked_prefill_chunks"] == 3
+    assert plain.get_last_continuous_stats()["chunked_prefill_chunks"] == 0
+
+
+def _tiny_llama():
+    from transformers import LlamaConfig, LlamaForCausalLM
+
+    torch.manual_seed(0)
+    config = LlamaConfig(vocab_size=32,
+                         hidden_size=16,
+                         intermediate_size=32,
+                         num_hidden_layers=2,
+                         num_attention_heads=2,
+                         num_key_value_heads=2,
+                         max_position_embeddings=64)
+    return LlamaForCausalLM(config).eval()
+
+
+def test_chunked_prefill_cache_matches_single_forward_prefill_on_a_real_model():
+    """The static paths stage the prompt; the cache must equal a single-forward prefill."""
+    from transformers import StaticCache
+
+    model = _tiny_llama()
+    rollout = HybridEngineRollout(SimpleNamespace(module=model), SimpleNamespace(pad_token_id=0, eos_token_id=None))
+    prompt = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8]])
+    attention = torch.ones_like(prompt)
+
+    with torch.no_grad():
+        whole_token, whole_cache = rollout._continuous_prefill_cache(model, StaticCache, prompt, attention,
+                                                                     torch.float32, torch.device("cpu"))
+        chunk_token, chunk_cache = rollout._chunked_prefill_cache(model, StaticCache, prompt, attention, torch.float32,
+                                                                  torch.device("cpu"), 3)
+
+    assert whole_token.tolist() == chunk_token.tolist()
+    for layer_idx in range(rollout._cache_layer_count(whole_cache)):
+        whole_keys, whole_values = rollout._cache_layer_tensors(whole_cache, layer_idx)
+        chunk_keys, chunk_values = rollout._cache_layer_tensors(chunk_cache, layer_idx)
+        assert torch.allclose(whole_keys[:, :, :8], chunk_keys[:, :, :8], atol=1e-5)
+        assert torch.allclose(whole_values[:, :, :8], chunk_values[:, :, :8], atol=1e-5)
+
+
+def test_static_eager_chunked_prefill_matches_naive_generate():
+    prompt = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8]])
+    attention = torch.ones_like(prompt)
+    sampling = SamplingConfig(max_new_tokens=3, temperature=0)
+
+    model = _tiny_llama()
+    prefill_widths = []
+
+    def record_width(_module, args, kwargs):
+        input_ids = kwargs.get("input_ids")
+        if input_ids is None and args:
+            input_ids = args[0]
+        if input_ids is not None:
+            prefill_widths.append(input_ids.shape[1])
+
+    handle = model.register_forward_pre_hook(record_width, with_kwargs=True)
+
+    chunked = HybridEngineRollout(
+        SimpleNamespace(module=model),
+        SimpleNamespace(pad_token_id=0, eos_token_id=None),
+        cfg=HybridEngineRolloutConfig(enable_chunked_prefill=True, prefill_chunk_size=3),
+    )
+    chunked_output = chunked.generate(RolloutRequest(prompt, attention), sampling)
+    chunked_widths = list(prefill_widths)
+    prefill_widths.clear()
+
+    plain = HybridEngineRollout(SimpleNamespace(module=model), SimpleNamespace(pad_token_id=0, eos_token_id=None))
+    plain_output = plain.generate(RolloutRequest(prompt, attention), sampling)
+    plain_widths = list(prefill_widths)
+    handle.remove()
+
+    assert chunked_widths[:3] == [3, 3, 2]  # three staged chunks, then single-token decode steps
+    assert plain_widths[0] == 8
+    assert chunked_output.input_ids.tolist() == plain_output.input_ids.tolist()
+    assert chunked_output.attention_mask.tolist() == plain_output.attention_mask.tolist()
+
+
+def test_chunked_prefill_warns_for_sampling_rollouts(monkeypatch):
+    warnings = []
+    monkeypatch.setattr(rollout_module.logger, "warning", lambda message, *args, **kwargs: warnings.append(message))
+
+    model = _tiny_llama()
+    rollout = HybridEngineRollout(
+        SimpleNamespace(module=model),
+        SimpleNamespace(pad_token_id=0, eos_token_id=None),
+        cfg=HybridEngineRolloutConfig(enable_chunked_prefill=True, prefill_chunk_size=3),
+    )
+    prompt = torch.tensor([[1, 2, 3, 4, 5, 6]])
+    request = RolloutRequest(prompt, torch.ones_like(prompt))
+
+    rollout.generate(request, SamplingConfig(max_new_tokens=2, temperature=0.8))
+    rollout.generate(request, SamplingConfig(max_new_tokens=2, temperature=0.8))
+
+    assert len(warnings) == 1
+    assert "greedy generation only" in warnings[0]
+
+
+def test_chunked_prefill_survives_row_compaction_while_staging():
+    """Rows retiring under a staged prompt must not drag its staged slot out from under it.
+
+    Logits here are derived from the cache contents, so a row writing to the wrong column
+    (which is what a stale staged slot produces) changes the emitted tokens.
+    """
+
+    class CacheSumModel(_ChunkedCacheModel):
+        """Emits EOS for the prompt whose cached ids sum to 21, so rows retire one at a time."""
+
+        def forward(self,
+                    input_ids,
+                    attention_mask=None,
+                    past_key_values=None,
+                    use_cache=True,
+                    cache_position=None,
+                    position_ids=None,
+                    **kwargs):
+            if input_ids.shape[1] > 1:
+                self.prefill_windows.append((input_ids.shape[1], int(cache_position[0].item())))
+            states = input_ids[:, None, :, None].to(dtype=torch.float32)
+            _, values = past_key_values.update(states, states, layer_idx=0, cache_position=cache_position)
+            cache_sums = values[:, 0].sum(dim=(1, 2))
+            next_tokens = torch.where(cache_sums == 21, 2, 3).long()
+            logits = torch.zeros((input_ids.shape[0], input_ids.shape[1], 8))
+            logits.scatter_(2, next_tokens[:, None, None].expand(-1, input_ids.shape[1], 1), 1)
+            return SimpleNamespace(logits=logits, past_key_values=past_key_values)
+
+    prompt = torch.tensor([[1, 2, 3, 4, 5, 6], [1, 2, 3, 4, 5, 7], [1, 2, 3, 4, 5, 8]])
+    request = RolloutRequest(prompt, torch.ones_like(prompt))
+    sampling = SamplingConfig(max_new_tokens=4, temperature=0, continuous_batch_size=2)
+
+    chunked_model = CacheSumModel()
+    chunked = HybridEngineRollout(
+        SimpleNamespace(module=chunked_model),
+        SimpleNamespace(pad_token_id=0, eos_token_id=2),
+        cfg=HybridEngineRolloutConfig(enable_chunked_prefill=True, prefill_chunk_size=4),
+    )
+    chunked_output = chunked.generate(request, sampling)
+
+    plain = HybridEngineRollout(SimpleNamespace(module=CacheSumModel()), SimpleNamespace(pad_token_id=0,
+                                                                                         eos_token_id=2))
+    plain_output = plain.generate(request, sampling)
+
+    assert chunked_model.prefill_windows != []  # staging really happened
+    assert chunked_output.input_ids.tolist() == plain_output.input_ids.tolist()
+    assert chunked_output.attention_mask.tolist() == plain_output.attention_mask.tolist()
+    assert chunked.get_last_continuous_stats()["chunked_prefill_chunks"] > 0
 
 
 def _cache_config(head_dim=None):
