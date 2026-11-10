@@ -90,6 +90,12 @@ The duplicate-prefix run reused 95 blocks / 6080 tokens and cut prefill forwards
 With graph capture, chunked prefill, and the sampler on the 6k four-way path, paged prefill is
 822.7 ms versus 1381.6 ms for dense-staging + copy; total is 1233.8 ms versus 1809.2 ms
 (tok/s 12.97 versus 8.84), with token-identical output (`d4a324e9…`).
+
+A head-to-head vLLM 0.33.0 run (same Qwen3-4B, prompt, tokenizer, chunk 512, batch 1, sampler,
+and generated-token count; vLLM KV pool capped to 1.1 GiB at 6k) is 954.8 ms / 16.76 tok/s at
+6k and 3363.6 ms / 2.38 tok/s at 20k greedy. The DeepSpeed paged path is **1.29x slower at 6k**
+and **1.15x slower at 20k**, with identical 6k and 20k greedy tokens; details in
+`DeepSpeedExamples/training/opsd/runs/vllm_comparison.md`.
 Peak memory did not drop because `PagedAttentionCache` sizes the `BlockedKVCache` pool for the
 full per-row block table; prefix reuse saves prefill compute and KV writes, not pool capacity.
 
