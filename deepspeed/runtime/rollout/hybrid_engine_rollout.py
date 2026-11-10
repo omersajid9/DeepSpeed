@@ -39,6 +39,7 @@ from deepspeed.runtime.rollout.sampling import configure_compiled_sampler, sampl
 from deepspeed.utils import logger
 
 
+@torch._dynamo.disable
 class _ForwardProfiler:
     """Measure top-level model forwards without synchronizing each call."""
 
@@ -59,6 +60,7 @@ class _ForwardProfiler:
         post_handle = module.register_forward_hook(self._end_forward)
         return pre_handle, post_handle
 
+    @torch._dynamo.disable
     def get_stage_times(self):
         if not self.measurements:
             return None, None, 0
@@ -68,14 +70,17 @@ class _ForwardProfiler:
         durations = [self._elapsed_time(start, end) for start, end in self.measurements]
         return durations[0], sum(durations[1:]), len(durations) - 1
 
+    @torch._dynamo.disable
     def _start_forward(self, _module, _args):
         self.active_start = self._record_time()
 
+    @torch._dynamo.disable
     def _end_forward(self, _module, _args, _output):
         end = self._record_time()
         self.measurements.append((self.active_start, end))
         self.active_start = None
 
+    @torch._dynamo.disable
     def _record_time(self):
         if self.use_host_timer:
             return time.perf_counter()
@@ -172,6 +177,7 @@ class HybridEngineRolloutConfig:
     paged_block_size: Optional[int] = None
     enable_paged_prefill: bool = False
     enable_prefix_reuse: bool = False
+    enable_torch_compile: bool = False
     enable_compiled_sampler: bool = False
 
 
@@ -326,6 +332,7 @@ class HybridEngineRollout(RolloutEngine):
         self.paged_block_size = getattr(cfg, 'paged_block_size', None) if cfg else None
         self.enable_paged_prefill = getattr(cfg, 'enable_paged_prefill', False) if cfg else False
         self.enable_prefix_reuse = getattr(cfg, 'enable_prefix_reuse', False) if cfg else False
+        self.enable_torch_compile = getattr(cfg, 'enable_torch_compile', False) if cfg else False
         self.enable_compiled_sampler = getattr(cfg, 'enable_compiled_sampler', False) if cfg else False
         if self.enable_compiled_sampler:
             configure_compiled_sampler(True)
@@ -336,6 +343,13 @@ class HybridEngineRollout(RolloutEngine):
         if self.use_paged_cache:
             from deepspeed.runtime.rollout.paged_cache import install_paged_attention
             install_paged_attention(self.engine.module)
+        if self.enable_torch_compile:
+            self.engine.module = torch.compile(
+                self.engine.module,
+                mode="max-autotune-no-cudagraphs",
+                fullgraph=False,
+                dynamic=False,
+            )
 
     @torch.no_grad()
     def generate(self, request: RolloutRequest, sampling: SamplingConfig) -> RolloutBatch:
