@@ -339,13 +339,16 @@ def test_continuous_graph_keeps_cache_position_alive_for_replay():
     rollout = HybridEngineRollout(SimpleNamespace(module=module), _make_tokenizer())
     state = rollout._get_continuous_graph_state(module, 1, 3, 5, torch.device(accelerator.current_device_name()),
                                                 torch.float32, DeepSpeedStaticCache)
+    bucket = rollout._decode_bucket(highest_row=1)
+    rollout._capture_bucket_if_needed(module, state.cache, bucket, state.static_cache_position, bucket.write_positions)
     gc.collect()
 
-    # A captured kernel retains only the device pointer, not the Python tensor.
+    # A captured kernel retains only the device pointer, not the Python tensor; the state
+    # itself is what keeps the tensor alive between capture and replay.
     assert module.cache_position_ref() is not None
     state.static_input.fill_(7)
-    accelerator.replay_graph(state.graph)
-    assert torch.equal(state.static_logits, torch.full_like(state.static_logits, 11))
+    accelerator.replay_graph(bucket.graph)
+    assert torch.equal(bucket.logits, torch.full_like(bucket.logits, 11))
 
 
 def test_continuous_graph_state_reuses_matching_capture_and_rebuilds_for_weight_updates():
@@ -375,10 +378,24 @@ def test_continuous_graph_state_reuses_matching_capture_and_rebuilds_for_weight_
 
     with patch.object(rollout, "_capture_continuous_graph", return_value=(graph, logits)) as capture:
         first = rollout._get_continuous_graph_state(module, 1, 3, 5, torch.device("cpu"), torch.float32, GraphCache)
+        # Capture is lazy: fetching the state allocates buffers, the first step that needs a
+        # width captures it.
+        assert capture.call_count == 0
+
+        def bucket_for(state):
+            bucket = rollout._decode_bucket(highest_row=1)
+            return rollout._capture_bucket_if_needed(module, state.cache, bucket, state.static_cache_position,
+                                                     bucket.write_positions)
+
+        bucket_for(first)
+        assert capture.call_count == 1
         second = rollout._get_continuous_graph_state(module, 1, 3, 5, torch.device("cpu"), torch.float32, GraphCache)
+        bucket_for(second)
+        assert capture.call_count == 1
         with torch.no_grad():
             module.weight.add_(1)
         third = rollout._get_continuous_graph_state(module, 1, 3, 5, torch.device("cpu"), torch.float32, GraphCache)
+        bucket_for(third)
 
     assert first is second
     assert third is not first
@@ -1776,6 +1793,20 @@ def test_chunked_prefill_requires_positive_chunk_size():
         rollout.generate(_make_request(), SamplingConfig(max_new_tokens=2, temperature=0, continuous_batch_size=2))
 
 
+def _record_window(model, input_ids, past_key_values):
+    """Record a prefill forward as (chunk width, cache column it is about to write).
+
+    The column is what a chunk window advances, and it lives in the cache rather than in
+    the caller's arguments, so this is the observable that shows a chunk forward's shape
+    and position from outside the rollout.
+    """
+    if input_ids.shape[1] <= 1:
+        return
+    window = past_key_values.get_query_offset(0)
+    model.prefill_windows.append(
+        (input_ids.shape[1], int(window.item()) if isinstance(window, torch.Tensor) else int(window)))
+
+
 class _ChunkedCacheModel(torch.nn.Module):
     """Minimal cache-class model that records the prefill windows it is asked to run."""
 
@@ -1803,8 +1834,7 @@ class _ChunkedCacheModel(torch.nn.Module):
                 cache_position=None,
                 position_ids=None,
                 **kwargs):
-        if input_ids.shape[1] > 1:
-            self.prefill_windows.append((input_ids.shape[1], int(cache_position[0].item())))
+        _record_window(self, input_ids, past_key_values)
         states = input_ids[:, None, :, None].to(dtype=torch.float32)
         past_key_values.update(states, states, layer_idx=0, cache_position=cache_position)
         logits = torch.zeros((input_ids.shape[0], input_ids.shape[1], 8))
@@ -1812,23 +1842,20 @@ class _ChunkedCacheModel(torch.nn.Module):
         return SimpleNamespace(logits=logits, past_key_values=past_key_values)
 
 
-def _mock_graph_accelerator(mock_get_accelerator, module=None, replay_marks=None, replay_logits=None):
+def _mock_graph_accelerator(mock_get_accelerator):
     stream = MagicMock()
     accelerator = mock_get_accelerator.return_value
     accelerator.Stream.return_value = stream
     accelerator.current_stream.return_value = stream
     accelerator.stream.side_effect = lambda _stream: nullcontext()
     accelerator.capture_to_graph.side_effect = lambda _graph: nullcontext()
-    if replay_marks is not None:
-        accelerator.replay_graph.side_effect = lambda _graph: replay_marks.append(len(module.prefill_windows))
     return accelerator
 
 
 @patch("deepspeed.runtime.rollout.hybrid_engine_rollout.get_accelerator")
 def test_chunked_prefill_stages_long_prompts_across_steps(mock_get_accelerator):
-    replay_marks = []
     model = _ChunkedCacheModel()
-    _mock_graph_accelerator(mock_get_accelerator, module=model, replay_marks=replay_marks)
+    _mock_graph_accelerator(mock_get_accelerator)
 
     rollout = HybridEngineRollout(
         SimpleNamespace(module=model),
@@ -1840,16 +1867,27 @@ def test_chunked_prefill_stages_long_prompts_across_steps(mock_get_accelerator):
 
     output = rollout.generate(request, SamplingConfig(max_new_tokens=2, temperature=0, continuous_batch_size=3))
 
-    # Six token prompts on a four token budget, advanced in admission order. The leftover
-    # budget of a step flows to the next staged prompt, so the chunks interleave prompts.
-    assert model.prefill_windows == [(4, 0), (2, 4), (2, 0), (4, 2), (4, 0), (2, 4)]
+    # Six token prompts on a four token chunk: every prefill the model runs is a full
+    # chunk rather than the whole prompt, which is what makes the forward capturable.
+    assert {width for width, _ in model.prefill_windows} == {4}
+    assert {window for _, window in model.prefill_windows} == {0}
     stats = rollout.get_last_continuous_stats()
     assert stats["chunked_prefill_chunks"] == 6
     assert stats["chunked_prefill_staging_bytes"] > 0
-    # The first prompt decodes while the other prompts are still being staged.
-    assert replay_marks and replay_marks[0] < len(model.prefill_windows)
+    assert stats["prefill_bucket_steps"] == 2
+    # Three staged rows fit the widest ladder bucket exactly, so nothing is padded and one
+    # prefill graph plus one decode graph are all this rollout captures.
+    assert stats["prefill_bucket_widths"] == {3: 2}
+    assert stats["prefill_padded_rows"] == 0
+    assert stats["graph_captures"] == 2
     assert output.input_ids[:, :6].tolist() == prompt.tolist()
     assert output.input_ids[:, 6:].tolist() == [[3, 3], [3, 3], [3, 3]]
+    # The chunk that ran wrote the first window of every staged row, and the published row
+    # that decoded afterwards holds its first response token in its own row.
+    state = rollout._continuous_graph_state
+    for row in range(3):
+        assert state.staging_cache.layers[0].keys[row, 0, :4, 0].tolist() == prompt[row, :4].tolist()
+        assert state.cache.layers[0].keys[row, 0, 6, 0].item() == 3.0
 
 
 @patch("deepspeed.runtime.rollout.hybrid_engine_rollout.get_accelerator")
@@ -1875,11 +1913,179 @@ def test_chunked_prefill_matches_single_forward_prefill(mock_get_accelerator):
     )
     plain_output = plain.generate(request, sampling)
 
-    assert chunked_model.prefill_windows == [(4, 0), (2, 4)]
-    assert plain_model.prefill_windows == [(6, 0)]
+    # The captured chunks keep the chunk width and slide only the window, while the plain
+    # path prefills the whole prompt in one forward.
+    assert {width for width, _ in chunked_model.prefill_windows} == {4}
+    assert {width for width, _ in plain_model.prefill_windows} == {6}
     assert chunked_output.input_ids.tolist() == plain_output.input_ids.tolist()
     assert chunked_output.attention_mask.tolist() == plain_output.attention_mask.tolist()
     assert plain.get_last_continuous_stats()["chunked_prefill_chunks"] == 0
+    assert chunked.get_last_continuous_stats()["prefill_bucket_steps"] == 2
+
+
+@patch("deepspeed.runtime.rollout.hybrid_engine_rollout.get_accelerator")
+def test_chunked_prefill_pads_staged_rows_to_the_next_bucket(mock_get_accelerator):
+    """Three staged rows on a four wide ladder replay a four row prefill graph."""
+    model = _ChunkedCacheModel()
+    _mock_graph_accelerator(mock_get_accelerator)
+
+    rollout = HybridEngineRollout(
+        SimpleNamespace(module=model),
+        SimpleNamespace(pad_token_id=0, eos_token_id=2),
+        cfg=HybridEngineRolloutConfig(use_graph_capture=True, enable_chunked_prefill=True, prefill_chunk_size=4),
+    )
+    prompt = torch.tensor([[1, 2, 3, 4, 5, 6], [1, 2, 3, 4, 5, 7], [1, 2, 3, 4, 5, 8], [0, 0, 1, 2, 3, 4]])
+    attention = torch.ones_like(prompt)
+    attention[3, :2] = 0
+    request = RolloutRequest(prompt, attention)
+
+    output = rollout.generate(request, SamplingConfig(max_new_tokens=2, temperature=0, continuous_batch_size=4))
+
+    # Three prompts stage as a wave padded up to the four row bucket, and the one prompt
+    # short enough for a single forward keeps the whole prompt width.
+    assert {width for width, _ in model.prefill_windows} == {4, 6}
+    stats = rollout.get_last_continuous_stats()
+    assert stats["prefill_bucket_widths"] == {4: 2}
+    assert stats["prefill_padded_rows"] == 2
+    assert output.input_ids[:, -2:].tolist() == [[3, 3], [3, 3], [3, 3], [3, 3]]
+
+
+@patch("deepspeed.runtime.rollout.hybrid_engine_rollout.get_accelerator")
+def test_chunked_prefill_graph_falls_back_to_eager_windows(mock_get_accelerator):
+    """A bucket whose capture fails keeps running the same buffers eagerly, window by window.
+
+    Capture raises here, so every step executes the model and the staging cache ends up
+    holding exactly the prompt, which is what shows that the sliding last window covered
+    every column rather than only the ones the first window wrote.
+    """
+    model = _ChunkedCacheModel()
+    _mock_graph_accelerator(mock_get_accelerator)
+    prompt = torch.tensor([[1, 2, 3, 4, 5, 6], [1, 2, 3, 4, 5, 7]])
+    request = RolloutRequest(prompt, torch.ones_like(prompt))
+
+    with patch.object(HybridEngineRollout,
+                      "_capture_continuous_graph",
+                      side_effect=RuntimeError("capture unsupported")):
+        rollout = HybridEngineRollout(
+            SimpleNamespace(module=model),
+            SimpleNamespace(pad_token_id=0, eos_token_id=2),
+            cfg=HybridEngineRolloutConfig(use_graph_capture=True, enable_chunked_prefill=True, prefill_chunk_size=4),
+        )
+        output = rollout.generate(request, SamplingConfig(max_new_tokens=2, temperature=0, continuous_batch_size=2))
+
+    stats = rollout.get_last_continuous_stats()
+    assert stats["graph_captures"] == 0
+    assert stats["prefill_bucket_steps"] == 2
+    # Every window ran, so the staging cache and the published decode rows hold the prompt.
+    state = rollout._continuous_graph_state
+    for request_id in range(2):
+        assert state.staging_cache.layers[0].keys[request_id, 0, :6, 0].tolist() == prompt[request_id].tolist()
+        assert state.cache.layers[0].keys[request_id, 0, :6, 0].tolist() == prompt[request_id].tolist()
+    assert {width for width, _ in model.prefill_windows} == {4}
+    assert output.input_ids[:, :6].tolist() == prompt.tolist()
+    assert output.input_ids[:, 6:].tolist() == [[3, 3], [3, 3]]
+
+
+@patch("deepspeed.runtime.rollout.hybrid_engine_rollout.get_accelerator")
+def test_chunked_prefill_wave_waits_and_decodes_in_parallel(mock_get_accelerator):
+    """A prompt admitted during a wave waits for the next one, while the wave's peers decode."""
+    model = _ChunkedCacheModel()
+    _mock_graph_accelerator(mock_get_accelerator)
+
+    rollout = HybridEngineRollout(
+        SimpleNamespace(module=model),
+        SimpleNamespace(pad_token_id=0, eos_token_id=2),
+        cfg=HybridEngineRolloutConfig(use_graph_capture=True, enable_chunked_prefill=True, prefill_chunk_size=4),
+    )
+    prompt = torch.tensor([[1, 2, 3, 4, 5, 6], [1, 2, 3, 4, 5, 7], [1, 2, 3, 4, 5, 8]])
+    request = RolloutRequest(prompt, torch.ones_like(prompt))
+
+    output = rollout.generate(request, SamplingConfig(max_new_tokens=4, temperature=0, continuous_batch_size=2))
+
+    stats = rollout.get_last_continuous_stats()
+    # Two prompts stage as a wave of two, the third waits for the second wave, and the waves
+    # decode alongside the prompts that already published. Decode therefore reaches a one
+    # row and a two row bucket, each captured lazily.
+    assert {width for width, _ in model.prefill_windows} == {4}
+    assert stats["prefill_bucket_steps"] == 4
+    # Both waves dispatch to the smallest bucket that fits: two staged rows, then one.
+    assert stats["prefill_bucket_widths"] == {1: 2, 2: 2}
+    assert sorted(stats["decode_bucket_widths"]) == [1, 2]
+    assert output.input_ids[:, :6].tolist() == prompt.tolist()
+    assert output.input_ids[:, 6:].tolist() == [[3, 3, 3, 3]] * 3
+
+
+def test_graph_capture_ladder_defaults_to_powers_of_two():
+    assert HybridEngineRollout._graph_capture_ladder(1) == (1, )
+    assert HybridEngineRollout._graph_capture_ladder(5) == (1, 2, 4, 5)
+    assert HybridEngineRollout._graph_capture_ladder(8) == (1, 2, 4, 8)
+    # A configured ladder still has to cover a full physical batch.
+    assert HybridEngineRollout._graph_capture_ladder(4, (1, 4)) == (1, 4)
+    assert HybridEngineRollout._graph_capture_ladder(4, (3, )) == (3, 4)
+
+
+def test_graph_capture_ladder_must_be_positive_and_fit_the_batch():
+    for configured, message in (((0, ), "positive integers"), ((5, ), "cannot exceed continuous_batch_size")):
+        rollout = HybridEngineRollout(
+            _make_engine(),
+            _make_tokenizer(),
+            cfg=HybridEngineRolloutConfig(use_graph_capture=True, graph_capture_batch_sizes=configured),
+        )
+        with pytest.raises(ValueError, match=message):
+            rollout.generate(_make_request(), SamplingConfig(max_new_tokens=2, temperature=0, continuous_batch_size=2))
+
+
+def test_graph_capture_bucket_width_rounds_up():
+    assert HybridEngineRollout._bucket_width((1, 2, 4, 8), 1) == 1
+    assert HybridEngineRollout._bucket_width((1, 2, 4, 8), 3) == 4
+    assert HybridEngineRollout._bucket_width((1, 2, 4, 8), 8) == 8
+
+
+@patch("deepspeed.runtime.rollout.hybrid_engine_rollout.get_accelerator")
+def test_graph_capture_dispatches_smaller_buckets_as_rows_retire(mock_get_accelerator):
+    """Decode steps pick the smallest captured width that holds the rows doing work."""
+
+    class RetiringModel(_ChunkedCacheModel):
+        """Gives each row its own first token and retires the last row as soon as it decodes it."""
+
+        def forward(self,
+                    input_ids,
+                    attention_mask=None,
+                    past_key_values=None,
+                    use_cache=True,
+                    cache_position=None,
+                    position_ids=None,
+                    **kwargs):
+            _record_window(self, input_ids, past_key_values)
+            states = input_ids[:, None, :, None].to(dtype=torch.float32)
+            past_key_values.update(states, states, layer_idx=0, cache_position=cache_position)
+            if input_ids.shape[1] > 1:
+                next_tokens = 3 + torch.arange(input_ids.shape[0]).long()
+            else:
+                next_tokens = torch.where(input_ids[:, 0] == 5, 2, 3).long()
+            logits = torch.zeros((input_ids.shape[0], input_ids.shape[1], 8))
+            logits.scatter_(2, next_tokens[:, None, None].expand(-1, input_ids.shape[1], 1), 1)
+            return SimpleNamespace(logits=logits, past_key_values=past_key_values)
+
+    model = RetiringModel()
+    _mock_graph_accelerator(mock_get_accelerator)
+    rollout = HybridEngineRollout(
+        SimpleNamespace(module=model),
+        SimpleNamespace(pad_token_id=0, eos_token_id=2),
+        cfg=HybridEngineRolloutConfig(use_graph_capture=True),
+    )
+    prompt = torch.tensor([[1, 2, 3, 4, 5, 6], [1, 2, 3, 4, 5, 7], [1, 2, 3, 4, 5, 8]])
+    request = RolloutRequest(prompt, torch.ones_like(prompt))
+
+    rollout.generate(request, SamplingConfig(max_new_tokens=4, temperature=0, continuous_batch_size=3))
+
+    stats = rollout.get_last_continuous_stats()
+    # Ladder is (1, 2, 3): the three row batch retires down to a two row batch, and both
+    # widths are captured lazily, so the rollout never replays a wider graph than it needs.
+    assert sorted(stats["decode_bucket_widths"]) == [2, 3]
+    assert stats["decode_padded_rows"] >= 0
+    assert stats["graph_captures"] == 2
+    assert stats["prefill_bucket_steps"] == 0
 
 
 def test_eager_continuous_chunked_prefill_matches_naive():
@@ -1941,6 +2147,145 @@ def test_chunked_prefill_cache_matches_single_forward_prefill_on_a_real_model():
         chunk_keys, chunk_values = rollout._cache_layer_tensors(chunk_cache, layer_idx)
         assert torch.allclose(whole_keys[:, :, :8], chunk_keys[:, :, :8], atol=1e-5)
         assert torch.allclose(whole_values[:, :, :8], chunk_values[:, :, :8], atol=1e-5)
+
+
+class _ReplayedForward:
+    """Stand-in for a captured graph that re-runs the real forward on every replay.
+
+    The rollout is built around the guarantee that a captured forward reads the same
+    static buffers a replay would, so re-running the module on those buffers with the
+    cache write position reset each time exercises the whole loop - buffers, mask,
+    per-row chunk writes, publish - without needing an accelerator that can capture.
+    """
+
+    def __init__(self, module, cache, inputs, mask, write_positions, cache_position, positions, logits_kwargs):
+        self.module = module
+        self.cache = cache
+        self.inputs = inputs
+        self.mask = mask
+        self.write_positions = write_positions
+        self.cache_position = cache_position
+        self.positions = positions
+        self.logits_kwargs = logits_kwargs
+        self.runs = 0
+        self.logits = None
+
+    def replay(self):
+        self.cache.set_write_position(self.write_positions)
+        output = self.module(self.inputs,
+                             attention_mask=self.mask,
+                             past_key_values=self.cache,
+                             use_cache=True,
+                             cache_position=self.cache_position,
+                             position_ids=self.positions,
+                             **self.logits_kwargs)
+        if self.logits is None:
+            self.logits = output.logits
+        else:
+            self.logits.copy_(output.logits)
+        self.runs += 1
+        return self.logits
+
+
+def _replaying_graph_accelerator(mock_get_accelerator, captures):
+    """Accelerator mock whose replays run the forward again, recording every capture."""
+
+    def fake_capture(module, cache, static_input, static_attention, static_write_positions, static_cache_position,
+                     static_position_ids, logits_kwargs=None):
+        graph = _ReplayedForward(module, cache, static_input, static_attention, static_write_positions,
+                                 static_cache_position, static_position_ids, logits_kwargs or {})
+        captures.append(graph)
+        return graph, graph.replay()
+
+    accelerator = _mock_graph_accelerator(mock_get_accelerator)
+    accelerator.replay_graph.side_effect = lambda graph: graph.replay()
+    return accelerator, fake_capture
+
+
+@patch("deepspeed.runtime.rollout.hybrid_engine_rollout.get_accelerator")
+def test_staged_chunk_windows_match_a_single_forward_with_replayed_graphs(mock_get_accelerator):
+    """With replays that really run, chunked decode must match a single-forward prefill."""
+    captures = []
+    _, fake_capture = _replaying_graph_accelerator(mock_get_accelerator, captures)
+    model = _tiny_llama()
+    prompt = torch.tensor([[0, 0, 3, 4, 5, 6, 7, 8, 9, 10], [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]])
+    attention = torch.tensor([[0, 0, 1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1, 1, 1, 1, 1]])
+    request = RolloutRequest(prompt, attention)
+    sampling = SamplingConfig(max_new_tokens=4, temperature=0, continuous_batch_size=2)
+
+    with patch.object(HybridEngineRollout, "_capture_continuous_graph", side_effect=fake_capture):
+        chunked = HybridEngineRollout(SimpleNamespace(module=model),
+                                      SimpleNamespace(pad_token_id=0, eos_token_id=None),
+                                      cfg=HybridEngineRolloutConfig(use_graph_capture=True,
+                                                                    enable_chunked_prefill=True,
+                                                                    prefill_chunk_size=4))
+        chunked_output = chunked.generate(request, sampling)
+        chunked_captures = len(captures)
+
+        plain = HybridEngineRollout(SimpleNamespace(module=model),
+                                    SimpleNamespace(pad_token_id=0, eos_token_id=None),
+                                    cfg=HybridEngineRolloutConfig(use_graph_capture=True))
+        plain_output = plain.generate(request, sampling)
+
+    stats = chunked.get_last_continuous_stats()
+    # One prefill bucket (two staged rows) and one decode bucket (two rows) are captured,
+    # and every step after that is a replay of one of them.
+    assert stats["prefill_bucket_steps"] == 3
+    assert chunked_captures == 2
+    assert len(captures) == 3
+    assert captures[0].runs > 1 and captures[1].runs > 1
+    assert chunked_output.input_ids.tolist() == plain_output.input_ids.tolist()
+    assert chunked_output.attention_mask.tolist() == plain_output.attention_mask.tolist()
+
+
+@patch("deepspeed.runtime.rollout.hybrid_engine_rollout.get_accelerator")
+def test_staged_chunk_windows_match_a_single_forward_on_a_real_model(mock_get_accelerator):
+    """Chunk windows and their mask must reproduce a single-forward prompt prefill.
+
+    Capture is turned off, so the rollout runs its chunk buffers through the eager
+    fallback - the same tensors and the same additive mask a replay would use - against a
+    real attention implementation. Padding on the left is included because a staged row is
+    the padded prompt, so the mask has to hide the padding columns from attention.
+    """
+    _mock_graph_accelerator(mock_get_accelerator)
+    model = _tiny_llama()
+    prompt = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]])
+    attention = torch.ones_like(prompt)
+
+    def stream(rollout, request, sampling):
+        with patch.object(HybridEngineRollout,
+                          "_capture_continuous_graph",
+                          side_effect=RuntimeError("capture unsupported")):
+            return rollout.generate(request, sampling)
+
+    sampling = SamplingConfig(max_new_tokens=3, temperature=0, continuous_batch_size=1)
+    chunked = HybridEngineRollout(SimpleNamespace(module=model),
+                                  SimpleNamespace(pad_token_id=0, eos_token_id=None),
+                                  cfg=HybridEngineRolloutConfig(use_graph_capture=True,
+                                                                enable_chunked_prefill=True,
+                                                                prefill_chunk_size=4))
+    chunked_output = stream(chunked, RolloutRequest(prompt, attention), sampling)
+    stats = chunked.get_last_continuous_stats()
+    assert stats["graph_captures"] == 0
+    assert stats["prefill_bucket_steps"] == 3
+
+    plain = HybridEngineRollout(SimpleNamespace(module=model),
+                                SimpleNamespace(pad_token_id=0, eos_token_id=None),
+                                cfg=HybridEngineRolloutConfig(use_graph_capture=True))
+    plain_output = stream(plain, RolloutRequest(prompt, attention), sampling)
+
+    assert chunked_output.input_ids.tolist() == plain_output.input_ids.tolist()
+    assert chunked_output.attention_mask.tolist() == plain_output.attention_mask.tolist()
+
+    # Two staged rows padded to different effective lengths, staged as one wave.
+    padded_prompt = torch.tensor([[0, 0, 3, 4, 5, 6, 7, 8, 9, 10], [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]])
+    padded_attention = torch.tensor([[0, 0, 1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1, 1, 1, 1, 1]])
+    batched = SamplingConfig(max_new_tokens=3, temperature=0, continuous_batch_size=2)
+    paired = stream(chunked, RolloutRequest(padded_prompt, padded_attention), batched)
+    paired_plain = stream(plain, RolloutRequest(padded_prompt, padded_attention), batched)
+
+    assert paired.input_ids.tolist() == paired_plain.input_ids.tolist()
+    assert paired.attention_mask.tolist() == paired_plain.attention_mask.tolist()
 
 
 def test_static_eager_chunked_prefill_matches_naive_generate():

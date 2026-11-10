@@ -23,7 +23,10 @@ graph replays read the current value each time.
 
 The caller (HybridEngineRollout) must call ``cache.set_write_position(pos)``
 before each replay. ``pos`` may be a scalar (the existing fixed-batch behavior)
-or one position per cache row for continuous batching.
+or one position per cache row for continuous batching. Per-row positions cover
+both decode (one token per row) and chunked prefill (a chunk per row, written at
+``[position_i, position_i + chunk)``), so rows can sit at different columns of
+their own prompts.
 """
 
 import torch
@@ -100,16 +103,23 @@ class DeepSpeedStaticLayer:
         if self._write_position is not None and self._write_position.dim() == 1:
             if self._write_position.numel() < key_states.shape[0]:
                 raise ValueError("per-row write positions must cover the active batch size")
-            if kv_length != 1:
-                raise ValueError("per-row write positions currently support one decode token at a time")
             cache_position = self._write_position[:key_states.shape[0]].to(self.device)
             is_capturing = get_accelerator().is_current_stream_capturing()
-            if not is_capturing and ((cache_position < 0).any() or (cache_position >= self.max_cache_len).any()):
+            if not is_capturing and ((cache_position < 0).any() or
+                                     (cache_position + kv_length - 1 >= self.max_cache_len).any()):
                 raise ValueError("per-row write positions must be within the cache bounds")
-            row_indices = torch.arange(key_states.shape[0], device=self.device)
-            self.keys[row_indices, :, cache_position, :] = key_states[:, :, 0, :]
-            self.values[row_indices, :, cache_position, :] = value_states[:, :, 0, :]
             active_batch_size = key_states.shape[0]
+            row_indices = torch.arange(active_batch_size, device=self.device)
+            if kv_length == 1:
+                self.keys[row_indices, :, cache_position, :] = key_states[:, :, 0, :]
+                self.values[row_indices, :, cache_position, :] = value_states[:, :, 0, :]
+            else:
+                # A chunk per row: row i writes columns [position_i, position_i + kv_length), so
+                # one cache can hold rows mid-way through different parts of their prompt.
+                row_indices = row_indices[:, None]
+                chunk_columns = cache_position[:, None] + torch.arange(kv_length, device=self.device)[None, :]
+                self.keys[row_indices, :, chunk_columns] = key_states.permute(0, 2, 1, 3)
+                self.values[row_indices, :, chunk_columns] = value_states.permute(0, 2, 1, 3)
             return self.keys[:active_batch_size], self.values[:active_batch_size]
 
         if self._write_position is not None:

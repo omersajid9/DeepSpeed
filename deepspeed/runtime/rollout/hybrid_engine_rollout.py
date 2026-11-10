@@ -13,13 +13,16 @@ Two generation paths:
   3. **continuous batching (experimental)**: an opt-in bounded path
      selected through ``SamplingConfig.continuous_batch_size``; greedy or
      sampled like the graph path, with or without graph capture.
+     capture it dispatches each step to the smallest captured batch width from a
+     ladder - separately for the decode step and for the chunked-prefill window -
+     so a rollout never replays a wider graph than the rows it is running.
 """
 
 import time
 from copy import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from inspect import signature
-from typing import Optional
+from typing import Dict, Optional, Tuple
 
 import torch
 
@@ -134,9 +137,19 @@ class HybridEngineRolloutConfig:
     keep making progress while a long prompt fills. Staging is decided on real tokens,
     so a batch padded to a wide common width does not stage prompts that are actually
     short, and a staged request spends no generation budget until its prompt is
-    complete. Sampling rollouts prefill in a single forward and log a warning. The
+    Sampling rollouts prefill in a single forward and log a warning. The
     cost is one staging cache per prompt being filled, sized to that prompt's
     effective length.
+
+    ``graph_capture_batch_sizes`` controls the captured-batch ladder of the
+    continuous graph path. The loop dispatches each step to the smallest
+    captured batch that fits the rows doing work, so a request arriving on its
+    own replays a one-row graph instead of the full batch, and a step that
+    stages one prompt captures prefill chunks at one row instead of padding up
+    to the whole batch. Defaults to the powers of two up to ``max_batch_size``
+    plus ``max_batch_size`` itself. Capture is lazy: a bucket is captured the
+    first time the loop needs it, and a bucket whose capture fails runs that
+    forward eagerly instead.
     """
     use_graph_capture: bool = False
     enable_profiling: bool = False
@@ -146,20 +159,89 @@ class HybridEngineRolloutConfig:
     continuous_cache_capacity: Optional[int] = None
     enable_chunked_prefill: bool = False
     prefill_chunk_size: int = 512
+    graph_capture_batch_sizes: Optional[Tuple[int, ...]] = None
+
+
+@dataclass
+class _DecodeBucket:
+    """Captured decode forward for one batch width.
+
+    The buffers are views of the rollout's master buffers, so the per-row state the
+    scheduler writes (tokens, positions, validity, write positions) is visible to every
+    bucket that covers those rows. ``logits`` is the tensor the captured forward returns
+    and the graph overwrites in place on every replay.
+    """
+
+    width: int
+    input_ids: torch.Tensor
+    causal_attention: torch.Tensor
+    position_ids: torch.Tensor
+    write_positions: torch.Tensor
+    graph: object = None
+    logits: Optional[torch.Tensor] = None
+    disabled: bool = False
+
+
+@dataclass
+class _PrefillBucket:
+    """Captured chunked-prefill forward for one batch width.
+
+    One row per staged prompt, and the chunk width is ``prefill_chunk_size`` for every row
+    and every step: the only shape that varies between steps is the number of staged
+    prompts, which is what the ladder absorbs. Rows past the staged count are parked
+    behind an all-masked attention row, exactly like parked decode rows.
+    """
+
+    width: int
+    input_ids: torch.Tensor
+    causal_attention: torch.Tensor
+    position_ids: torch.Tensor
+    write_positions: torch.Tensor
+    graph: object = None
+    logits: Optional[torch.Tensor] = None
+    disabled: bool = False
+
+
+@dataclass
+class _StagedPrompt:
+    """A prompt filled one chunk per step inside the shared staging cache.
+
+    ``slot`` is the decode-cache row the prompt will land in, ``row`` is its own row in
+    the staging cache, and ``start`` is the first column of its next chunk window. A row
+    belongs to exactly one prompt while it is staged, so a staged prompt never reads
+    another prompt's columns.
+    """
+
+    slot: int
+    row: int
+    prompt_ids: torch.Tensor
+    prompt_attention: torch.Tensor
+    position_ids: torch.Tensor
+    start: int = 0
+
+    @property
+    def prompt_len(self):
+        """Padded prompt width, which every request in a continuous batch shares."""
+        return self.prompt_ids.shape[1]
 
 
 @dataclass
 class _ContinuousGraphState:
+    """Captured graphs and static buffers shared by rollouts with the same shapes."""
+
     signature: tuple
+    ladder: Tuple[int, ...]
     cache: object
+    staging_cache: object
     static_input: torch.Tensor
     static_attention: torch.Tensor
     static_causal_attention: torch.Tensor
     static_position_ids: torch.Tensor
     static_write_positions: torch.Tensor
     static_cache_position: torch.Tensor
-    graph: object
-    static_logits: torch.Tensor
+    decode: Dict[int, _DecodeBucket] = field(default_factory=dict)
+    prefill: Dict[int, _PrefillBucket] = field(default_factory=dict)
+    captures: int = 0
 
 
 @dataclass
@@ -226,6 +308,7 @@ class HybridEngineRollout(RolloutEngine):
         self.continuous_cache_capacity = getattr(cfg, 'continuous_cache_capacity', None) if cfg else None
         self.enable_chunked_prefill = getattr(cfg, 'enable_chunked_prefill', False) if cfg else False
         self.prefill_chunk_size = getattr(cfg, 'prefill_chunk_size', 0) if cfg else 0
+        self.graph_capture_batch_sizes = getattr(cfg, 'graph_capture_batch_sizes', None) if cfg else None
         self._last_profile = None
         self._continuous_graph_state = None
         self._last_continuous_stats = None
@@ -687,7 +770,7 @@ class HybridEngineRollout(RolloutEngine):
             update = scheduler.advance(finished_ids, prefilling_ids=tuple(prefill_chunks))
             self._profile_end(profile, "scheduler_overhead_ms", scheduler_start)
 
-        stats["cache_memory_bytes"] = self._continuous_cache_memory_bytes(cache, attention_mask, write_positions)
+        stats["cache_memory_bytes"] = self._cache_bytes(cache) + attention_mask.nbytes + write_positions.nbytes
         generation_end = self._profile_start(profile)
         post_processing_start = generation_end
         output = self._build_continuous_batch(original_request, responses)
@@ -713,16 +796,21 @@ class HybridEngineRollout(RolloutEngine):
 
     @torch.no_grad()
     def _generate_continuous_graph(self, original_request, requests, sampling, max_batch_size):
-        """Run continuous decoding with a fixed-capacity graph.
+        """Run continuous greedy decoding with captured graphs.
 
-        Scheduler slots stay attached to physical cache rows for their whole
-        lifetime. Retired rows are masked until a new prompt is prefetched into
-        them, so the captured decode always receives the same batch shape and
-        static tensor addresses.
+        Scheduler slots stay attached to physical cache rows for their whole lifetime.
+        Retired rows are masked until a new prompt is prefetched into them, so a captured
+        forward always receives the same batch shape and static tensor addresses.
 
-        With ``enable_chunked_prefill``, prompts longer than ``prefill_chunk_size``
-        are staged and filled across steps instead of in a single forward, so the
-        decode rows in the batch keep producing tokens while a long prompt fills.
+        Each step dispatches to the smallest captured batch that covers the rows doing
+        work, so a step runs at most two replays: the chunk window of the staged prompts,
+        then the decode token of the rows that are already generating. Buckets are captured
+        the first time the loop needs them, and a bucket whose capture fails runs that
+        forward eagerly from the same static buffers.
+
+        With ``enable_chunked_prefill``, prompts longer than ``prefill_chunk_size`` are
+        staged in one shared cache and filled a chunk at a time, so the decode rows in the
+        batch keep producing tokens while a long prompt fills.
         """
         module = self.engine.module
         select_next_tokens = self._token_selector(sampling)
@@ -767,19 +855,44 @@ class HybridEngineRollout(RolloutEngine):
         static_causal_attention = state.static_causal_attention
         static_position_ids = state.static_position_ids
         static_write_positions = state.static_write_positions
-        graph = state.graph
-        static_logits = state.static_logits
+        staging_cache = state.staging_cache
+        staging_bytes = self._cache_bytes(staging_cache)
+        captures_before = state.captures
         stats = {
-            "cache_capacity": max_cache_len,
-            "peak_cache_length": prompt_len,
-            "cache_memory_bytes": self._continuous_cache_memory_bytes(cache, static_attention, static_write_positions),
-            "trim_count": 0,
-            "trimmed_columns": 0,
-            "trim_latency_ms": 0.0,
-            "trim_bytes_moved": 0,
-            "decode_steps": 0,
-            "chunked_prefill_chunks": 0,
-            "chunked_prefill_staging_bytes": 0,
+            "cache_capacity":
+            max_cache_len,
+            "peak_cache_length":
+            prompt_len,
+            "cache_memory_bytes":
+            self._cache_bytes(cache) + static_attention.nbytes + static_write_positions.nbytes,
+            "graph_capture_ladder":
+            list(state.ladder),
+            "graph_captures":
+            0,
+            "decode_bucket_steps":
+            0,
+            "decode_padded_rows":
+            0,
+            "decode_bucket_widths": {},
+            "prefill_bucket_steps":
+            0,
+            "prefill_padded_rows":
+            0,
+            "prefill_bucket_widths": {},
+            "trim_count":
+            0,
+            "trimmed_columns":
+            0,
+            "trim_latency_ms":
+            0.0,
+            "trim_bytes_moved":
+            0,
+            "decode_steps":
+            0,
+            "chunked_prefill_chunks":
+            0,
+            "chunked_prefill_staging_bytes":
+            staging_bytes,
         }
 
         slot_by_request = {}
@@ -798,6 +911,9 @@ class HybridEngineRollout(RolloutEngine):
                 slot_by_request.pop(request_id, None)
                 write_positions.pop(request_id, None)
                 next_tokens.pop(request_id, None)
+                # A staged prompt that retires drops out of its wave; its staging row stays
+                # parked behind an all-masked row until the wave ends.
+                prefill_chunks.pop(request_id, None)
 
             free_slots = [slot for slot in range(max_batch_size) if slot not in slot_by_request.values()]
             admitted_ids = tuple(request.request_id for request in update.admitted)
@@ -827,20 +943,21 @@ class HybridEngineRollout(RolloutEngine):
                     target_slots=tuple(admitted_slots),
                     prefill_chunks=prefill_chunks,
                     chunk_size=chunk_size,
+                    stage_prompts=self._stage_staged_prompt,
                 )
                 next_tokens.update(admitted_tokens)
             published_ids = set()
             if prefill_chunks:
-                chunked_tokens = self._run_chunked_prefill(module,
-                                                           prefill_chunks,
-                                                           chunk_size,
-                                                           device,
-                                                           cache,
-                                                           static_attention,
-                                                           static_write_positions,
-                                                           chunk_stats,
-                                                           profile,
-                                                           request_write_positions=write_positions)
+                chunked_tokens = self._run_staged_prefill(module,
+                                                          prefill_chunks,
+                                                          chunk_size,
+                                                          prompt_len,
+                                                          cache,
+                                                          static_attention,
+                                                          static_write_positions,
+                                                          chunk_stats,
+                                                          profile,
+                                                          request_write_positions=write_positions)
                 next_tokens.update(chunked_tokens)
                 # A prompt that completed in this step starts decoding next step, exactly
                 # like a freshly admitted row: this step's token is the first response token
@@ -866,11 +983,17 @@ class HybridEngineRollout(RolloutEngine):
             decoded_tokens = {}
             if decode_ids:
                 self._update_static_causal_attention(static_attention, static_causal_attention)
+                # Only the rows that are decoding need to be covered, so the step replays the
+                # smallest captured batch that holds them instead of the whole physical batch.
+                bucket = self._decode_bucket(max(slot_by_request[request_id] for request_id in decode_ids) + 1)
+                self._capture_bucket_if_needed(module, cache, bucket, state.static_cache_position,
+                                               bucket.write_positions)
                 decode_start = self._profile_start(profile)
-                get_accelerator().replay_graph(graph)
+                decode_logits_all = self._run_bucket(module, cache, bucket, state.static_cache_position,
+                                                     bucket.write_positions)
                 self._profile_end(profile, "decode_forward_ms", decode_start, count="num_decode_forwards")
                 decode_logits = torch.cat(
-                    [static_logits[slot_by_request[request_id], -1, :].unsqueeze(0) for request_id in decode_ids],
+                    [decode_logits_all[slot_by_request[request_id], -1, :].unsqueeze(0) for request_id in decode_ids],
                     dim=0)
                 decoded = self._continuous_next_tokens(
                     decode_logits,
@@ -884,6 +1007,9 @@ class HybridEngineRollout(RolloutEngine):
                     decoded_tokens[request_id] = token
                     write_positions[request_id] += 1
                 stats["decode_steps"] += 1
+                stats["decode_bucket_steps"] += 1
+                stats["decode_padded_rows"] += bucket.width - len(decode_ids)
+                stats["decode_bucket_widths"][bucket.width] = stats["decode_bucket_widths"].get(bucket.width, 0) + 1
                 next_tokens.update(decoded_tokens)
 
             finished_ids = []
@@ -916,8 +1042,14 @@ class HybridEngineRollout(RolloutEngine):
             stats["end_to_end_ms"] = None
             stats["tokens_per_second"] = None
         stats["trim_frequency"] = 0.0
+        stats["graph_captures"] = state.captures - captures_before
         stats["chunked_prefill_chunks"] = chunk_stats["chunks"]
-        stats["chunked_prefill_staging_bytes"] = chunk_stats["peak_staging_bytes"]
+        if staging_cache is None:
+            stats["chunked_prefill_staging_bytes"] = chunk_stats["peak_staging_bytes"]
+        else:
+            stats["prefill_bucket_steps"] = chunk_stats.get("graph_steps", 0)
+            stats["prefill_padded_rows"] = chunk_stats.get("padded_rows", 0)
+            stats["prefill_bucket_widths"] = dict(chunk_stats.get("bucket_widths", {}))
         self._last_continuous_stats = stats
         if profile is not None:
             self._finish_continuous_profile(profile, original_request, responses, max_batch_size, prompt_len,
@@ -934,15 +1066,59 @@ class HybridEngineRollout(RolloutEngine):
         if (self.continuous_cache_capacity is not None
                 and self.continuous_cache_capacity < prompt_len + sampling.max_new_tokens):
             raise ValueError("continuous_cache_capacity must fit the prompt and all generated tokens")
+        self._graph_capture_ladder(sampling.continuous_batch_size, self.graph_capture_batch_sizes)
+
+    @staticmethod
+    def _graph_capture_ladder(max_batch_size, configured=None):
+        """Return the batch widths the graph path captures, smallest first.
+
+        The loop buckets every step up to the nearest width in the ladder, so a sparse
+        ladder means fewer captures and more padded rows, and a dense one means the
+        opposite. ``max_batch_size`` is always included: a full physical batch has to be
+        replayable for the step that drains every slot.
+        """
+        widths = {max_batch_size}
+        if configured:
+            for width in configured:
+                if not isinstance(width, int) or width <= 0:
+                    raise ValueError("graph_capture_batch_sizes must be positive integers")
+                if width > max_batch_size:
+                    raise ValueError("graph_capture_batch_sizes cannot exceed continuous_batch_size")
+                widths.add(width)
+        else:
+            width = 1
+            while width < max_batch_size:
+                widths.add(width)
+                width *= 2
+        return tuple(sorted(widths))
+
+    @staticmethod
+    def _bucket_width(ladder, required):
+        """Smallest captured width that covers ``required`` rows."""
+        for width in ladder:
+            if width >= required:
+                return width
+        raise ValueError(f"captured batch ladder {ladder} does not cover {required} rows")
 
     def _get_continuous_graph_state(self, module, max_batch_size, prompt_len, max_cache_len, device, model_dtype,
                                     cache_type):
+        ladder = self._graph_capture_ladder(max_batch_size, self.graph_capture_batch_sizes)
         signature = self._continuous_graph_signature(module, max_batch_size, prompt_len, max_cache_len, device,
-                                                     model_dtype)
+                                                     model_dtype, ladder)
         state = self._continuous_graph_state
         if state is None or state.signature != signature:
             # Capture sizes the layers from the model's local KV tensors.
             cache = cache_type(module.config, max_cache_len=max_cache_len)
+            staging_cache = None
+            if self.enable_chunked_prefill:
+                # One staging cache serves every staged prompt and every captured prefill
+                # width: rows are staged prompts and columns are the padded prompt width,
+                # which is the same for every request in a continuous batch. Rows are
+                # reused across prompts, but a staged prompt always writes its own columns
+                # forward before the attention can read them, so stale columns are never
+                # read and the cache does not need to be cleared between rollouts.
+                staging_cache = self._create_static_cache(cache_type, module.config, max_batch_size, prompt_len,
+                                                          device, model_dtype)
             static_input = torch.zeros((max_batch_size, 1), dtype=torch.long, device=device)
             static_attention = torch.zeros((max_batch_size, max_cache_len), dtype=torch.long, device=device)
             static_causal_attention = torch.zeros((max_batch_size, 1, 1, max_cache_len),
@@ -954,27 +1130,20 @@ class HybridEngineRollout(RolloutEngine):
             # Transformers uses cache_position to build the causal mask. Per-row
             # validity is represented by static_attention, so a fixed upper bound
             # lets one captured graph serve requests at different decode lengths.
+            # Captured chunk forwards short-circuit on the additive mask, so their
+            # cache_position is not read at all.
             static_cache_position = torch.tensor([max_cache_len - 1], dtype=torch.long, device=device)
-            graph, static_logits = self._capture_continuous_graph(
-                module,
-                cache,
-                static_input,
-                static_causal_attention,
-                static_write_positions,
-                static_cache_position,
-                static_position_ids,
-            )
             state = _ContinuousGraphState(
                 signature,
+                ladder,
                 cache,
+                staging_cache,
                 static_input,
                 static_attention,
                 static_causal_attention,
                 static_position_ids,
                 static_write_positions,
                 static_cache_position,
-                graph,
-                static_logits,
             )
             self._continuous_graph_state = state
 
@@ -986,10 +1155,89 @@ class HybridEngineRollout(RolloutEngine):
         state.static_write_positions.zero_()
         return state
 
+    def _decode_bucket(self, highest_row):
+        """Return the decode bucket covering the rows that are decoding, allocating it if new.
+
+        Buckets are captured by the caller once its buffers hold the step it is about to
+        run, so a capture is never asked to warm up on stale rows.
+        """
+        state = self._continuous_graph_state
+        width = self._bucket_width(state.ladder, highest_row)
+        bucket = state.decode.get(width)
+        if bucket is None:
+            bucket = _DecodeBucket(width, state.static_input[:width], state.static_causal_attention[:width],
+                                   state.static_position_ids[:width], state.static_write_positions[:width])
+            state.decode[width] = bucket
+        return bucket
+
+    def _prefill_bucket(self, width):
+        """Return the chunked-prefill bucket for a staged row count, allocating it if new."""
+        state = self._continuous_graph_state
+        bucket = state.prefill.get(width)
+        if bucket is None:
+            device = state.static_input.device
+            bucket = _PrefillBucket(
+                width,
+                torch.zeros((width, self.prefill_chunk_size), dtype=torch.long, device=device),
+                torch.zeros((width, 1, self.prefill_chunk_size, state.staging_cache.get_max_cache_shape()),
+                            dtype=state.static_causal_attention.dtype,
+                            device=device),
+                torch.zeros((width, self.prefill_chunk_size), dtype=torch.long, device=device),
+                torch.zeros(width, dtype=torch.long, device=device),
+            )
+            state.prefill[width] = bucket
+        return bucket
+
+    def _capture_bucket_if_needed(self, module, cache, bucket, cache_position, write_position):
+        """Capture a bucket the first time the loop needs it."""
+        if bucket.graph is None and not bucket.disabled:
+            self._capture_bucket(module, cache, bucket, cache_position, write_position)
+        return bucket
+
+    def _capture_bucket(self, module, cache, bucket, cache_position, write_position):
+        """Capture one bucket's forward, falling back to eager forwards if capture fails.
+
+        The capture runs the model for real during its warmup, with the buffers the next
+        replay will use, so it must be called only once the caller has filled them.
+        """
+        try:
+            cache.set_write_position(write_position)
+            bucket.graph, bucket.logits = self._capture_continuous_graph(module, cache, bucket.input_ids,
+                                                                         bucket.causal_attention, write_position,
+                                                                         cache_position, bucket.position_ids,
+                                                                         self._last_logits_kwargs(module))
+            self._continuous_graph_state.captures += 1
+        except Exception as error:  # a graph is an optimization: a failed capture must not fail the rollout
+            bucket.graph = None
+            bucket.disabled = True
+            logger.warning(
+                "Rollout graph capture failed for batch width %s (%s); this bucket will run eagerly "
+                "for the rest of the rollout.", bucket.width, error)
+
+    def _run_bucket(self, module, cache, bucket, cache_position, write_position):
+        """Replay a bucket's captured forward, or run the same buffers eagerly without a graph."""
+        if bucket.graph is not None:
+            get_accelerator().replay_graph(bucket.graph)
+            return bucket.logits
+        # The eager fallback reads the same static buffers, so it stays token-identical
+        # to a replay; only the launch overhead differs.
+        cache.set_write_position(write_position)
+        output = self._call_model(
+            module,
+            bucket.input_ids,
+            attention_mask=bucket.causal_attention,
+            past_key_values=cache,
+            use_cache=True,
+            cache_position=cache_position,
+            position_ids=bucket.position_ids,
+            **self._last_logits_kwargs(module),
+        )
+        return output.logits
+
     @staticmethod
-    def _continuous_graph_signature(module, max_batch_size, prompt_len, max_cache_len, device, model_dtype):
+    def _continuous_graph_signature(module, max_batch_size, prompt_len, max_cache_len, device, model_dtype, ladder):
         parameter_signature = tuple((parameter.data_ptr(), parameter._version) for parameter in module.parameters())
-        return (id(module), device.type, device.index, model_dtype, max_batch_size, prompt_len, max_cache_len,
+        return (id(module), device.type, device.index, model_dtype, max_batch_size, prompt_len, max_cache_len, ladder,
                 parameter_signature)
 
     @staticmethod
@@ -998,9 +1246,20 @@ class HybridEngineRollout(RolloutEngine):
         static_causal_attention.neg_().add_(1).mul_(torch.finfo(static_causal_attention.dtype).min)
 
     @staticmethod
-    def _capture_continuous_graph(module, cache, static_input, static_attention, static_write_positions,
-                                  static_cache_position, static_position_ids):
-        """Capture one fixed-capacity decode forward and return its static logits."""
+    def _capture_continuous_graph(module,
+                                  cache,
+                                  static_input,
+                                  static_attention,
+                                  static_write_positions,
+                                  static_cache_position,
+                                  static_position_ids,
+                                  logits_kwargs=None):
+        """Capture one fixed-shape forward and return its graph and static logits.
+
+        The caller fills the static buffers before capturing, because the warmup forwards
+        run the model for real: they write the same KV the following replay writes.
+        """
+        logits_kwargs = logits_kwargs or {}
         accelerator = get_accelerator()
         saved_pre = dict(module._forward_pre_hooks)
         saved_post = dict(module._forward_hooks)
@@ -1028,6 +1287,7 @@ class HybridEngineRollout(RolloutEngine):
                         use_cache=True,
                         cache_position=static_cache_position,
                         position_ids=static_position_ids,
+                        **logits_kwargs,
                     )
             accelerator.current_stream().wait_stream(warmup_stream)
             graph = accelerator.create_graph()
@@ -1039,6 +1299,7 @@ class HybridEngineRollout(RolloutEngine):
                     use_cache=True,
                     cache_position=static_cache_position,
                     position_ids=static_position_ids,
+                    **logits_kwargs,
                 )
         finally:
             module._forward_pre_hooks.update(saved_pre)
@@ -1141,7 +1402,8 @@ class HybridEngineRollout(RolloutEngine):
                             profile=None,
                             target_slots=None,
                             prefill_chunks=None,
-                            chunk_size=0):
+                            chunk_size=0,
+                            stage_prompts=None):
         if not update.admitted:
             return {}
 
@@ -1152,9 +1414,9 @@ class HybridEngineRollout(RolloutEngine):
             if len(target_slots) != len(admitted_ids):
                 raise ValueError("continuous prefill needs one target slot per admitted request")
             if prefill_chunks is not None and chunk_size > 0:
-                admitted_ids, target_slots = self._stage_long_prompts(module, admitted_ids, target_slots,
-                                                                      request_by_id, prefill_chunks, chunk_size,
-                                                                      static_cache_type, model_dtype, device)
+                stager = stage_prompts if stage_prompts is not None else self._stage_long_prompts
+                admitted_ids, target_slots = stager(module, admitted_ids, target_slots, request_by_id, prefill_chunks,
+                                                    chunk_size, static_cache_type, model_dtype, device)
                 if not admitted_ids:
                     return {}
             prompt_ids = torch.cat([request_by_id[request_id].prompt_ids for request_id in admitted_ids], dim=0)
@@ -1231,12 +1493,6 @@ class HybridEngineRollout(RolloutEngine):
             write_positions[target_row] = cache_position
             self._profile_end(profile, "cache_management_overhead_ms", cache_copy_start)
         return admitted_tokens
-
-    @staticmethod
-    def _continuous_cache_memory_bytes(cache, attention_mask, write_positions):
-        # Eager and graph decoding report the same quantity: the KV cache plus the per-row metadata that
-        # tracks it. Graph-only staging buffers are not counted.
-        return cache.memory_bytes() + attention_mask.nbytes + write_positions.nbytes
 
     @staticmethod
     def _continuous_cache_layer(cache, layer_idx, prefill_keys, prefill_values, max_batch_size):
@@ -1364,6 +1620,176 @@ class HybridEngineRollout(RolloutEngine):
             completed[request_id] = first_token
             del prefill_chunks[request_id]
         return completed
+
+    # ------------------------------------------------------------------
+    # Captured chunked prefill (continuous graph path)
+    # ------------------------------------------------------------------
+
+    def _stage_staged_prompt(self, module, admitted_ids, target_slots, request_by_id, prefill_chunks, chunk_size,
+                             static_cache_type, model_dtype, device):
+        """Divert prompts that do not fit one chunk into the shared staging cache.
+
+        The signature matches ``_stage_long_prompts`` so the continuous graph loop can hand
+        it to the shared admission path, but the staging itself is different: rows live in
+        one cache that every captured prefill width can address, and the staged row is the
+        whole padded prompt rather than its real tokens. A continuous batch shares one
+        padded width, so staging the padded row keeps the chunk grid constant across
+        prompts, which is what lets one captured chunk graph serve all of them.
+
+        Staged prompts advance in waves: every row of a wave writes the same chunk window,
+        so the wave is a single forward with a single scalar write position. A prompt
+        admitted while a wave runs waits for the next one, holding its decode slot and
+        spending no generation budget, exactly like a prompt that is mid-wave.
+        """
+        state = self._continuous_graph_state
+        if state.staging_cache is None:
+            raise ValueError("chunked prefill capture requires a staging cache")
+        batched_ids, batched_slots = [], []
+        pending = []
+        for request_id, target_slot in zip(admitted_ids, target_slots):
+            request = request_by_id[request_id]
+            if int(request.prompt_attention_mask.sum().item()) <= chunk_size:
+                batched_ids.append(request_id)
+                batched_slots.append(target_slot)
+                continue
+            pending.append((request_id, target_slot, request))
+        wave_running = any(chunk.row is not None for chunk in prefill_chunks.values())
+        for request_id, target_slot, request in pending:
+            prefill_chunks[request_id] = _StagedPrompt(slot=target_slot,
+                                                       row=None,
+                                                       prompt_ids=request.prompt_ids,
+                                                       prompt_attention=request.prompt_attention_mask,
+                                                       position_ids=self._prefill_position_ids(
+                                                           request.prompt_attention_mask))
+        if pending and not wave_running:
+            for row, chunk in enumerate(prefill_chunks.values()):
+                chunk.row = row
+        return tuple(batched_ids), tuple(batched_slots)
+
+    def _run_staged_prefill(self,
+                            module,
+                            prefill_chunks,
+                            chunk_size,
+                            prompt_len,
+                            cache,
+                            attention_mask,
+                            write_positions,
+                            chunk_stats,
+                            profile=None,
+                            request_write_positions=None):
+        """Advance the running wave by one chunk window and publish the prompts that finish.
+
+        Every row of a wave shares one window, so the whole wave is one forward at
+        ``[rows, chunk_size]`` padded up to the nearest captured bucket, replayed from a
+        graph when the bucket is warm. Prompts still waiting for a wave are skipped.
+        """
+        state = self._continuous_graph_state
+        wave = [(request_id, chunk) for request_id, chunk in prefill_chunks.items() if chunk.row is not None]
+        if not wave:
+            return {}
+        starts = {chunk.start for _, chunk in wave}
+        if len(starts) != 1:
+            raise ValueError(f"staged prompts of one wave must share a chunk window, saw {sorted(starts)}")
+        # The last window slides back to end at the prompt instead of starting where the
+        # chunk grid would: it keeps the chunk width constant without padding fake tokens
+        # into the cache, and it re-writes columns the previous window already filled with
+        # the same values.
+        window = min(wave[0][1].start, prompt_len - chunk_size)
+        end = window + chunk_size
+        width = self._bucket_width(state.ladder, len(wave))
+        bucket = self._prefill_bucket(width)
+        bucket.input_ids.zero_()
+        bucket.position_ids.zero_()
+        for row_index, (_, chunk) in enumerate(wave):
+            bucket.input_ids[row_index].copy_(chunk.prompt_ids[0, window:end])
+            bucket.position_ids[row_index].copy_(chunk.position_ids[0, window:end])
+        self._fill_staged_attention(bucket, wave, window)
+        # The bucket is filled before it is captured: capture warms up on the buffers, and
+        # those warmups write the same KV the following replay writes.
+        self._capture_bucket_if_needed(module, state.staging_cache, bucket, state.static_cache_position,
+                                       bucket.write_positions)
+        forward_start = self._profile_start(profile)
+        logits = self._run_bucket(module, state.staging_cache, bucket, state.static_cache_position,
+                                  bucket.write_positions)
+        self._profile_end(profile, "prefill_forward_ms", forward_start, count="num_prefill_forwards")
+        completion = end >= prompt_len
+        completed = {}
+        for row_index, (request_id, chunk) in enumerate(wave):
+            chunk.start = end
+            if not completion:
+                continue
+            # The chunk that completes the prompt also predicts the first response token.
+            first_token = logits[row_index:row_index + 1, -1, :].argmax(dim=-1, keepdim=True)
+            self._publish_staged_prompt(chunk, state, cache, attention_mask, write_positions)
+            if request_write_positions is not None:
+                request_write_positions[request_id] = prompt_len
+            completed[request_id] = first_token
+            del prefill_chunks[request_id]
+        chunk_stats["chunks"] += len(wave)
+        chunk_stats["graph_steps"] = chunk_stats.get("graph_steps", 0) + 1
+        chunk_stats["padded_rows"] = chunk_stats.get("padded_rows", 0) + width - len(wave)
+        widths = chunk_stats.setdefault("bucket_widths", {})
+        widths[width] = widths.get(width, 0) + 1
+        return completed
+
+    def _fill_staged_attention(self, bucket, wave, window):
+        """Write the chunk's additive mask and its write positions in place.
+
+        A query at column ``window + j`` may attend to every staged key up to and including
+        column ``window + j``, minus the prompt's own padding. Rows the bucket carries past
+        the wave stay masked everywhere, so their logits are the ones the caller discards.
+        A wave shares one window, so every row of it writes the same columns; the position
+        stays a per-row tensor because the cache needs one that covers only the active rows.
+        """
+        min_dtype = torch.finfo(bucket.causal_attention.dtype).min
+        if bucket.width > len(wave):
+            bucket.causal_attention[len(wave):].fill_(min_dtype)
+        chunk_size = bucket.input_ids.shape[1]
+        keys = torch.arange(bucket.causal_attention.shape[-1], device=bucket.causal_attention.device)
+        queries = window + torch.arange(chunk_size, device=keys.device)
+        for row_index, (_, chunk) in enumerate(wave):
+            valid = (keys[None, :] <= queries[:, None]) & chunk.prompt_attention[0].bool()[None, :]
+            bucket.causal_attention[row_index, 0].copy_(torch.where(valid, 0.0, min_dtype))
+        bucket.write_positions.fill_(window)
+
+    def _publish_staged_prompt(self, chunk, state, cache, attention_mask, write_positions):
+        """Move a finished staged prompt into its row of the decode cache.
+
+        The prompt lands at column zero of its own row, exactly like a one-shot prefill, so
+        the row's response starts at the padded prompt width and the cache capacity stays a
+        function of the prompt and the response budget, never of how many chunks it took.
+        """
+        prompt_len = chunk.prompt_len
+        for layer_idx in range(self._cache_layer_count(state.staging_cache)):
+            staged_keys, staged_values = self._cache_layer_tensors(state.staging_cache, layer_idx)
+            target_layer = cache.layers[layer_idx]
+            if not target_layer.is_initialized:
+                # The capture cache sizes its layers lazily; when every bucket falls back to
+                # eager windows no captured warmup has allocated them yet.
+                target_layer.lazy_initialization(staged_keys[chunk.row:chunk.row + 1],
+                                                 staged_values[chunk.row:chunk.row + 1],
+                                                 max_batch_size=attention_mask.shape[0])
+            target_layer.keys[chunk.slot, :, :prompt_len].copy_(staged_keys[chunk.row, :, :prompt_len])
+            target_layer.values[chunk.slot, :, :prompt_len].copy_(staged_values[chunk.row, :, :prompt_len])
+        attention_mask[chunk.slot, :prompt_len].copy_(chunk.prompt_attention[0])
+        write_positions[chunk.slot] = prompt_len
+
+    @staticmethod
+    def _cache_bytes(cache):
+        """Bytes held by a cache's key/value tensors, or zero for a cache that is not allocated."""
+        if cache is None:
+            return 0
+        layers = getattr(cache, "layers", None)
+        if layers is None:
+            return 0
+        total = 0
+        for layer in layers:
+            keys = getattr(layer, "keys", None)
+            values = getattr(layer, "values", None)
+            if keys is None or values is None:
+                continue
+            total += keys.numel() * keys.element_size() + values.numel() * values.element_size()
+        return total
 
     def _chunked_prefill_cache(self,
                                module,
