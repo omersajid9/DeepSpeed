@@ -144,6 +144,7 @@ class HybridEngineRolloutConfig:
     enable_paged_prefill: bool = False
     enable_prefix_reuse: bool = False
     enable_torch_compile: bool = False
+    use_flashinfer_prefill: bool = False
     enable_compiled_sampler: bool = False
 
 
@@ -299,6 +300,7 @@ class HybridEngineRollout(RolloutEngine):
         self.enable_paged_prefill = getattr(cfg, 'enable_paged_prefill', False) if cfg else False
         self.enable_prefix_reuse = getattr(cfg, 'enable_prefix_reuse', False) if cfg else False
         self.enable_torch_compile = getattr(cfg, 'enable_torch_compile', False) if cfg else False
+        self.use_flashinfer_prefill = getattr(cfg, 'use_flashinfer_prefill', False) if cfg else False
         self.enable_compiled_sampler = getattr(cfg, 'enable_compiled_sampler', False) if cfg else False
         if self.enable_compiled_sampler:
             configure_compiled_sampler(True)
@@ -560,6 +562,7 @@ class HybridEngineRollout(RolloutEngine):
                 device=device,
                 dtype=model_dtype,
                 block_size=self.paged_block_size,
+                use_flashinfer_prefill=self.use_flashinfer_prefill,
             )
         else:
             cache = DeepSpeedStaticCache(
@@ -1216,6 +1219,7 @@ class HybridEngineRollout(RolloutEngine):
                     device=device,
                     dtype=model_dtype,
                     block_size=self.paged_block_size,
+                    use_flashinfer_prefill=self.use_flashinfer_prefill,
                 )
                 cache.enable_graph_safe()
             else:

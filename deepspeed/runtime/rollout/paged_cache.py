@@ -57,6 +57,7 @@ class PagedAttentionCache:
         device,
         dtype,
         block_size: Optional[int] = None,
+        use_flashinfer_prefill: bool = False,
     ) -> None:
         if batch_size <= 0:
             raise ValueError("paged cache requires a positive batch size")
@@ -134,6 +135,9 @@ class PagedAttentionCache:
         self._block_hash_by_id: dict[int, bytes] = {}
         self.prefix_reuse_blocks = 0
         self.prefix_reuse_tokens = 0
+        self.use_flashinfer_prefill = use_flashinfer_prefill
+        self._flashinfer_prefill_wrapper = None
+        self._flashinfer_workspace = None
 
     @property
     def layers(self) -> list[_PagedLayer]:
@@ -450,6 +454,48 @@ class PagedAttentionCache:
         self._step_q_len = q_len
         return self._step_atoms
 
+    def _flashinfer_prefill_attention(self, layer_idx: int, query_states: torch.Tensor, scale: float) -> torch.Tensor:
+        """Prefill a single prompt row through FlashInfer's paged-KV backend."""
+        if query_states.shape[0] != 1:
+            raise ValueError("FlashInfer prefill currently supports one active row")
+        if self._graph_mode:
+            raise RuntimeError("FlashInfer prefill cannot run inside a graph replay")
+
+        from flashinfer import BatchPrefillWithPagedKVCacheWrapper
+
+        if self._flashinfer_prefill_wrapper is None:
+            self._flashinfer_workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=self.device)
+            self._flashinfer_prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(self._flashinfer_workspace,
+                                                                                   "NHD",
+                                                                                   use_cuda_graph=False)
+
+        row = int(self._active_rows[0])
+        total_len = int(self.row_len[row])
+        block_count = (total_len + self.block_size - 1) // self.block_size
+        last_page_len = total_len - (block_count - 1) * self.block_size
+        if last_page_len == 0:
+            last_page_len = self.block_size
+        indices = self.block_ids[row, :block_count].to(torch.int32)
+        indptr = torch.tensor([0, block_count], dtype=torch.int32, device=self.device)
+        last_page = torch.tensor([last_page_len], dtype=torch.int32, device=self.device)
+        q = query_states.transpose(1, 2).reshape(-1, query_states.shape[1], query_states.shape[3])
+        qo_indptr = torch.tensor([0, q.shape[0]], dtype=torch.int32, device=self.device)
+        wrapper = self._flashinfer_prefill_wrapper
+        wrapper.plan(qo_indptr,
+                     indptr,
+                     indices,
+                     last_page,
+                     query_states.shape[1],
+                     self.num_kv_heads,
+                     self.head_dim,
+                     self.block_size,
+                     causal=True,
+                     sm_scale=scale,
+                     q_data_type=query_states.dtype,
+                     kv_data_type=query_states.dtype)
+        output = wrapper.run(q, (self._key_views[layer_idx], self._value_views[layer_idx]))
+        return output.view(1, q.shape[0], query_states.shape[1], query_states.shape[3]).transpose(1, 2)
+
     def attention(self, layer_idx: int, query_states: torch.Tensor, scale: float) -> torch.Tensor:
         """Run blocked flash attention for one decode step.
 
@@ -458,6 +504,8 @@ class PagedAttentionCache:
         writes into a preallocated output, so the replay performs no host work.
         """
         num_rows, num_heads, q_len, head_dim = query_states.shape
+        if q_len > 1 and self.use_flashinfer_prefill:
+            return self._flashinfer_prefill_attention(layer_idx, query_states, scale)
         if self._graph_mode and q_len != 1:
             raise ValueError("graph replay paged attention expects one query token per row")
         if self._graph_mode:
