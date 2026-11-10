@@ -3,10 +3,10 @@
 """Paged KV cache and attention shim for the hybrid-engine rollout.
 
 The cache keeps one block table per row over a shared ``BlockedKVCache`` pool.
-Prefill still uses the dense static cache (the model's own attention); its KV is
-copied into blocks once per prompt. Decode writes one token per row into the
-block table and runs ``BlockedFlashAttn`` over the atoms, so it never builds the
-dense per-step attention mask.
+Prefill can write directly into the table in chunk windows (no dense staging or
+copy), and decode writes one token per row and runs ``BlockedFlashAttn`` over the
+atoms, so neither path builds the dense attention mask. Full prompt-prefix blocks
+can be shared between rows with per-block refcounts.
 
 The attention shim is scoped to Qwen3's attention modules. It falls back to the
 module's original forward whenever ``past_key_values`` is not a
@@ -22,6 +22,7 @@ from deepspeed.inference.v2.inference_utils import DtypeEnum
 from deepspeed.inference.v2.kernels.ragged_ops.blocked_flash.blocked_flash import (
     BlockedFlashAttn,
     get_kv_block_size,
+    get_q_block_size,
 )
 from deepspeed.inference.v2.ragged.kv_cache import BlockedKVCache, split_kv
 from deepspeed.inference.v2.ragged.manager_configs import (
@@ -110,10 +111,12 @@ class PagedAttentionCache:
         self._write_positions: Optional[torch.Tensor] = None
         self._active_rows = torch.arange(self.max_batch_size, dtype=torch.long, device=self.device)
         self._kernel = BlockedFlashAttn(self.head_dim, DtypeEnum(dtype))
-        self._atom_count = self.max_batch_size
+        self.q_block_size = get_q_block_size(self.head_dim)
+        self._atom_count = self.max_batch_size * ((max_cache_len + self.q_block_size - 1) // self.q_block_size)
         self._atoms_cpu = torch.zeros((self._atom_count, 8), dtype=torch.int32)
         self._atoms_device = torch.zeros((self._atom_count, 8), dtype=torch.int32, device=self.device)
         self._step_atoms: Optional[torch.Tensor] = None
+        self._step_q_len = 1
         self._step_prepared = False
         self._scale = self.head_dim**-0.5
         self._graph_safe = False
@@ -124,6 +127,13 @@ class PagedAttentionCache:
         self._graph_outputs: Optional[torch.Tensor] = None
         self._graph_row_buffers: dict = {}
         self._graph_atom_views: dict = {}
+        # Block sharing for prompt-prefix reuse. A block can be referenced by several
+        # rows; it returns to the allocator only when the last row releases it.
+        self._block_refs: dict[int, int] = {}
+        self._block_hash: dict[bytes, int] = {}
+        self._block_hash_by_id: dict[int, bytes] = {}
+        self.prefix_reuse_blocks = 0
+        self.prefix_reuse_tokens = 0
 
     @property
     def layers(self) -> list[_PagedLayer]:
@@ -153,6 +163,7 @@ class PagedAttentionCache:
         self._write_positions = pos
         self._step_prepared = False
         self._step_atoms = None
+        self._step_q_len = 1
 
     def set_active_rows(self, rows) -> None:
         rows = torch.as_tensor(rows, dtype=torch.long, device=self.device)
@@ -180,6 +191,15 @@ class PagedAttentionCache:
                                               dtype=self.dtype,
                                               device=self.device)
 
+    def set_eager_mode(self) -> None:
+        """Return to eager writes/attention after a decode graph has run."""
+        self._graph_mode = False
+        self._graph_width = 0
+        self._graph_atoms = None
+        self._step_prepared = False
+        self._step_atoms = None
+        self._step_q_len = 1
+
     def set_graph_mode(self, width: int) -> None:
         """Address exactly ``width`` rows from device-resident buffers for a replay step."""
         if not self._graph_safe:
@@ -201,9 +221,14 @@ class PagedAttentionCache:
             self._graph_atom_views[width] = atoms
         self._graph_active_rows = rows
         self._graph_atoms = atoms
+        # Eager prefill may have overwritten the shared atom buffer with multi-token
+        # atoms. Restore the decode atom structure before every capture/replay.
+        self._init_graph_atom_structure()
+        self._graph_atoms = self._atoms_device[:width]
         self._active_rows = rows
         self._step_prepared = True
         self._step_atoms = None
+        self._step_q_len = 1
 
     def _allocate_all_blocks(self) -> None:
         for row in range(self.max_batch_size):
@@ -233,8 +258,8 @@ class PagedAttentionCache:
         atoms = self._atoms_cpu
         pointers = torch.tensor([self.block_ids[row].data_ptr() for row in range(self.max_batch_size)],
                                 dtype=torch.int64)
-        atoms.view(torch.int64)[:, 0].copy_(pointers)
-        atoms[:, 2] = torch.arange(self.max_batch_size, dtype=torch.int32)
+        atoms.view(torch.int64)[:self.max_batch_size, 0].copy_(pointers)
+        atoms[:, 2] = torch.arange(self._atom_count, dtype=torch.int32)
         atoms[:, 3] = 1
         atoms[:, 4:7] = 0
         atoms[:, 7] = 0
@@ -251,14 +276,64 @@ class PagedAttentionCache:
         self.block_ids[row, count:needed].copy_(new_blocks)
         self._block_counts[row] = needed
 
+    def clear_row(self, row: int) -> None:
+        """Release a row's block chain before it is reused for a new prompt."""
+        self._free_row(row)
+
+    def _release_blocks(self, blocks) -> None:
+        for block in blocks:
+            refs = self._block_refs.get(block)
+            if refs is None or refs <= 1:
+                if refs is not None:
+                    self._block_refs.pop(block, None)
+                block_hash = self._block_hash_by_id.pop(block, None)
+                if block_hash is not None:
+                    self._block_hash.pop(block_hash, None)
+                self.kv_cache.free([block])
+            else:
+                self._block_refs[block] = refs - 1
+
     def _free_row(self, row: int) -> None:
         count = self._block_counts[row]
         if count:
-            blocks = self.block_ids[row, :count].tolist()
-            self.kv_cache.free(blocks)
+            self._release_blocks(self.block_ids[row, :count].tolist())
             self.block_ids[row].fill_(-1)
             self._block_counts[row] = 0
             self.row_len[row] = 0
+
+    def prepare_prefix(self, hashes, target_row: int) -> int:
+        """Point ``target_row`` at an existing block chain and return its block count.
+
+        Only full blocks are reused. The caller prefills the remaining suffix; shared
+        blocks keep their refcount so retiring either row cannot free KV that the other
+        row still reads.
+        """
+        if self._graph_safe:
+            raise RuntimeError("prefix reuse is not compatible with a graph-safe cache")
+        self._free_row(target_row)
+        reused = 0
+        for block_hash in hashes:
+            block = self._block_hash.get(block_hash)
+            if block is None:
+                break
+            self.block_ids[target_row, reused] = block
+            self._block_refs[block] = self._block_refs.get(block, 1) + 1
+            reused += 1
+        self._block_counts[target_row] = reused
+        self.row_len[target_row] = reused * self.block_size
+        return reused
+
+    def register_prefix(self, hashes, target_row: int, count: int) -> None:
+        """Record the target row's full blocks as reusable prefix blocks."""
+        if self._graph_safe:
+            return
+        for index, block_hash in enumerate(hashes[:count]):
+            if block_hash in self._block_hash:
+                continue
+            block = int(self.block_ids[target_row, index])
+            self._block_hash[block_hash] = block
+            self._block_hash_by_id[block] = block_hash
+            self._block_refs.setdefault(block, 1)
 
     def _slots(self, rows: torch.Tensor, positions: torch.Tensor, q_len: int) -> torch.Tensor:
         """Return ``[rows, q_len]`` physical slot ids for the block-table rows."""
@@ -328,24 +403,51 @@ class PagedAttentionCache:
         value_view[slots.reshape(-1)] = value_states.permute(0, 2, 1, 3).reshape(-1, self.num_kv_heads, self.head_dim)
         self.row_len[rows] = (positions + q_len).to(torch.int32)
 
-    def _build_atoms(self) -> torch.Tensor:
-        if self._step_atoms is not None:
+    def _build_atoms(self, q_len: int = 1) -> torch.Tensor:
+        if self._step_atoms is not None and self._step_q_len == q_len:
             return self._step_atoms
         rows = self._active_rows
         positions = self._write_positions[rows]
-        num_atoms = rows.numel()
-        atoms = self._atoms_cpu[:num_atoms]
-        pointers = torch.tensor([self.block_ids[int(row)].data_ptr() for row in rows.tolist()], dtype=torch.int64)
-        atoms.view(torch.int64)[:, 0].copy_(pointers)
-        # AttentionAtom: pointer (8 bytes), q_start, q_len, kv_blocks, total_extent, global_q_idx, unused.
-        atoms[:, 2] = torch.arange(num_atoms, dtype=torch.int32)
-        atoms[:, 3] = 1
-        atoms[:, 4] = ((positions + 1 + self.block_size - 1) // self.block_size).to(torch.int32)
-        atoms[:, 5] = (positions + 1).to(torch.int32)
-        atoms[:, 6] = positions.to(torch.int32)
-        atoms[:, 7] = 0
+        num_rows = rows.numel()
+        if q_len == 1:
+            atoms = self._atoms_cpu[:num_rows]
+            pointers = torch.tensor([self.block_ids[int(row)].data_ptr() for row in rows.tolist()], dtype=torch.int64)
+            atoms.view(torch.int64)[:, 0].copy_(pointers)
+            # AttentionAtom: pointer (8 bytes), q_start, q_len, kv_blocks, total_extent, global_q_idx, unused.
+            atoms[:, 2] = torch.arange(num_rows, dtype=torch.int32)
+            atoms[:, 3] = 1
+            atoms[:, 4] = ((positions + 1 + self.block_size - 1) // self.block_size).to(torch.int32)
+            atoms[:, 5] = (positions + 1).to(torch.int32)
+            atoms[:, 6] = positions.to(torch.int32)
+            atoms[:, 7] = 0
+            num_atoms = num_rows
+        else:
+            # The kernel consumes one atom per query block; a prefilling row wider than
+            # q_block_size must be split or the kernel reads past the atom's query block.
+            q_blocks_per_row = (q_len + self.q_block_size - 1) // self.q_block_size
+            if num_rows * q_blocks_per_row > self._atom_count:
+                raise ValueError("query block count exceeds the paged atom table")
+            atom_index = torch.arange(num_rows * q_blocks_per_row, device=positions.device)
+            row_index = atom_index // q_blocks_per_row
+            local_block = atom_index % q_blocks_per_row
+            local_start = local_block * self.q_block_size
+            local_len = torch.clamp(q_len - local_start, max=self.q_block_size)
+            atom_row = rows[row_index]
+            atom_start = positions[row_index] + local_start
+            atoms = self._atoms_cpu[:atom_index.numel()]
+            pointers = torch.tensor([self.block_ids[int(row)].data_ptr() for row in atom_row.tolist()],
+                                    dtype=torch.int64)
+            atoms.view(torch.int64)[:, 0].copy_(pointers)
+            atoms[:, 2] = (row_index * q_len + local_start).to(torch.int32).cpu()
+            atoms[:, 3] = local_len.to(torch.int32).cpu()
+            atoms[:, 4] = ((atom_start + local_len + self.block_size - 1) // self.block_size).to(torch.int32).cpu()
+            atoms[:, 5] = (atom_start + local_len).to(torch.int32).cpu()
+            atoms[:, 6] = atom_start.to(torch.int32).cpu()
+            atoms[:, 7] = 0
+            num_atoms = atom_index.numel()
         self._atoms_device[:num_atoms].copy_(atoms, non_blocking=True)
         self._step_atoms = self._atoms_device[:num_atoms]
+        self._step_q_len = q_len
         return self._step_atoms
 
     def attention(self, layer_idx: int, query_states: torch.Tensor, scale: float) -> torch.Tensor:
@@ -356,8 +458,8 @@ class PagedAttentionCache:
         writes into a preallocated output, so the replay performs no host work.
         """
         num_rows, num_heads, q_len, head_dim = query_states.shape
-        if q_len != 1:
-            raise ValueError("paged decode attention expects one query token per row")
+        if self._graph_mode and q_len != 1:
+            raise ValueError("graph replay paged attention expects one query token per row")
         if self._graph_mode:
             if self._graph_outputs is None:
                 raise RuntimeError("graph-safe paged cache has no output buffers")
@@ -366,13 +468,13 @@ class PagedAttentionCache:
             atoms = self._graph_atoms
             output = self._graph_outputs[layer_idx][:num_rows]
         else:
-            atoms = self._build_atoms()
-            output = torch.empty((num_rows, num_heads * head_dim),
+            atoms = self._build_atoms(q_len)
+            output = torch.empty((num_rows * q_len, num_heads * head_dim),
                                  dtype=query_states.dtype,
                                  device=query_states.device)
-        query = query_states.transpose(1, 2).reshape(num_rows, num_heads * head_dim)
+        query = query_states.transpose(1, 2).reshape(num_rows * q_len, num_heads * head_dim)
         self._kernel(output, query, self._key_views[layer_idx], self._value_views[layer_idx], atoms, scale)
-        return output.view(num_rows, 1, num_heads, head_dim).transpose(1, 2)
+        return output.view(num_rows, q_len, num_heads, head_dim).transpose(1, 2)
 
     def materialize(self, layer_idx: int, row: int, length: Optional[int] = None) -> tuple[torch.Tensor, torch.Tensor]:
         """Gather a row's blocks into dense ``[heads, length, head_dim]`` K/V for tests."""
@@ -416,6 +518,9 @@ class PagedAttentionCache:
         for row in range(self.max_batch_size):
             self._free_row(row)
         self.row_len.zero_()
+        self._block_refs.clear()
+        self._block_hash.clear()
+        self._block_hash_by_id.clear()
         if self._graph_safe:
             self._allocate_all_blocks()
             self._zero_storage()
@@ -437,7 +542,7 @@ class PagedAttentionCache:
                 self._free_row(row)
                 continue
             released = self.block_ids[row, :blocks].tolist()
-            self.kv_cache.free(released)
+            self._release_blocks(released)
             remaining = row_blocks - blocks
             self.block_ids[row, :remaining].copy_(self.block_ids[row, blocks:row_blocks].clone())
             self.block_ids[row, remaining:].fill_(-1)
@@ -492,7 +597,9 @@ def _paged_qwen3_forward(
 
     past_key_values.write(self.layer_idx, key_states, value_states)
     attn_output = past_key_values.attention(self.layer_idx, query_states, self.scaling)
-    attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+    # attention() returns [rows, query, heads, head_dim]; the original forward gets
+    # [rows, query, hidden] from SDPA, so transpose before flattening the head layout.
+    attn_output = attn_output.transpose(1, 2).reshape(*input_shape, -1).contiguous()
     attn_output = self.o_proj(attn_output)
     return attn_output, None
 

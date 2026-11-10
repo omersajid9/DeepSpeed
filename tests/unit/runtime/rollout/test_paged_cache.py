@@ -145,3 +145,84 @@ def test_graph_safe_paged_decode_matches_dense_oracle():
             row_values.unsqueeze(0).repeat_interleave(ratio, dim=1),
         )
         torch.testing.assert_close(actual[row:row + 1], expected, atol=0.25, rtol=0.25)
+
+
+def test_paged_prefill_attention_matches_dense_oracle():
+    if not torch.cuda.is_available():  #ignore-cuda
+        pytest.skip("paged cache needs a CUDA device")
+    torch.manual_seed(3)
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    head_dim, num_kv_heads, num_heads = 64, 2, 4
+    block_size = get_kv_block_size(head_dim)
+    config = SimpleNamespace(
+        num_hidden_layers=1,
+        num_key_value_heads=num_kv_heads,
+        num_attention_heads=num_heads,
+        head_dim=head_dim,
+        hidden_size=num_heads * head_dim,
+    )
+    cache = PagedAttentionCache(
+        config,
+        batch_size=1,
+        max_cache_len=512,
+        device=device,
+        dtype=dtype,
+        block_size=block_size,
+    )
+    prompt_len = 260
+    keys = torch.randn(1, num_kv_heads, prompt_len, head_dim, device=device, dtype=dtype)
+    values = torch.randn_like(keys)
+    cache.set_write_position(torch.tensor([0], device=device, dtype=torch.long))
+    cache.set_active_rows([0])
+    cache.write(0, keys, values)
+    query = torch.randn(1, num_heads, prompt_len, head_dim, device=device, dtype=dtype)
+    actual = cache.attention(0, query, 1.0 / (head_dim**0.5))
+    ratio = num_heads // num_kv_heads
+    dense_keys = keys[0].unsqueeze(0).repeat_interleave(ratio, dim=1)
+    dense_values = values[0].unsqueeze(0).repeat_interleave(ratio, dim=1)
+    expected = torch.nn.functional.scaled_dot_product_attention(query, dense_keys, dense_values, is_causal=True)
+    torch.testing.assert_close(actual, expected, atol=0.25, rtol=0.25)
+
+
+def test_prefix_reuse_shares_blocks_and_releases_after_last_row():
+    if not torch.cuda.is_available():  #ignore-cuda
+        pytest.skip("paged cache needs a CUDA device")
+    torch.manual_seed(4)
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    head_dim, num_kv_heads = 64, 2
+    block_size = get_kv_block_size(head_dim)
+    config = SimpleNamespace(
+        num_hidden_layers=1,
+        num_key_value_heads=num_kv_heads,
+        num_attention_heads=4,
+        head_dim=head_dim,
+        hidden_size=4 * head_dim,
+    )
+    cache = PagedAttentionCache(
+        config,
+        batch_size=2,
+        max_cache_len=256,
+        device=device,
+        dtype=dtype,
+        block_size=block_size,
+    )
+    keys = torch.randn(1, num_kv_heads, 3, head_dim, device=device, dtype=dtype)
+    values = torch.randn_like(keys)
+    cache.copy_from_dense(0, keys[0], values[0], 0)
+    prefix_hash = b"same-prefix"
+    cache.register_prefix([prefix_hash], 0, 1)
+
+    assert cache.prepare_prefix([prefix_hash], 1) == 1
+    assert cache.block_ids[1, 0].item() == cache.block_ids[0, 0].item()
+    row_keys, row_values = cache.materialize(0, 1, 3)
+    torch.testing.assert_close(row_keys, keys[0])
+    torch.testing.assert_close(row_values, values[0])
+
+    cache.clear_row(0)
+    assert cache.blocks_in_use == 1
+    row_keys, _ = cache.materialize(0, 1, 3)
+    torch.testing.assert_close(row_keys, keys[0])
+    cache.clear_row(1)
+    assert cache.blocks_in_use == 0

@@ -1,8 +1,9 @@
 # Paged attention for the rollout — plan
 
 Status: phases 0-2 and 4 implemented (graph-safe blocked decode), plus sampling in chunked prefill.
-Prefill still uses the dense static cache and copies into blocks; phase 3 (paged prefill/mixed) and
-phase 5 (prefix reuse) remain.
+Phase 3 is implemented for paged prefill and chunked paged prefill (one request at a time; mixed
+prefill+decode in one forward remains open). Phase 5 block hashing and ref-counted block sharing are
+implemented; weight-version salts, `prefix_id` sessions, and cross-cache reuse remain open.
 Owner: rollout/graph workstream.
 Target: `deepspeed/runtime/rollout/` on the hybrid-engine path, for RL/distillation training.
 Read with: `plans/../optimization_strategy.md` §3.4.2, §4.1, §9 (R2/R8/R17/R20/R21) and `cuda-graph-sampling-v2.md`.
@@ -55,7 +56,42 @@ in a captured kernel must stay alive across replays. Recreating them in `set_gra
 the captured index pointers and caused a device-side `index out of bounds` on the second replay;
 `PagedAttentionCache` now caches those buffers per width.
 
-Phase 3 is still needed before paged prefill can replace the dense prefill copy; phase 5 remains.
+### Phase 3/5 implementation and measurement
+
+`PagedAttentionCache` now supports `q_len > 1` attention and direct paged prefill:
+`HybridEngineRollout._paged_prefill` strips left padding, splits the prompt into
+`prefill_chunk_size` windows, writes K/V into the block table, and runs the blocked kernel
+without a dense staging cache or a prefill-to-paged copy. Query blocks wider than the kernel's
+`q_block_size` are split into one atom per query block. The completion of a prefilling chunk
+returns the first response token from the last chunk's logits, so sampling and greedy rollouts
+share the same first-token path.
+
+Full-block prefix reuse is implemented with a chained blake2b hash per block, a hash→block map,
+and per-block refcounts. `prepare_prefix` points a new row at the matched block chain and
+increments its refs; `register_prefix` records newly written full blocks; `_release_blocks` only
+returns a block to the allocator when the last row releases it. Reuse is restricted to the
+non-graph-safe cache because the graph-safe cache preallocates every block table; it currently
+reuses blocks shared by rows in the same cache, not blocks retained after a row retires.
+
+Measured on Qwen3-4B, A40, bf16, no graph capture, paged cache, chunk 512, 8 new tokens
+(`DeepSpeedExamples/training/opsd/runs/paged_prefill_prefix.md`):
+
+| workload | path | prefill ms | forwards | total ms | peak MiB | token SHA |
+|---|---|---:|---:|---:|---:|---|
+| 6k, batch 2 | dense prefill | 3253.7 | 24 | 4509.2 | 10522.8 | `5530534d…` |
+| 6k, batch 2 | paged prefill | 2081.3 | 24 | 2704.6 | 9521.3 | `5530534d…` |
+| 20k, batch 1 | dense prefill | 10913.2 | 39 | 11954.9 | 13585.9 | `c4291b80…` |
+| 20k, batch 1 | paged prefill | 3972.8 | 39 | 4591.5 | 10521.6 | `c4291b80…` |
+| 6k, batch 2, duplicate prompts | paged, no prefix reuse | 2081.3 | 24 | 2704.6 | 9521.3 | `5530534d…` |
+| 6k, batch 2, duplicate prompts | paged, prefix reuse | 1269.7 | 13 | 1875.8 | 9521.3 | `5530534d…` |
+
+The duplicate-prefix run reused 95 blocks / 6080 tokens and cut prefill forwards from 24 to 13.
+Peak memory did not drop because `PagedAttentionCache` sizes the `BlockedKVCache` pool for the
+full per-row block table; prefix reuse saves prefill compute and KV writes, not pool capacity.
+
+Limitations: prefill is one request at a time, so the phase-3 mixed prefill+decode batch is not
+implemented; prefix reuse has no weight-version salt and no session id; Qwen3.5-hybrid remains
+unsupported by the paged shim.
 
 ---
 

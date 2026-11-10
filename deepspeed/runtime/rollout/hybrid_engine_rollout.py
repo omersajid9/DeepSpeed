@@ -22,6 +22,7 @@ Generation paths:
      models or option combinations the paths above do not cover.
 """
 
+import hashlib
 import time
 from copy import copy
 from dataclasses import dataclass, field
@@ -140,6 +141,7 @@ class HybridEngineRolloutConfig:
     graph_capture_batch_sizes: Optional[Tuple[int, ...]] = None
     use_paged_cache: bool = False
     paged_block_size: Optional[int] = None
+    enable_prefix_reuse: bool = False
 
 
 @dataclass
@@ -291,6 +293,7 @@ class HybridEngineRollout(RolloutEngine):
         self.graph_capture_batch_sizes = getattr(cfg, 'graph_capture_batch_sizes', None) if cfg else None
         self.use_paged_cache = getattr(cfg, 'use_paged_cache', False) if cfg else False
         self.paged_block_size = getattr(cfg, 'paged_block_size', None) if cfg else None
+        self.enable_prefix_reuse = getattr(cfg, 'enable_prefix_reuse', False) if cfg else False
         self._last_profile = None
         self._continuous_graph_state = None
         self._last_continuous_stats = None
@@ -842,6 +845,8 @@ class HybridEngineRollout(RolloutEngine):
             stats["paged_block_size"] = cache.block_size
             stats["blocks_in_use"] = cache.blocks_in_use
             stats["block_utilization"] = cache.blocks_in_use / cache.block_ids.numel()
+            stats["prefix_reuse_blocks"] = getattr(cache, "prefix_reuse_blocks", 0)
+            stats["prefix_reuse_tokens"] = getattr(cache, "prefix_reuse_tokens", 0)
         self._last_continuous_stats = stats
         if profile is not None:
             self._finish_continuous_profile(profile, original_request, responses, max_batch_size, prompt_len,
@@ -1127,6 +1132,8 @@ class HybridEngineRollout(RolloutEngine):
             stats["paged_block_size"] = cache.block_size
             stats["blocks_in_use"] = cache.blocks_in_use
             stats["block_utilization"] = cache.blocks_in_use / cache.block_ids.numel()
+            stats["prefix_reuse_blocks"] = getattr(cache, "prefix_reuse_blocks", 0)
+            stats["prefix_reuse_tokens"] = getattr(cache, "prefix_reuse_tokens", 0)
         self._last_continuous_stats = stats
         if profile is not None:
             self._finish_continuous_profile(profile, original_request, responses, max_batch_size, prompt_len,
@@ -1529,6 +1536,24 @@ class HybridEngineRollout(RolloutEngine):
         if not update.admitted:
             return {}, None
 
+        if self.use_paged_cache:
+            if target_slots is None:
+                target_slots = update.admitted_slots
+            admitted_ids = tuple(request.request_id for request in update.admitted)
+            if len(target_slots) != len(admitted_ids):
+                raise ValueError("paged prefill needs one target slot per admitted request")
+            return self._paged_prefill(module,
+                                       cache,
+                                       request_by_id,
+                                       admitted_ids,
+                                       target_slots,
+                                       attention_mask,
+                                       write_positions,
+                                       chunk_size,
+                                       device,
+                                       profile=profile,
+                                       sampling=sampling)
+
         if not align_decode_fronts:
             admitted_ids = tuple(request.request_id for request in update.admitted)
             if target_slots is None:
@@ -1633,6 +1658,94 @@ class HybridEngineRollout(RolloutEngine):
             write_positions[target_row] = cache_position
             self._profile_end(profile, "cache_management_overhead_ms", cache_copy_start)
         return admitted_tokens, admitted_logprobs
+
+    @staticmethod
+    def _prefix_block_hashes(prompt_ids, block_size):
+        """Hash complete prompt blocks, chained so a match implies the same prefix."""
+        ids = prompt_ids[0].tolist()
+        hashes = []
+        parent = b""
+        for start in range(0, len(ids) - block_size + 1, block_size):
+            tokens = b"".join(
+                int(token).to_bytes(4, "little", signed=False) for token in ids[start:start + block_size])
+            parent = hashlib.blake2b(parent + tokens, digest_size=16).digest()
+            hashes.append(parent)
+        return hashes
+
+    def _paged_prefill(self,
+                       module,
+                       cache,
+                       request_by_id,
+                       admitted_ids,
+                       target_slots,
+                       attention_mask,
+                       write_positions,
+                       chunk_size,
+                       device,
+                       profile=None,
+                       sampling=None):
+        """Prefill prompts directly into the paged KV cache, one request at a time.
+
+        A request's prompt is stripped of its left padding and fed to the model in chunks.
+        The paged cache stores the K/V at compact columns 0..prompt_len and the blocked
+        attention kernel applies the causal mask during each chunk, so there is no dense
+        prefill cache and no prefill-to-paged copy.
+        """
+        from deepspeed.runtime.rollout.paged_cache import PagedAttentionCache
+        if not isinstance(cache, PagedAttentionCache):
+            raise TypeError("paged prefill requires a PagedAttentionCache")
+        cache.set_eager_mode()
+        paged_attention = {"full_attention": None, "sliding_attention": None}
+        tokens = {}
+        logprobs = {} if sampling is not None and sampling.temperature > 0.0 else None
+        for request_id, target_slot in zip(admitted_ids, target_slots):
+            request = request_by_id[request_id]
+            valid = request.prompt_attention_mask[0].bool()
+            prompt_ids = request.prompt_ids[:, valid]
+            prompt_len = prompt_ids.shape[1]
+            prefix_enabled = self.enable_prefix_reuse and not getattr(cache, "_graph_safe", False)
+            prompt_hashes = self._prefix_block_hashes(prompt_ids, cache.block_size) if prefix_enabled else []
+            start = 0
+            if prefix_enabled:
+                # Keep at least one query token so the suffix forward produces the
+                # logits for the first response token.
+                reusable = min(len(prompt_hashes), max(prompt_len - 1, 0) // cache.block_size)
+                reused = cache.prepare_prefix(prompt_hashes[:reusable], target_slot)
+                start = reused * cache.block_size
+                cache.prefix_reuse_blocks = getattr(cache, "prefix_reuse_blocks", 0) + reused
+                cache.prefix_reuse_tokens = getattr(cache, "prefix_reuse_tokens", 0) + start
+            elif not getattr(cache, "_graph_safe", False):
+                cache.clear_row(target_slot)
+            end = start
+            while end < prompt_len:
+                start = end
+                end = min(prompt_len, start + chunk_size) if chunk_size > 0 else prompt_len
+                write_positions[target_slot] = start
+                cache.set_write_position(write_positions)
+                cache.set_active_rows([target_slot])
+                position_ids = torch.arange(start, end, device=device).unsqueeze(0)
+                forward_start = self._profile_start(profile)
+                output = self._call_model(
+                    module,
+                    prompt_ids[:, start:end],
+                    attention_mask=paged_attention,
+                    past_key_values=cache,
+                    use_cache=True,
+                    cache_position=position_ids[0],
+                    position_ids=position_ids,
+                    **self._last_logits_kwargs(module),
+                )
+                self._profile_end(profile, "prefill_forward_ms", forward_start, count="num_prefill_forwards")
+            if prefix_enabled:
+                cache.register_prefix(prompt_hashes, target_slot, len(prompt_hashes))
+            first_token, first_logprob = self._draw_token(output.logits[:, -1, :], sampling)
+            attention_mask[target_slot].zero_()
+            attention_mask[target_slot, :prompt_len] = 1
+            write_positions[target_slot] = prompt_len
+            tokens[request_id] = first_token
+            if logprobs is not None:
+                logprobs[request_id] = first_logprob
+        return tokens, logprobs
 
     def _stage_long_prompts(self, module, admitted_ids, target_slots, request_by_id, prefill_chunks, chunk_size,
                             static_cache_type, model_dtype, device):
