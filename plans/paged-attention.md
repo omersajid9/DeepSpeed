@@ -96,10 +96,11 @@ prefill is not the fastest setting for these single-prompt workloads: it adds 9.
 
 A head-to-head vLLM 0.33.0 run (same Qwen3-4B, prompt, tokenizer, batch 1, no chunked prefill,
 sampler, and generated-token count; vLLM KV pool capped to match) is 823.6 ms / 19.43 tok/s at
-6k and 2794.4 ms / 2.86 tok/s at 20k greedy. The best DeepSpeed path is **1.37x slower at 6k**
-and **1.22x slower at 20k**, with identical 6k and 20k greedy tokens; details in
-`DeepSpeedExamples/training/opsd/runs/optimization_ablation.md` and
-`runs/vllm_comparison.md`.
+6k and 2794.4 ms / 2.86 tok/s at 20k greedy. Optional `torch.compile` fusion (with graph
+capture) gives 1017.8 ms at 6k and 3208.0 ms at 20k, improving the gap from 1.37x/1.22x to
+**1.235x/1.148x**, at +14.8%/+35.6% peak memory. The 6k and 20k greedy tokens are identical;
+details in `DeepSpeedExamples/training/opsd/runs/optimization_ablation.md`,
+`runs/vllm_comparison.md`, and `runs/vllm_parity_optimizations.md`.
 Peak memory did not drop because `PagedAttentionCache` sizes the `BlockedKVCache` pool for the
 full per-row block table; prefix reuse saves prefill compute and KV writes, not pool capacity.
 
