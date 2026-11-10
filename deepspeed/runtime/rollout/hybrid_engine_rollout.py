@@ -143,6 +143,7 @@ class HybridEngineRolloutConfig:
     paged_block_size: Optional[int] = None
     enable_paged_prefill: bool = False
     enable_prefix_reuse: bool = False
+    enable_torch_compile: bool = False
 
 
 @dataclass
@@ -296,6 +297,7 @@ class HybridEngineRollout(RolloutEngine):
         self.paged_block_size = getattr(cfg, 'paged_block_size', None) if cfg else None
         self.enable_paged_prefill = getattr(cfg, 'enable_paged_prefill', False) if cfg else False
         self.enable_prefix_reuse = getattr(cfg, 'enable_prefix_reuse', False) if cfg else False
+        self.enable_torch_compile = getattr(cfg, 'enable_torch_compile', False) if cfg else False
         self._last_profile = None
         self._continuous_graph_state = None
         self._last_continuous_stats = None
@@ -303,6 +305,13 @@ class HybridEngineRollout(RolloutEngine):
         if self.use_paged_cache:
             from deepspeed.runtime.rollout.paged_cache import install_paged_attention
             install_paged_attention(self.engine.module)
+        if self.enable_torch_compile:
+            self.engine.module = torch.compile(
+                self.engine.module,
+                mode="max-autotune-no-cudagraphs",
+                fullgraph=False,
+                dynamic=False,
+            )
 
     @torch.no_grad()
     def generate(self, request: RolloutRequest, sampling: SamplingConfig) -> RolloutBatch:
