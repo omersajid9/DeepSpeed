@@ -84,7 +84,34 @@ hybrid-engine rollout*, keeping the rollout's write-position protocol, bucket la
   a **weight-version salt in `extra_keys`**.
 - **vLLM (metadata)**: `block_table`/`slot_mapping` are ordinary device tensors built by a kernel/host step
   and consumed by attention; nothing about the layout requires a scheduler thread — we can build them in our
-  own loop.
+  own loop. Specifics worth matching or deliberately diverging from:
+  - page layout: theirs is per layer `[num_blocks, num_kv_heads, block_size, 2*head_size]` with K and V
+    **interleaved in the page tail**, and FA views it as `transpose(1,2).split(head_size)` →
+    `[num_blocks, block_size, num_kv_heads, head_size]`. Ours (the in-repo kernel's) is
+    `[num_blocks, block_size, 2, n_kv_heads, head_size]` split by `split_kv` with k/v passed separately — keep
+    ours, do not copy the interleaving;
+  - block size: their manager default is **64 tokens** (`config/cache.py:185,481-482`) and FA accepts any
+    multiple of 16; ours comes from `get_kv_block_size(head_size)` (128/64/32). Their manager block can be
+    larger than the kernel block and the kernel table is *derived*, not stored — we should just pick one
+    block size and skip that layer (`v1/worker/utils.py:371-410`);
+  - `slot_mapping` is `int64 [num_kv_groups, max_num_batched_tokens]` — **shape over tokens, not rows** —
+    with `PAD_SLOT_ID = -1` and `NULL_BLOCK_ID = 0` (`attention/backends/utils.py:51-52`), which matches our
+    `slot_map [max_tokens]` design; padding is written as `-1` by a kernel rather than by Python;
+  - `block_table` is per group `int32 [max_num_reqs, max_num_blocks]`, appended CPU→UVA in staged writes, and
+    the forward reads a **gathered** copy (`gather_block_tables`) per group — we can index rows directly
+    because we own the loop, so the gather is unnecessary for us;
+  - decode and prefill/chunk are **the same paged call**, differing only in `query_start_loc`/`max_query_len`
+    (`flash_attn.py:586-620,1355-1381`) — independent confirmation that one code path covers both, which is
+    what phase 3 assumes;
+  - the mask disappears entirely: `causal=True` plus per-row `seqused_k` replaces the 4-D additive mask, and
+    `window_size` gives sliding-window attention for free (`flash_attn.py:428,1355-1381`) — this is the direct
+    answer to the §8.2 anomaly, and it also closes the roadmap's sliding-window appendix item;
+  - capture: their flashinfer backend records the **addresses** of `seq_lens` and the page table at capture
+    time, preallocates dummy block tables/slot mappings, writes them in place every step, zeroes stale rows
+    and pads with `-1` (`flashinfer_ts.py:203-245`, `block_table.py:get_dummy_*`) — the same discipline our
+    phase 4 needs;
+  - the free-queue + hash→block prefix cache + refcounts live in one pool object
+    (`core/block_pool.py:112-190`), which is the shape of the ref-count layer §3.1 says we must add.
 - **neuron-rl-core**: block tables and slot mappings are built **on the host in numpy** and shipped as one
   int32 upload per step (`vllm_lite/host_step.py:19-59,80-101`); a *single* paged kernel launch serves a mixed
   prefill+decode batch, with the entry-point variant chosen **on the host** from cheap counters
