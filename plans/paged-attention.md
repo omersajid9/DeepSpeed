@@ -86,10 +86,23 @@ hybrid-engine rollout*, keeping the rollout's write-position protocol, bucket la
   and consumed by attention; nothing about the layout requires a scheduler thread — we can build them in our
   own loop.
 - **neuron-rl-core**: block tables and slot mappings are built **on the host in numpy** and shipped as one
-  int32 upload per step (`vllm_lite/host_step.py:19-59,80-101`), and a *single* paged kernel launch serves a
-  mixed prefill+decode batch with host-selected decode-only entry points (`core/kernels/paged_attention/
-  kernel.py:557`, `kernel_decode.py:1309,1334`; decode-only entry saves ~20-40 µs/launch). That is the shape
-  our step should end up with: host builds metadata once, one launch serves the mix.
+  int32 upload per step (`vllm_lite/host_step.py:19-59,80-101`); a *single* paged kernel launch serves a mixed
+  prefill+decode batch, with the entry-point variant chosen **on the host** from cheap counters
+  (`decode_only = counts_prefill == 0 and counts_decode > 0`, plus a chunk-slice choice from the maximum
+  `nblk_vis`; `core/kernels/paged_attention/kernel.py:556-580`, `kernel_decode.py:1265-1356`), and their mixed
+  kernel's decodes are **bit-identical** to the decode-only entry. Portable mechanics worth copying:
+  - a table invariant: `int32 [R_MAX, NB_MAX]`, `-1` marks an unused tail, and there must be **no `-1` hole
+    inside the used prefix** `[0, ceil(seq_len / block_size))` (`vllm_lite/models/attention.py:449-499`);
+  - the packed query dim is the row-major concatenation of each row's queries, so
+    `q_start_idx == cumsum(q_len)` — atoms (and any varlen call) inherit that invariant;
+  - the KV write for a step is **one scatter per pool**: slot `blk*B + pos % B` → flat row
+    `(slot // B) * n_kv_heads * B + head * B + slot % B`, applied to a `view(-1, head_dim)` of the pool
+    (`attention.py:178-215,685`) — not a per-row Python loop;
+  - a **sink page**: padded/`-1` slots write to a dedicated never-referenced block (`sink_slot = NPHYS * B`,
+    `attention.py:167-169`), so rows that must keep a stable table entry (parked bucket rows) have somewhere
+    harmless to point;
+  - rows with no item leave the attention output **uninitialised**, not zeroed — a consumer must gather only
+    active rows (the same rule as R1).
 
 ## 4 · Target design
 
@@ -106,8 +119,14 @@ row_refs    : block -> ref count (NEW, see §3.1 gap 1)
 ```
 
 Invariants to keep from today's cache: per-row write position advanced by the caller; rows are
-independent; a row's blocks are append-only until it retires (no compaction copies); padding rows are
-never referenced.
+independent; a row's blocks are append-only until it retires (no compaction copies).
+
+New invariants this design adds (from the neuron contract, `attention.py:449-499`):
+`block_ids` is `int32 [max_rows, max_blocks]` with `-1` only in the unused tail and no `-1` hole inside a
+row's used prefix; the packed token dim is the row-major concatenation of each row's queries, so
+`q_start_idx == cumsum(q_len)` per step; the step's KV is written **before** the attention launch, as one
+scatter per pool over a `view(-1, head_dim)` (never a per-row Python loop); and attention output rows for
+rows without an atom are left uninitialised, so the logits gather must read only active rows (R1).
 
 ### 4.2 Step flow
 
@@ -216,6 +235,14 @@ counter exists.
     pool sizing becomes a collective, and `AllocationMode` matters.
 11. **Allocator granularity**: `allocate` walks a pinned host list in Python; pre-reserve a row's blocks (or
     batch allocations per step) instead of allocating at every block boundary.
+12. **Parked rows in captured buckets need valid table entries.** Our bucket ladder replays a width wider than
+    the active rows; a captured kernel that walks a row's block list will read whatever the table holds there.
+    Two mitigations, both cheap: emit atoms only for active rows (preferred - the kernel then never touches the
+    parked rows), and keep a **sink page** the parked rows point at so their entries stay stable across replays.
+13. **Mixed vs decode-only parity.** neuron's mixed entry is bit-identical to its decode-only entry, which is
+    the property to test for us too: once phase 3 has one atom list for prefill+decode, assert the decode rows
+    produce the same logits as the decode-only path at the same width (a cheap regression test that catches
+    atom/packing mistakes the token-stream comparison would hide behind sampling).
 
 ## 7 · What this replaces in the roadmap
 
