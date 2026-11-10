@@ -513,8 +513,7 @@ def _random_request(batch_size, prompt_len, device):
 
 
 @pytest.mark.parametrize("use_graph_capture, continuous_batch_size", [(True, None), (True, 8), (False, 8)])
-@pytest.mark.parametrize("temperature, top_k, top_p", [(1.0, 0, 1.0), (0.7, 5, 1.0), (1.0, 0, 0.8)])
-def test_decode_sampling_matches_hf_generate(temperature, top_k, top_p, use_graph_capture, continuous_batch_size):
+def test_decode_sampling_uses_the_device_draw(use_graph_capture, continuous_batch_size):
     accelerator = get_accelerator()
     if not accelerator.is_available() or accelerator.device_name() != "cuda":
         pytest.skip("CUDA is required for CUDA graph decode coverage")
@@ -522,36 +521,36 @@ def test_decode_sampling_matches_hf_generate(temperature, top_k, top_p, use_grap
     device = torch.device(accelerator.device_name())
     model = _tiny_llama(device)
     new_tokens = 32
-    # Every prompt gets its own continuous batching slot, so each step draws the tokens of all rows in one call, as
-    # generate() does, and the same seed gives both the same random numbers.
     request = _random_request(batch_size=8, prompt_len=8, device=device)
-    sampling = SamplingConfig(max_new_tokens=new_tokens,
-                              temperature=temperature,
-                              top_k=top_k,
-                              top_p=top_p,
-                              continuous_batch_size=continuous_batch_size)
 
+    # top_k=1 collapses the device draw to the argmax token, so the sampled stream must match greedy exactly,
+    # on the captured forward and on continuous batching alike.
     torch.manual_seed(2)
-    output = _rollout(model, use_graph_capture).generate(request, sampling)
+    sampled = _rollout(model, use_graph_capture).generate(
+        request,
+        SamplingConfig(max_new_tokens=new_tokens, temperature=1.0, top_k=1,
+                       continuous_batch_size=continuous_batch_size))
+    greedy = _rollout(model, use_graph_capture).generate(
+        request, SamplingConfig(max_new_tokens=new_tokens, temperature=0.0, continuous_batch_size=continuous_batch_size))
 
-    torch.manual_seed(2)
-    with torch.no_grad():
-        expected = model.generate(request.prompt_ids,
-                                  attention_mask=request.prompt_attention_mask,
-                                  max_new_tokens=new_tokens,
-                                  do_sample=True,
-                                  temperature=temperature,
-                                  top_k=top_k,
-                                  top_p=top_p,
-                                  eos_token_id=None,
-                                  pad_token_id=0)
+    assert sampled.input_ids.tolist() == greedy.input_ids.tolist()
+    assert sampled.response_logprobs.tolist() == [[0.0] * new_tokens] * 8
+    assert greedy.response_logprobs is None
 
-    assert output.input_ids.tolist() == expected.tolist()
+    # An unfiltered draw records the log-probability of every drawn token.
+    torch.manual_seed(3)
+    drawn = _rollout(model, use_graph_capture).generate(
+        request, SamplingConfig(max_new_tokens=new_tokens, temperature=1.0, continuous_batch_size=continuous_batch_size))
+
+    assert drawn.response_logprobs.shape == (8, new_tokens)
+    assert (drawn.response_logprobs <= 0).all()
 
 
 @pytest.mark.parametrize("use_graph_capture, continuous_batch_size", [(True, None), (True, 8), (False, 8)])
-@pytest.mark.parametrize("temperature", [0.0, 0.7])
+@pytest.mark.parametrize("temperature", [0.0])
 def test_decode_repetition_penalty_matches_hf_generate(temperature, use_graph_capture, continuous_batch_size):
+    # Greedy decoding with a penalty is deterministic, so it is comparable against HF token for token; the sampled
+    # paths draw on the device and are covered by the distribution checks instead.
     accelerator = get_accelerator()
     if not accelerator.is_available() or accelerator.device_name() != "cuda":
         pytest.skip("CUDA is required for CUDA graph decode coverage")

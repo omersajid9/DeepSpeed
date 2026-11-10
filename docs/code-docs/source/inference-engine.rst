@@ -75,6 +75,35 @@ model's ``generation_config``, as ``generate()`` does. Other
 ``generation_config`` settings are not applied on the graph path. Continuous
 batching, with or without graph capture, picks tokens the same way.
 
+
+Device-side sampling
+--------------------
+
+Rollouts that sample (``SamplingConfig.temperature > 0``) draw their tokens on
+the device when the model supports cache classes. The engine prefills the prompt
+once into a static cache, and every decode step is one forward plus one
+``deepspeed.runtime.rollout.sampling.sample`` call, so HuggingFace's
+host-side logits warpers and ``multinomial`` and the dynamic cache's per-step
+reallocation are out of the loop. Each drawn token's log-probability is recorded
+in ``RolloutBatch.response_logprobs`` (positions the attention mask retires are
+zero), which is what PPO/OPD importance ratios need. Greedy rollouts keep their
+own paths (graph capture or chunked prefill); models without cache-class support
+and rollouts using ``use_shared_prefill`` keep the ``model.generate()`` fallback.
+
+Sampling keeps the captured forward. With ``use_graph_capture`` the decode step is one graph
+replay of the model plus one device draw on the replayed logits, so a sampling rollout no
+longer gives up CUDA graphs; greedy and sampling differ only in how the token is selected
+(``argmax`` versus the sampler).
+
+The draw is the Gumbel-max trick -- ``argmax(logits / temperature + Gumbel)`` --
+so the sampling parameters are masks over one vectorised ``argmax``:
+``temperature`` (``<= 0`` is greedy), ``top_k`` (``<= 0`` disables it) and
+``top_p`` (``>= 1`` disables it). The nucleus filter keeps the token that
+crosses ``top_p`` (vLLM's rule), not the last token whose inclusive cumulative
+probability stays inside the threshold. Log-probabilities are taken over the
+sampling distribution (temperature-scaled, filtered, renormalized), i.e. the
+distribution the token was actually drawn from.
+
 Shared Prompt Prefill
 ---------------------
 
@@ -117,11 +146,14 @@ configured capacity.
 
 The experimental path intentionally does not implement paged attention or change the
 default generation semantics. It currently requires one padded prompt width for
-all rows, a model with cache-class support, and one sample per prompt. Shared
-prompt prefill is rejected until the scheduling semantics are validated on real
-workloads. Models that explicitly declare no cache-class
-support are rejected; models with unknown support should be validated against
-the default ``generate()`` path before use.
+all rows, a model with cache-class support, and one sample per prompt. Rows may be
+greedy (``argmax`` of each step's logits) or sampled (the device draw), but not both in
+one call: ``SamplingConfig`` is per call. Sampling rollouts prefill in a single forward --
+prompt staging is greedy-only -- so their first response token is drawn from the prefill
+logits, and they report ``RolloutBatch.response_logprobs``. Shared prompt prefill is
+rejected until the scheduling semantics are validated on real workloads. Models that
+explicitly declare no cache-class support are rejected; models with unknown support should
+be validated against the default ``generate()`` path before use.
 ``align_decode_fronts=False`` is the default equal-width padded-prompt baseline:
 all requests use the same padded prompt width. Different effective lengths
 encoded by the attention masks retain the legacy staggered logical decode

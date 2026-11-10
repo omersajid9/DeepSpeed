@@ -64,11 +64,17 @@ class RolloutBatch:
 
     ``input_ids`` holds the *concatenation* of (left-padded) prompt and
     response, right-padded to the longest sequence in the batch.
+
+    ``response_logprobs`` holds one log-probability per response token, under the
+    distribution the token was sampled from; positions the mask retires (padding and
+    tokens after the first EOS) are zero. It is ``None`` when the engine did not
+    record log-probabilities.
     """
 
     input_ids: torch.Tensor  # [B', T_p + T_r]; B' = B * n_samples_per_prompt
     attention_mask: torch.Tensor  # [B', T_p + T_r]
     response_start_idx: torch.Tensor  # [B'] int
+    response_logprobs: Optional[torch.Tensor] = None  # [B', T_r] float32
 
     def __post_init__(self) -> None:
         if self.input_ids.dim() != 2:
@@ -80,6 +86,11 @@ class RolloutBatch:
         if self.response_start_idx.shape != (B, ):
             raise ValueError(f"response_start_idx must be 1-D of length {B}; got "
                              f"{tuple(self.response_start_idx.shape)}")
+        if self.response_logprobs is not None:
+            response_shape = (B, self.input_ids.shape[1] - int(self.response_start_idx[0]))
+            if self.response_logprobs.shape != response_shape:
+                raise ValueError(f"response_logprobs shape {tuple(self.response_logprobs.shape)} does "
+                                 f"not match {response_shape}")
 
     @property
     def batch_size(self) -> int:

@@ -15,14 +15,13 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
-from transformers import PretrainedConfig
+from transformers import LlamaForCausalLM, PretrainedConfig
 
 import deepspeed
 import deepspeed.comm as dist
 from deepspeed.accelerator import get_accelerator
 from deepspeed.ops.transformer.inference.op_binding.workspace import WorkspaceOp
 from deepspeed.runtime.hybrid_engine import DeepSpeedHybridEngine
-from deepspeed.runtime.rollout import hybrid_engine_rollout as rollout_module
 from deepspeed.runtime.rollout.base import RolloutRequest, SamplingConfig
 from deepspeed.runtime.rollout.hybrid_engine_rollout import (
     GlobalWorkRemaining,
@@ -125,6 +124,10 @@ def test_continuous_generation_rejects_unsupported_inputs():
         rollout.generate(empty_request, SamplingConfig(max_new_tokens=2, continuous_batch_size=1))
     with pytest.raises(ValueError, match="positive"):
         rollout.generate(request, SamplingConfig(max_new_tokens=2, continuous_batch_size=0))
+    with pytest.raises(ValueError, match="one sample per prompt"):
+        rollout.generate(
+            request, SamplingConfig(max_new_tokens=2, temperature=0.5, n_samples_per_prompt=2,
+                                    continuous_batch_size=1))
 
 
 @pytest.mark.parametrize(
@@ -878,10 +881,6 @@ def test_continuous_generation_refills_padded_prompts_after_trim():
     assert rollout.get_last_continuous_stats()["trim_count"] > 0
 
 
-def _argmax(logits):
-    return logits.argmax(dim=-1, keepdim=True)
-
-
 def test_continuous_generation_applies_repetition_penalty():
     request = RolloutRequest(torch.tensor([[0]]), torch.ones((1, 1), dtype=torch.long))
     responses = {0: [torch.tensor([[0]])]}
@@ -889,16 +888,17 @@ def test_continuous_generation_applies_repetition_penalty():
 
     # Pin the real-model regression: a bare argmax would select the repeated
     # token 0, while Transformers' repetition processor must select token 1.
-    next_tokens = HybridEngineRollout._continuous_next_tokens(
+    next_tokens, logprobs = HybridEngineRollout._continuous_next_tokens(
         torch.tensor([[6.0, 5.0]]),
         (0, ),
         {0: request},
         responses,
         module,
-        _argmax,
+        None,
     )
 
     assert next_tokens.tolist() == [[1]]
+    assert logprobs is None
 
 
 def test_continuous_generation_treats_none_repetition_penalty_as_one():
@@ -906,36 +906,38 @@ def test_continuous_generation_treats_none_repetition_penalty_as_one():
     responses = {0: [torch.tensor([[0]])]}
     module = SimpleNamespace(generation_config=SimpleNamespace(repetition_penalty=None))
 
-    next_tokens = HybridEngineRollout._continuous_next_tokens(
+    next_tokens, logprobs = HybridEngineRollout._continuous_next_tokens(
         torch.tensor([[6.0, 5.0]]),
         (0, ),
         {0: request},
         responses,
         module,
-        _argmax,
+        None,
     )
 
     assert next_tokens.tolist() == [[0]]
+    assert logprobs is None
 
 
-def test_continuous_sampling_applies_repetition_penalty_before_warpers():
+def test_continuous_sampling_applies_repetition_penalty_before_the_draw():
     request = RolloutRequest(torch.tensor([[0]]), torch.ones((1, 1), dtype=torch.long))
     responses = {0: [torch.tensor([[0]])]}
     module = SimpleNamespace(generation_config=SimpleNamespace(repetition_penalty=1.5))
-    select = HybridEngineRollout._token_selector(SamplingConfig(max_new_tokens=1, temperature=1.0, top_k=1))
+    sampling = SamplingConfig(max_new_tokens=1, temperature=1.0, top_k=1)
 
-    # generate() penalizes first: token 0 drops from 6 to 4, so top-k 1 keeps only token 1. Warping first would
+    # generate() penalizes first: token 0 drops from 6 to 4, so top-k 1 keeps only token 1. Drawing first would
     # keep only token 0.
-    next_tokens = HybridEngineRollout._continuous_next_tokens(
+    next_tokens, next_logprobs = HybridEngineRollout._continuous_next_tokens(
         torch.tensor([[6.0, 5.0]]),
         (0, ),
         {0: request},
         responses,
         module,
-        select,
+        sampling,
     )
 
     assert next_tokens.tolist() == [[1]]
+    assert next_logprobs.tolist() == [0.0]
 
 
 def test_continuous_generation_applies_repetition_penalty_in_float32():
@@ -946,16 +948,17 @@ def test_continuous_generation_applies_repetition_penalty_in_float32():
 
     # generate() penalizes in float32: token 0 drops to 4.0208, below token 1. In bf16 it would round up to 4.03125,
     # tying with token 1, and argmax would keep token 0.
-    next_tokens = HybridEngineRollout._continuous_next_tokens(
+    next_tokens, next_logprobs = HybridEngineRollout._continuous_next_tokens(
         logits,
         (0, ),
         {0: request},
         responses,
         module,
-        _argmax,
+        None,
     )
 
     assert next_tokens.tolist() == [[1]]
+    assert next_logprobs is None
     assert logits.tolist() == [[6.03125, 4.03125]]
 
 
@@ -976,53 +979,13 @@ def test_continuous_prefill_applies_repetition_penalty():
                                   cfg=HybridEngineRolloutConfig())
     prompt_ids = torch.tensor([[0, 0]])
 
-    tokens, _ = rollout._continuous_prefill_cache(rollout.engine.module, lambda *args, **kwargs: None, prompt_ids,
-                                                  torch.ones_like(prompt_ids), torch.float32, torch.device("cpu"),
-                                                  SamplingConfig(max_new_tokens=1, temperature=0))
+    tokens, logprobs, _ = rollout._continuous_prefill_cache(rollout.engine.module, lambda *args, **kwargs: None,
+                                                            prompt_ids, torch.ones_like(prompt_ids), torch.float32,
+                                                            torch.device("cpu"),
+                                                            SamplingConfig(max_new_tokens=1, temperature=0))
 
     assert tokens.tolist() == [[1]]
-
-
-def _reference_probs(logits, temperature, top_k, top_p):
-    """The distribution ``SamplingConfig`` describes, derived from ``logits`` independently of the rollout."""
-    scores = logits / temperature
-    if top_k > 0:
-        kth_score = scores.topk(top_k).values[-1]
-        scores = scores.masked_fill(scores < kth_score, float("-inf"))
-    probs = scores.softmax(dim=-1)
-    if top_p < 1.0:
-        sorted_probs, order = probs.sort(descending=True)
-        # A token is kept while the more likely tokens hold less than top_p of the mass.
-        keep_sorted = (sorted_probs.cumsum(dim=-1) - sorted_probs) < top_p
-        keep = torch.zeros_like(keep_sorted).scatter(0, order, keep_sorted)
-        probs = torch.where(keep, probs, torch.zeros_like(probs))
-        probs = probs / probs.sum()
-    return probs
-
-
-@pytest.mark.parametrize("temperature, top_k, top_p", [(1.0, -1, 1.0), (0.5, -1, 1.0), (1.0, 3, 1.0), (1.0, -1, 0.7),
-                                                       (0.7, 4, 0.9)])
-def test_token_selector_samples_the_configured_distribution(temperature, top_k, top_p):
-    logits = torch.tensor([2.0, 1.5, 1.0, 0.5, 0.0, -0.5, -1.0, -2.0])
-    expected = _reference_probs(logits, temperature, top_k, top_p)
-    select = HybridEngineRollout._token_selector(
-        SamplingConfig(max_new_tokens=1, temperature=temperature, top_k=top_k, top_p=top_p))
-    draws = 20000
-
-    torch.manual_seed(0)
-    tokens = select(logits.expand(draws, -1)).squeeze(1)
-
-    observed = torch.bincount(tokens, minlength=logits.numel()).float() / draws
-    assert (observed[expected == 0] == 0).all(), "sampled a token outside the top-k / top-p support"
-    tolerance = 4 * (expected * (1 - expected) / draws).sqrt() + 1e-6
-    assert ((observed - expected).abs() <= tolerance).all(), f"observed {observed}, expected {expected}"
-
-
-def test_token_selector_is_argmax_without_temperature():
-    logits = torch.tensor([[0.1, 3.0, 2.0], [5.0, -1.0, 4.9]])
-    select = HybridEngineRollout._token_selector(SamplingConfig(max_new_tokens=1, temperature=0))
-
-    assert select(logits).tolist() == [[1], [0]]
+    assert logprobs is None
 
 
 def test_continuous_generation_samples_when_temperature_is_set():
@@ -1603,7 +1566,7 @@ def test_generate_calls_graph_capture_when_enabled(mock_get_accelerator, mock_pe
     tok = _make_tokenizer()
     cfg = HybridEngineRolloutConfig(use_graph_capture=True, enable_profiling=True)
     rollout = HybridEngineRollout(engine, tok, cfg=cfg)
-    rollout._generate_graph = MagicMock(return_value=torch.zeros(1, 5, dtype=torch.long))
+    rollout._generate_graph = MagicMock(return_value=(torch.zeros(1, 5, dtype=torch.long), None))
     mock_perf_counter.side_effect = [1.0, 1.001, 1.011, 1.013]
 
     req = MagicMock()
@@ -1678,6 +1641,7 @@ def test_generate_keeps_ranks_in_lockstep_and_pads_after_eos():
 
 def test_generate_forwards_top_k_for_sampling_with_multiple_samples_and_eos():
     engine = _make_engine()
+    engine.module._supports_cache_class = False  # no cache classes: the HuggingFace fallback runs
     tok = _make_tokenizer()
     rollout = HybridEngineRollout(engine, tok)
     engine.module.generate.return_value = torch.tensor([
@@ -1704,6 +1668,7 @@ def test_generate_forwards_top_k_for_sampling_with_multiple_samples_and_eos():
 @pytest.mark.parametrize("top_k", [-1, 0])
 def test_generate_disables_top_k_for_sampling(top_k):
     engine = _make_engine()
+    engine.module._supports_cache_class = False  # no cache classes: the HuggingFace fallback runs
     rollout = HybridEngineRollout(engine, _make_tokenizer())
     engine.module.generate.return_value = torch.tensor([[10, 11, 5]])
     request = RolloutRequest(torch.tensor([[10, 11]]), torch.ones((1, 2), dtype=torch.long))
@@ -2024,7 +1989,7 @@ def test_graph_capture_ladder_defaults_to_powers_of_two():
     assert HybridEngineRollout._graph_capture_ladder(4, (3, )) == (3, 4)
 
 
-def test_graph_capture_ladder_must_be_positive_and_fit_the_batch():
+def test_graph_capture_ladder_must_be_positive_and_fit_the_batch(graph_capture_accelerator):
     for configured, message in (((0, ), "positive integers"), ((5, ), "cannot exceed continuous_batch_size")):
         rollout = HybridEngineRollout(
             _make_engine(),
@@ -2112,7 +2077,7 @@ def test_eager_continuous_chunked_prefill_matches_naive():
     assert plain.get_last_continuous_stats()["chunked_prefill_chunks"] == 0
 
 
-def _tiny_llama():
+def _tiny_llama(model_class=None):
     from transformers import LlamaConfig, LlamaForCausalLM
 
     torch.manual_seed(0)
@@ -2123,7 +2088,7 @@ def _tiny_llama():
                          num_attention_heads=2,
                          num_key_value_heads=2,
                          max_position_embeddings=64)
-    return LlamaForCausalLM(config).eval()
+    return (model_class or LlamaForCausalLM)(config).eval()
 
 
 def test_chunked_prefill_cache_matches_single_forward_prefill_on_a_real_model():
@@ -2136,12 +2101,13 @@ def test_chunked_prefill_cache_matches_single_forward_prefill_on_a_real_model():
     attention = torch.ones_like(prompt)
 
     with torch.no_grad():
-        whole_token, whole_cache = rollout._continuous_prefill_cache(model, StaticCache, prompt, attention,
-                                                                     torch.float32, torch.device("cpu"))
+        whole_token, whole_logprobs, whole_cache = rollout._continuous_prefill_cache(
+            model, StaticCache, prompt, attention, torch.float32, torch.device("cpu"))
         chunk_token, chunk_cache = rollout._chunked_prefill_cache(model, StaticCache, prompt, attention, torch.float32,
                                                                   torch.device("cpu"), 3)
 
     assert whole_token.tolist() == chunk_token.tolist()
+    assert whole_logprobs is None
     for layer_idx in range(rollout._cache_layer_count(whole_cache)):
         whole_keys, whole_values = rollout._cache_layer_tensors(whole_cache, layer_idx)
         chunk_keys, chunk_values = rollout._cache_layer_tensors(chunk_cache, layer_idx)
@@ -2323,28 +2289,6 @@ def test_static_eager_chunked_prefill_matches_naive_generate():
     assert plain_widths[0] == 8
     assert chunked_output.input_ids.tolist() == plain_output.input_ids.tolist()
     assert chunked_output.attention_mask.tolist() == plain_output.attention_mask.tolist()
-
-
-def test_chunked_prefill_warns_for_sampling_rollouts(monkeypatch):
-    warnings = []
-    monkeypatch.setattr(rollout_module.logger, "warning", lambda message, *args, **kwargs: warnings.append(message))
-
-    model = _tiny_llama()
-    rollout = HybridEngineRollout(
-        SimpleNamespace(module=model),
-        SimpleNamespace(pad_token_id=0, eos_token_id=None),
-        cfg=HybridEngineRolloutConfig(enable_chunked_prefill=True, prefill_chunk_size=3),
-    )
-    prompt = torch.tensor([[1, 2, 3, 4, 5, 6]])
-    request = RolloutRequest(prompt, torch.ones_like(prompt))
-
-    rollout.generate(request, SamplingConfig(max_new_tokens=2, temperature=0.8))
-    rollout.generate(request, SamplingConfig(max_new_tokens=2, temperature=0.8))
-
-    assert len(warnings) == 1
-    assert "greedy generation only" in warnings[0]
-
-
 def test_chunked_prefill_survives_row_compaction_while_staging():
     """Rows retiring under a staged prompt must not drag its staged slot out from under it.
 
@@ -2499,3 +2443,293 @@ def test_static_graph_capture_receives_a_prebuilt_4d_mask(mock_get_accelerator):
         expected[:, :prompt_len] = prompt_attention == 0
         expected[:, prompt_len:position + 1] = False
         assert torch.equal(masked, expected), f"replay {step}"
+
+
+# -- device-side sampling path ------------------------------------------
+
+
+def test_sampling_path_matches_greedy_with_top_k_one():
+    """top_k=1 leaves one token per row, so the sampling loop must reproduce greedy decoding."""
+    model = _tiny_llama()
+    rollout = HybridEngineRollout(SimpleNamespace(module=model), SimpleNamespace(pad_token_id=0, eos_token_id=None))
+    prompt = torch.tensor([[0, 0, 1, 2, 3], [4, 5, 6, 7, 8]])
+    attention = torch.tensor([[0, 0, 1, 1, 1], [1, 1, 1, 1, 1]])
+
+    torch.manual_seed(0)
+    output = rollout.generate(RolloutRequest(prompt, attention),
+                              SamplingConfig(max_new_tokens=4, temperature=1.0, top_k=1))
+    with torch.no_grad():
+        greedy = model.generate(prompt, attention_mask=attention, max_new_tokens=4, do_sample=False,
+                                eos_token_id=None, pad_token_id=0)
+
+    assert output.input_ids.tolist() == greedy.tolist()
+    # top_k=1 renormalizes the surviving token to probability 1.
+    assert output.response_logprobs.tolist() == [[0.0] * 4, [0.0] * 4]
+
+
+def test_sampling_path_logprobs_match_the_model_distribution():
+    """Every reported log-probability is the model's own log-softmax at the drawn token."""
+    model = _tiny_llama()
+    rollout = HybridEngineRollout(SimpleNamespace(module=model), SimpleNamespace(pad_token_id=0, eos_token_id=None))
+    prompt = torch.tensor([[1, 2, 3], [4, 5, 6]])  # unpadded: cache column and rotary position coincide
+    attention = torch.ones_like(prompt)
+
+    torch.manual_seed(7)
+    output = rollout.generate(RolloutRequest(prompt, attention), SamplingConfig(max_new_tokens=4, temperature=1.0))
+
+    with torch.no_grad():
+        logits = model(output.input_ids, attention_mask=output.attention_mask).logits
+    start = int(output.response_start_idx[0])
+    expected = torch.log_softmax(logits[:, start - 1:-1, :], dim=-1).gather(-1,
+                                                                           output.input_ids[:, start:].unsqueeze(-1))
+    expected = expected.squeeze(-1)
+
+    assert output.response_logprobs.shape == (2, 4)
+    assert torch.allclose(output.response_logprobs, expected, atol=1e-5)
+
+
+def test_sampling_path_owns_the_decode_loop():
+    """One prefill, then a single-token forward per step, all writing into a static cache."""
+    from transformers import LlamaForCausalLM, StaticCache
+
+    class RecordingLlama(LlamaForCausalLM):
+
+        def __init__(self, config):
+            super().__init__(config)
+            self.widths = []
+            self.masks = []
+            self.cache_types = []
+
+        def forward(self, *args, **kwargs):
+            input_ids = kwargs.get("input_ids", args[0] if args else None)
+            self.widths.append(int(input_ids.shape[1]))
+            self.masks.append(kwargs["attention_mask"].tolist())
+            self.cache_types.append(type(kwargs.get("past_key_values")).__name__)
+            return super().forward(*args, **kwargs)
+
+        def generate(self, *args, **kwargs):
+            raise AssertionError("sampling must not fall back to HuggingFace generate")
+
+    model = _tiny_llama(model_class=RecordingLlama)
+    rollout = HybridEngineRollout(SimpleNamespace(module=model), SimpleNamespace(pad_token_id=0, eos_token_id=None))
+    prompt = torch.tensor([[0, 1, 2], [3, 4, 5]])
+    attention = torch.tensor([[0, 1, 1], [1, 1, 1]])
+    request = RolloutRequest(prompt, attention)
+
+    torch.manual_seed(1)
+    output = rollout.generate(request, SamplingConfig(max_new_tokens=4, temperature=1.0))
+
+    assert output.input_ids.shape == (2, 7)
+    assert model.widths == [3, 1, 1, 1]
+    assert set(model.cache_types) == {StaticCache.__name__}
+    # The prefill carries the prompt mask, and the decode masks hide the pad column while
+    # adding exactly one column per step.
+    assert model.masks[0] == attention.tolist()
+    for index, mask in enumerate(model.masks[1:], start=1):
+        assert mask[0] == [0, 1, 1] + [1] * index + [0] * (4 - index)
+
+
+def test_sampling_path_pads_after_eos_and_zeroes_retired_logprobs():
+    """The first EOS ends the response; later tokens and their log-probabilities are retired."""
+
+    class ScriptedModel(torch.nn.Module):
+        _supports_cache_class = True
+
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(1))
+            self.config = PretrainedConfig(max_position_embeddings=32,
+                                           num_hidden_layers=1,
+                                           num_attention_heads=1,
+                                           num_key_value_heads=1,
+                                           hidden_size=1,
+                                           head_dim=1)
+            self.script = [5, 2, 9, 9]
+            self.step = 0
+
+        def forward(self, input_ids, attention_mask=None, past_key_values=None, use_cache=True, **kwargs):
+            keys = input_ids[:, None, :, None].float()
+            past_key_values.update(keys, keys, layer_idx=0, cache_kwargs=kwargs)
+            logits = torch.full((input_ids.shape[0], input_ids.shape[1], 16), -1e9)
+            logits[:, -1, self.script[self.step]] = 20.0
+            self.step += 1
+            return SimpleNamespace(logits=logits)
+
+    rollout = HybridEngineRollout(SimpleNamespace(module=ScriptedModel()),
+                                  SimpleNamespace(pad_token_id=1, eos_token_id=2))
+    request = RolloutRequest(torch.tensor([[1, 2, 3]]), torch.ones((1, 3), dtype=torch.long))
+
+    output = rollout.generate(request, SamplingConfig(max_new_tokens=4, temperature=1.0))
+
+    assert output.input_ids[:, 3:].tolist() == [[5, 2, 1, 1]]
+    assert output.attention_mask[:, 3:].tolist() == [[1, 1, 0, 0]]
+    assert output.response_logprobs[:, 2:].tolist() == [[0.0, 0.0]]
+# -- sampling on the captured forward ------------------------------------
+
+
+class _RecordingLogitsLlama(LlamaForCausalLM):
+    """Records its last forward (and output logits) so a mocked replay can run it again."""
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.last_call = None
+        self.last_output_logits = None
+        self.captured_logits = None
+
+    def forward(self, *args, **kwargs):
+        output = super().forward(*args, **kwargs)
+        self.last_call = (args, kwargs)
+        self.last_output_logits = output.logits
+        return output
+
+
+class _CapturedLogitsRecorder:
+    """Stands in for ``capture_to_graph``: remembers the output the capture bound to."""
+
+    def __init__(self, model):
+        self.model = model
+
+    def __enter__(self):
+        return None
+
+    def __exit__(self, *_exc):
+        self.model.captured_logits = self.model.last_output_logits
+        return False
+
+
+def _replaying_static_graph(mock_get_accelerator, model):
+    """Accelerator mock whose replays re-run the captured forward into the captured logits."""
+    accelerator = _mock_graph_accelerator(mock_get_accelerator)
+    accelerator.capture_to_graph.side_effect = lambda _graph: _CapturedLogitsRecorder(model)
+
+    def replay(_graph):
+        args, kwargs = model.last_call
+        fresh = model(*args, **kwargs)
+        model.captured_logits.copy_(fresh.logits)
+
+    accelerator.replay_graph.side_effect = replay
+    return accelerator
+
+
+@patch("deepspeed.runtime.rollout.hybrid_engine_rollout.get_accelerator")
+def test_graph_capture_serves_sampling_and_greedy_alike(mock_get_accelerator):
+    """The captured forward is shared: only the token selection differs between the two."""
+    model = _tiny_llama(model_class=_RecordingLogitsLlama)
+    _replaying_static_graph(mock_get_accelerator, model)
+    prompt = torch.tensor([[0, 0, 1, 2, 3], [4, 5, 6, 7, 8]])
+    attention = torch.tensor([[0, 0, 1, 1, 1], [1, 1, 1, 1, 1]])
+    request = RolloutRequest(prompt, attention)
+
+    graph_rollout = HybridEngineRollout(SimpleNamespace(module=model),
+                                        SimpleNamespace(pad_token_id=0, eos_token_id=None),
+                                        cfg=HybridEngineRolloutConfig(use_graph_capture=True))
+    eager_model = _tiny_llama()
+    eager_rollout = HybridEngineRollout(SimpleNamespace(module=eager_model),
+                                        SimpleNamespace(pad_token_id=0, eos_token_id=None))
+
+    torch.manual_seed(3)
+    sampled = graph_rollout.generate(request, SamplingConfig(max_new_tokens=4, temperature=1.0, top_k=1))
+    torch.manual_seed(3)
+    sampled_eager = eager_rollout.generate(request, SamplingConfig(max_new_tokens=4, temperature=1.0, top_k=1))
+    greedy = graph_rollout.generate(request, SamplingConfig(max_new_tokens=4, temperature=0))
+
+    # top_k=1 leaves one token per row, so the captured replay must reproduce both the eager
+    # sampling loop and the greedy path token for token.
+    assert sampled.input_ids.tolist() == sampled_eager.input_ids.tolist()
+    assert greedy.input_ids.tolist() == sampled_eager.input_ids.tolist()
+    assert sampled.response_logprobs.tolist() == [[0.0] * 4, [0.0] * 4]
+    assert greedy.response_logprobs is None
+
+    # Unfiltered sampling records the model's own log-probabilities at the tokens it drew
+    # from the replayed logits.
+    torch.manual_seed(11)
+    free = graph_rollout.generate(request, SamplingConfig(max_new_tokens=3, temperature=1.0))
+    with torch.no_grad():
+        logits = model(free.input_ids, attention_mask=free.attention_mask).logits
+    start = int(free.response_start_idx[0])
+    expected = torch.log_softmax(logits[:, start - 1:-1, :],
+                                 dim=-1).gather(-1, free.input_ids[:, start:].unsqueeze(-1)).squeeze(-1)
+    assert torch.allclose(free.response_logprobs, expected, atol=1e-5)
+
+
+def test_continuous_sampling_logprobs_match_the_model_distribution():
+    """Row order and values: every logprob belongs to the token the same row drew."""
+    model = _tiny_llama()
+    rollout = HybridEngineRollout(SimpleNamespace(module=model), SimpleNamespace(pad_token_id=0, eos_token_id=None))
+    prompt = torch.tensor([[1, 2, 3], [4, 5, 6]])  # unpadded: cache column and position coincide
+    request = RolloutRequest(prompt, torch.ones_like(prompt))
+
+    torch.manual_seed(9)
+    output = rollout.generate(request, SamplingConfig(max_new_tokens=3, temperature=1.0, continuous_batch_size=2))
+
+    with torch.no_grad():
+        logits = model(output.input_ids, attention_mask=output.attention_mask).logits
+    start = int(output.response_start_idx[0])
+    expected = torch.log_softmax(logits[:, start - 1:-1, :], dim=-1).gather(-1, output.input_ids[:,
+                                                                                                 start:].unsqueeze(-1))
+    expected = expected.squeeze(-1)
+
+    assert output.response_logprobs.shape == (2, 3)
+    assert torch.allclose(output.response_logprobs, expected, atol=1e-5)
+
+
+def test_continuous_sampling_matches_greedy_with_top_k_one():
+    """Continuous batching now serves sampling too; top_k=1 must equal the greedy stream."""
+    model = _tiny_llama()
+    rollout = HybridEngineRollout(SimpleNamespace(module=model), SimpleNamespace(pad_token_id=0, eos_token_id=None))
+    prompt = torch.tensor([[0, 0, 1, 2], [3, 4, 5, 6]])
+    attention = torch.tensor([[0, 0, 1, 1], [1, 1, 1, 1]])
+    request = RolloutRequest(prompt, attention)
+
+    torch.manual_seed(5)
+    sampled = rollout.generate(request,
+                               SamplingConfig(max_new_tokens=4, temperature=1.0, top_k=1, continuous_batch_size=2))
+    greedy = rollout.generate(request, SamplingConfig(max_new_tokens=4, temperature=0, continuous_batch_size=2))
+
+    assert sampled.input_ids.tolist() == greedy.input_ids.tolist()
+    assert sampled.attention_mask.tolist() == greedy.attention_mask.tolist()
+    assert sampled.response_logprobs.tolist() == [[0.0] * 4, [0.0] * 4]
+    assert greedy.response_logprobs is None
+
+
+def test_continuous_sampling_draws_the_first_response_token():
+    """The first response token is drawn from the prefill logits, not argmaxed."""
+    model = _tiny_llama()
+    rollout = HybridEngineRollout(SimpleNamespace(module=model), SimpleNamespace(pad_token_id=0, eos_token_id=None))
+    prompt = torch.tensor([[1, 2, 3]])
+    attention = torch.ones_like(prompt)
+    request = RolloutRequest(prompt, attention)
+
+    first_tokens = set()
+    for seed in range(8):
+        torch.manual_seed(seed)
+        output = rollout.generate(request, SamplingConfig(max_new_tokens=1, temperature=3.0, continuous_batch_size=1))
+        first_tokens.add(int(output.input_ids[0, prompt.shape[1]]))
+        assert float(output.response_logprobs[0, 0]) < 0.0
+
+    assert len(first_tokens) > 1
+
+
+@patch("deepspeed.runtime.rollout.hybrid_engine_rollout.get_accelerator")
+def test_continuous_graph_sampling_matches_greedy_with_top_k_one(mock_get_accelerator):
+    """Sampling keeps the captured continuous forward; the draw stays on the graph's logits."""
+    captures = []
+    _, fake_capture = _replaying_graph_accelerator(mock_get_accelerator, captures)
+    model = _tiny_llama()
+    prompt = torch.tensor([[0, 0, 3, 4, 5, 6, 7, 8, 9, 10], [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]])
+    attention = torch.tensor([[0, 0, 1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1, 1, 1, 1, 1]])
+    request = RolloutRequest(prompt, attention)
+
+    with patch.object(HybridEngineRollout, "_capture_continuous_graph", side_effect=fake_capture):
+        rollout = HybridEngineRollout(SimpleNamespace(module=model),
+                                      SimpleNamespace(pad_token_id=0, eos_token_id=None),
+                                      cfg=HybridEngineRolloutConfig(use_graph_capture=True))
+        torch.manual_seed(7)
+        sampled = rollout.generate(request,
+                                   SamplingConfig(max_new_tokens=4, temperature=1.0, top_k=1, continuous_batch_size=2))
+        greedy = rollout.generate(request, SamplingConfig(max_new_tokens=4, temperature=0, continuous_batch_size=2))
+
+    assert sampled.input_ids.tolist() == greedy.input_ids.tolist()
+    assert sampled.attention_mask.tolist() == greedy.attention_mask.tolist()
+    assert sampled.response_logprobs.tolist() == [[0.0] * 4, [0.0] * 4]
+    assert captures  # the decode really was replayed
