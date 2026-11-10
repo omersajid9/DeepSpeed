@@ -25,6 +25,31 @@ def test_static_layer_supports_per_row_decode_positions():
     assert torch.equal(layer.get_seq_length(), torch.tensor([2, 4]))
 
 
+def test_static_layer_writes_a_chunk_per_row_at_its_own_position():
+    """Chunked prefill stages rows at different columns of their own prompts."""
+    layer = DeepSpeedStaticLayer(max_cache_len=8)
+    keys = torch.zeros((2, 1, 4, 1))
+    layer.lazy_initialization(keys, keys)
+    layer.set_write_position(torch.tensor([0, 2], dtype=torch.long))
+    chunk = torch.arange(8, dtype=torch.float32).reshape(2, 1, 4, 1)
+
+    layer.update(chunk, chunk)
+
+    assert layer.keys[0, 0, :4, 0].tolist() == [0.0, 1.0, 2.0, 3.0]
+    assert layer.keys[0, 0, 4:, 0].tolist() == [0.0, 0.0, 0.0, 0.0]
+    assert layer.keys[1, 0, :6, 0].tolist() == [0.0, 0.0, 4.0, 5.0, 6.0, 7.0]
+
+
+def test_static_layer_rejects_a_chunk_that_runs_past_the_cache():
+    layer = DeepSpeedStaticLayer(max_cache_len=4)
+    keys = torch.zeros((1, 1, 2, 1))
+    layer.lazy_initialization(keys, keys)
+    layer.set_write_position(torch.tensor([3], dtype=torch.long))
+
+    with pytest.raises(ValueError, match="within the cache bounds"):
+        layer.update(keys, keys)
+
+
 def test_static_layer_per_row_positions_support_graph_replay():
     accelerator = get_accelerator()
     graph = accelerator.create_graph()
