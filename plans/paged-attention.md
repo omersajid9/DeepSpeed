@@ -48,20 +48,32 @@ device kernels. Verified surface:
 | blocked KV writes + rotary (pre-RoPE'd keys into blocks, GQA ratios 1-8) | `kernels/ragged_ops/linear_blocked_kv_rotary/{blocked_kv_rotary,blocked_trained_kv_rotary,linear_blocked_kv_copy}.py` | head sizes 64/80/96/128 |
 | block-size rules | `blocked_flash.py:12-53` | `get_q_block_size`, `get_kv_block_size(head_size)` → 128 / 64 / 32 |
 | builder | `op_builder/ragged_ops.py` (`DS_BUILD_RAGGED_DEVICE_OPS`) | `RaggedOpsBuilder().load()`, CC gate |
+| **block table is a view, not a tensor** | `ragged/ragged_manager.py:66-80`, `ragged/sequence_descriptor.py:98-133,192` | one `int32 [max_tracked_sequences, groups, max_blocks]` buffer; a row is a view, and kernels take its `data_ptr()` (`kv_blocks_ptr`) |
+| pinned host shadows + one-shot H2D | `ragged/ragged_wrapper.py:79-121,184` (`finalize()`), `sequence_descriptor.py:177-235` (`extend_kv_cache`) | the R14 pattern is already implemented here: build on the host, upload once per step |
+| kernel ABI structs | `kernels/ragged_ops/ragged_helpers/ragged_dtypes.h:7-35` | `RaggedBatchDescriptor`, `InflightSeqDescriptor`, `KVCacheDescriptor{int32** block_lists, block_size, n_blocks}` — the contract any metadata builder must produce |
+| block→address math for the KV write | `linear_blocked_kv_rotary/blocked_kv_rotary_cuda.cu:79-95` | `global = seen + (tok - start)`; `blk = block_lists[row][global / B]`; `off = (blk*B + global % B) * stride1 + head*head_dim` |
+| KV write variants | `linear_blocked_kv_rotary/{blocked_kv_rotary,blocked_trained_kv_rotary,linear_blocked_kv_copy}.py` | synthesized RoPE, trained inv_freq RoPE, and a no-RoPE copy; GQA `q_ratio = n_q / n_kv` (only `head_idx % q_ratio == 0` writes KV); requires `qkv_stride == k.stride(0) == v.stride(0)`; head sizes 64/80/96/128 |
+| atom count rule | `blocked_flash/atom_builder.cpp:26-47`, `modules/implementations/attention/dense_blocked_attention.py:113` | `n_atoms = Σ_rows ceil(q_len / q_block_size)`, `max_atoms = max_ragged_sequence_count`; decode ⇒ exactly one atom per row |
+| state manager (optional for a rollout) | `ragged/ragged_manager.py:55-203` | tracking-slot allocator, per-uid descriptors, `flush_sequence`; a rollout that owns its rows needs the block row, not this layer |
+| reserve vs allocate, TP agreement | `ragged/kv_cache.py:141-152` | `AllocationMode.RESERVE` vs `ALLOCATE`; inside a TP group the block count is min-reduced so ranks agree |
 
 So the plan is **not** "write paged attention". It is: *adopt the V2 ragged/blocked stack inside the
 hybrid-engine rollout*, keeping the rollout's write-position protocol, bucket ladder and scheduler.
 
 **Two gaps in that stack, which this plan has to build:**
 
-1. **No sharing/ref-counts.** `BlockedAllocator` is a free/used list only (`:31-105`). Prefix reuse needs
-   blocks to be referenced by more than one row and freed only when the last reference dies — vLLM's
-   block pool carries `ref_cnt` for exactly this. Add a thin ref-count map (or block-state table) on top of
-   `BlockedAllocator` rather than forking it.
-2. **No CUDA path for tests.** `BlockedFlashAttn` requires CC ≥ 8, and CPU CI is where our correctness
-   tests live. Keep a **materialise-then-dense** reference: gather a row's blocks by slot map into a
-   contiguous `[1, heads, len, head_dim]` view and call `SDPA`/`BlockedFlashAttn` behind one interface, so
-   the same tests run on CPU (oracle) and GPU (target).
+1. **No sharing/ref-counts.** `BlockedAllocator` is a free/used list only, mutated by a Python loop
+   (`:33-105`). Prefix reuse needs blocks referenced by more than one row and freed only when the last
+   reference dies — vLLM's block pool carries `ref_cnt` for exactly this. Add a thin ref-count map on top of
+   `BlockedAllocator` rather than forking it, and reserve in batches (per-token-boundary calls would put a
+   Python loop on the step's critical path).
+2. **No CPU path for tests.** `BlockedFlashAttn` requires CC ≥ 8 *and links an external `dskernels`
+   library* (`-lblockedflash`, see `blocked_flash.cpp`); the ragged plumbing additionally needs
+   `RaggedUtilsBuilder` (`allocate_fast_host_buffer`), not just `RaggedOpsBuilder`. CPU CI is where our
+   correctness tests live, so keep a **materialise-then-dense** reference: gather a row's blocks by slot map
+   into a contiguous `[1, heads, len, head_dim]` view and call SDPA, behind the same interface as the blocked
+   kernel. That oracle is also what makes the build dependency non-blocking: phases 0-1 need no CUDA ops at
+   all.
 
 ### 3.2 Lessons from the reference implementations (audited in §9)
 
@@ -99,10 +111,12 @@ never referenced.
 
 ### 4.2 Step flow
 
-**Decode step (R rows, one token each):** host (or device kernel) appends the new position's slot to
-`slot_map`; `BlockedKVWrite` writes the token's K/V (with RoPE) into its block slot; `AtomBuilder`
-turns `(row_len, kv_blocks, global_q_idx)` into one atom per row; one `BlockedFlashAttn` call over the
-packed query rows produces the logits input. No mask tensor is built.
+**Decode step (R rows, one token each):** the slot for each row's new position is
+`block_ids[row, p // B] * B + p % B` (the same arithmetic the write kernel does internally,
+`blocked_kv_rotary_cuda.cu:79-95`); the K/V write (with RoPE, three variants available) goes through
+`KVCacheDescriptor`; `AtomBuilder` emits **one atom per row** for `q_len == 1`
+(`n_atoms = Σ ceil(q_len / q_block_size)`); one `BlockedFlashAttn` call over the packed query rows
+produces the attention output. No mask tensor is built.
 
 **Prefill / staged chunk (C rows × chunk tokens):** same, with `q_len = chunk` and `q_start_idx` pointing
 into the packed token dim; the atom's `kv_blocks` covers the row's already-written prefix, `total_extent`
@@ -190,6 +204,18 @@ counter exists.
    Python). Under graph capture and many rows, block growth must be pre-reserved or done outside capture.
 7. **Memory accounting**: graphs + pools + block pool must be budgeted before the KV allocation
    (vLLM's `profile_cudagraph_memory` pattern), otherwise the first capture can OOM what the pool needed.
+8. **Build surface**: `BlockedFlashAttn` needs the external `dskernels`/`-lblockedflash` link, and the ragged
+   batch plumbing needs `RaggedUtilsBuilder` alongside `RaggedOpsBuilder`. Verify both build on the target box
+   before phase 2; phases 0-1 are deliberately op-free.
+9. **Stride coupling on the write side**: the blocked write requires
+   `qkv_stride == k.stride(0) == v.stride(0)`, i.e. the KV write must consume the same packed-QKV layout the
+   V2 kernels expect (or pay a copy). Decide this when wiring the shim (option A) — it constrains how the
+   attention module is replaced.
+10. **TP**: `BlockedKVCache` min-reduces block counts across a TP group so ranks agree on pool size
+    (`kv_cache.py:141-152`). Our rollout paths are single-rank today; if the rollout is ever TP-sharded the
+    pool sizing becomes a collective, and `AllocationMode` matters.
+11. **Allocator granularity**: `allocate` walks a pinned host list in Python; pre-reserve a row's blocks (or
+    batch allocations per step) instead of allocating at every block boundary.
 
 ## 7 · What this replaces in the roadmap
 
