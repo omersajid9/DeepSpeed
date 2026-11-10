@@ -301,10 +301,6 @@ class HybridEngineRollout(RolloutEngine):
 
     @torch.no_grad()
     def generate(self, request: RolloutRequest, sampling: SamplingConfig) -> RolloutBatch:
-        if self.enable_chunked_prefill and sampling.temperature > 0.0 and not self._chunked_prefill_warned:
-            logger.warning("Rollout chunked prefill currently covers greedy generation only; "
-                           "sampling rollouts prefill the prompt in a single forward.")
-            self._chunked_prefill_warned = True
         if sampling.continuous_batch_size is not None:
             return self._generate_continuous(request, sampling, sampling.continuous_batch_size)
         if self.use_paged_cache:
@@ -590,9 +586,9 @@ class HybridEngineRollout(RolloutEngine):
         span_starts = [0] * max_batch_size
         prefill_chunks = {}
         chunk_stats = {"chunks": 0, "peak_staging_bytes": 0}
-        # Chunked prefill stages long prompts for greedy rows only: a sampling rollout prefills
-        # in one forward so its first response token can be drawn from the prefill logits.
-        chunk_size = self.prefill_chunk_size if (self.enable_chunked_prefill and is_greedy) else 0
+        # Long prompts are staged for every decoding mode; the completing chunk draws the
+        # first response token with the same sampler as the decode steps.
+        chunk_size = self.prefill_chunk_size if self.enable_chunked_prefill else 0
 
         self._profile_end(profile, "cache_management_overhead_ms", cache_start)
         scheduler_start = self._profile_start(profile)
@@ -702,9 +698,18 @@ class HybridEngineRollout(RolloutEngine):
                 next_logprobs.update(admitted_logprobs)
             published_ids = set()
             if prefill_chunks:
-                published = self._run_chunked_prefill(module, prefill_chunks, chunk_size, device, cache,
-                                                      attention_mask, write_positions, chunk_stats, profile)
+                published, published_logprobs = self._run_chunked_prefill(module,
+                                                                          prefill_chunks,
+                                                                          chunk_size,
+                                                                          device,
+                                                                          cache,
+                                                                          attention_mask,
+                                                                          write_positions,
+                                                                          chunk_stats,
+                                                                          profile,
+                                                                          sampling=sampling)
                 admitted_tokens.update(published)
+                next_logprobs.update(published_logprobs)
                 # A prompt that completed in this step starts decoding next step, exactly
                 # like a freshly admitted row: this step's token is the first response token.
                 published_ids = set(published)
@@ -957,9 +962,9 @@ class HybridEngineRollout(RolloutEngine):
         response_logprobs = {request_id: [] for request_id in request_by_id} if not is_greedy else None
         prefill_chunks = {}
         chunk_stats = {"chunks": 0, "peak_staging_bytes": 0}
-        # Chunked prefill stages long prompts for greedy rows only: a sampling rollout prefills
-        # in one forward so its first response token can be drawn from the prefill logits.
-        chunk_size = self.prefill_chunk_size if (self.enable_chunked_prefill and is_greedy) else 0
+        # Long prompts are staged for every decoding mode; the completing chunk draws the
+        # first response token with the same sampler as the decode steps.
+        chunk_size = self.prefill_chunk_size if self.enable_chunked_prefill else 0
         update = scheduler.schedule()
         while update.active:
             if profile is not None:
@@ -1009,17 +1014,19 @@ class HybridEngineRollout(RolloutEngine):
                     next_logprobs.update(admitted_logprobs)
             published_ids = set()
             if prefill_chunks:
-                chunked_tokens = self._run_staged_prefill(module,
-                                                          prefill_chunks,
-                                                          chunk_size,
-                                                          prompt_len,
-                                                          cache,
-                                                          static_attention,
-                                                          static_write_positions,
-                                                          chunk_stats,
-                                                          profile,
-                                                          request_write_positions=write_positions)
+                chunked_tokens, chunked_logprobs = self._run_staged_prefill(module,
+                                                                            prefill_chunks,
+                                                                            chunk_size,
+                                                                            prompt_len,
+                                                                            cache,
+                                                                            static_attention,
+                                                                            static_write_positions,
+                                                                            chunk_stats,
+                                                                            profile,
+                                                                            request_write_positions=write_positions,
+                                                                            sampling=sampling)
                 next_tokens.update(chunked_tokens)
+                next_logprobs.update(chunked_logprobs)
                 # A prompt that completed in this step starts decoding next step, exactly
                 # like a freshly admitted row: this step's token is the first response token
                 # and must not be overwritten by a decode of the same row.
@@ -1616,7 +1623,7 @@ class HybridEngineRollout(RolloutEngine):
                                                        position_ids=self._prefill_position_ids(prompt_attention))
         return tuple(batched_ids), tuple(batched_slots)
 
-    def _advance_prefill_chunk(self, module, chunk, width, device, profile=None):
+    def _advance_prefill_chunk(self, module, chunk, width, device, profile=None, sampling=None):
         """Prefill the next chunk of a staged prompt.
 
         Returns the first response token once the prompt is complete, else ``None``. The
@@ -1640,9 +1647,10 @@ class HybridEngineRollout(RolloutEngine):
         self._profile_end(profile, "prefill_forward_ms", forward_start, count="num_prefill_forwards")
         chunk.offset = end
         if end < chunk.prompt_len:
-            return None
-        # The chunk that completes the prompt also predicts the first response token.
-        return output.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            return None, None
+        # The completing chunk predicts the first response token; sampling rollouts must
+        # draw it from the same distribution as the rest of the response.
+        return self._draw_token(output.logits[:, -1, :], sampling)
 
     def _publish_prefill_chunk(self, chunk, cache, attention_mask, write_positions):
         """Move a completed staged prompt into its row of the decode cache.
@@ -1680,21 +1688,28 @@ class HybridEngineRollout(RolloutEngine):
                              write_positions,
                              chunk_stats,
                              profile=None,
-                             request_write_positions=None):
+                             request_write_positions=None,
+                             sampling=None):
         """Advance the staged prompts by at most ``chunk_size`` tokens in total.
 
         The budget is spent in admission order, so the number of extra forwards in a step
         is bounded no matter how many prompts are waiting. Returns the first response
-        token of every prompt that completed in this step, keyed by request id.
+        token and its logprob (when sampling) of every prompt that completed in this step.
         """
         budget = chunk_size
         completed = {}
+        completed_logprobs = {}
         for request_id in list(prefill_chunks):
             if budget <= 0:
                 break
             chunk = prefill_chunks[request_id]
             width = min(chunk.remaining, budget)
-            first_token = self._advance_prefill_chunk(module, chunk, width, device, profile)
+            first_token, first_logprob = self._advance_prefill_chunk(module,
+                                                                     chunk,
+                                                                     width,
+                                                                     device,
+                                                                     profile,
+                                                                     sampling=sampling)
             budget -= width
             chunk_stats["chunks"] += 1
             chunk_stats["peak_staging_bytes"] = max(chunk_stats["peak_staging_bytes"], chunk.staging_bytes())
@@ -1704,8 +1719,10 @@ class HybridEngineRollout(RolloutEngine):
             if request_write_positions is not None:
                 request_write_positions[request_id] = prompt_end
             completed[request_id] = first_token
+            if first_logprob is not None:
+                completed_logprobs[request_id] = first_logprob
             del prefill_chunks[request_id]
-        return completed
+        return completed, completed_logprobs
 
     # ------------------------------------------------------------------
     # Captured chunked prefill (continuous graph path)
@@ -1762,7 +1779,8 @@ class HybridEngineRollout(RolloutEngine):
                             write_positions,
                             chunk_stats,
                             profile=None,
-                            request_write_positions=None):
+                            request_write_positions=None,
+                            sampling=None):
         """Advance the running wave by one chunk window and publish the prompts that finish.
 
         Every row of a wave shares one window, so the whole wave is one forward at
@@ -1800,23 +1818,26 @@ class HybridEngineRollout(RolloutEngine):
         self._profile_end(profile, "prefill_forward_ms", forward_start, count="num_prefill_forwards")
         completion = end >= prompt_len
         completed = {}
+        completed_logprobs = {}
         for row_index, (request_id, chunk) in enumerate(wave):
             chunk.start = end
             if not completion:
                 continue
             # The chunk that completes the prompt also predicts the first response token.
-            first_token = logits[row_index:row_index + 1, -1, :].argmax(dim=-1, keepdim=True)
+            first_token, first_logprob = self._draw_token(logits[row_index:row_index + 1, -1, :], sampling)
             self._publish_staged_prompt(chunk, state, cache, attention_mask, write_positions)
             if request_write_positions is not None:
                 request_write_positions[request_id] = prompt_len
             completed[request_id] = first_token
+            if first_logprob is not None:
+                completed_logprobs[request_id] = first_logprob
             del prefill_chunks[request_id]
         chunk_stats["chunks"] += len(wave)
         chunk_stats["graph_steps"] = chunk_stats.get("graph_steps", 0) + 1
         chunk_stats["padded_rows"] = chunk_stats.get("padded_rows", 0) + width - len(wave)
         widths = chunk_stats.setdefault("bucket_widths", {})
         widths[width] = widths.get(width, 0) + 1
-        return completed
+        return completed, completed_logprobs
 
     def _fill_staged_attention(self, bucket, wave, window):
         """Write the chunk's additive mask and its write positions in place.
