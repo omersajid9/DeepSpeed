@@ -57,7 +57,10 @@ def test_paged_decode_matches_dense_oracle():
         dense_keys = row_keys.unsqueeze(0).repeat_interleave(ratio, dim=1)
         dense_values = row_values.unsqueeze(0).repeat_interleave(ratio, dim=1)
         expected = torch.nn.functional.scaled_dot_product_attention(query[row:row + 1], dense_keys, dense_values)
-        torch.testing.assert_close(actual[row:row + 1], expected, atol=0.25, rtol=0.25)
+        # attention() returns [rows, q_len, heads * head_dim] head-major; restore the
+        # [rows, heads, q_len, head_dim] layout the dense oracle produces.
+        actual_row = actual[row:row + 1].view(1, num_heads, 1, head_dim)
+        torch.testing.assert_close(actual_row, expected, atol=0.25, rtol=0.25)
 
 
 def test_paged_compact_releases_and_reorders_rows():
@@ -144,7 +147,8 @@ def test_graph_safe_paged_decode_matches_dense_oracle():
             row_keys.unsqueeze(0).repeat_interleave(ratio, dim=1),
             row_values.unsqueeze(0).repeat_interleave(ratio, dim=1),
         )
-        torch.testing.assert_close(actual[row:row + 1], expected, atol=0.25, rtol=0.25)
+        actual_row = actual[row:row + 1].view(1, num_heads, 1, head_dim)
+        torch.testing.assert_close(actual_row, expected, atol=0.25, rtol=0.25)
 
 
 def test_paged_prefill_attention_matches_dense_oracle():
@@ -182,7 +186,61 @@ def test_paged_prefill_attention_matches_dense_oracle():
     dense_keys = keys[0].unsqueeze(0).repeat_interleave(ratio, dim=1)
     dense_values = values[0].unsqueeze(0).repeat_interleave(ratio, dim=1)
     expected = torch.nn.functional.scaled_dot_product_attention(query, dense_keys, dense_values, is_causal=True)
+    actual = actual.view(1, prompt_len, num_heads, head_dim).permute(0, 2, 1, 3)
     torch.testing.assert_close(actual, expected, atol=0.25, rtol=0.25)
+
+
+def test_flashinfer_decode_matches_dense_oracle():
+    pytest.importorskip("flashinfer")
+    if not torch.cuda.is_available():  #ignore-cuda
+        pytest.skip("paged cache needs a CUDA device")
+    torch.manual_seed(5)
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    # Qwen3-4B head config: GQA ratio 4, head_dim 128, which routes the
+    # FlashInfer decode to the fa2 tensor-core split-KV kernel.
+    head_dim, num_kv_heads, num_heads = 128, 8, 32
+    block_size = get_kv_block_size(head_dim)
+    config = SimpleNamespace(
+        num_hidden_layers=1,
+        num_key_value_heads=num_kv_heads,
+        num_attention_heads=num_heads,
+        head_dim=head_dim,
+        hidden_size=num_heads * head_dim,
+    )
+    cache = PagedAttentionCache(config,
+                                batch_size=2,
+                                max_cache_len=8 * block_size,
+                                device=device,
+                                dtype=dtype,
+                                block_size=block_size,
+                                use_flashinfer_decode=True)
+
+    prompt_len = 5 * block_size + 3
+    keys = torch.randn(2, num_kv_heads, prompt_len, head_dim, device=device, dtype=dtype)
+    values = torch.randn_like(keys)
+    cache.copy_from_dense(0, keys[0], values[0], 0)
+    cache.copy_from_dense(0, keys[1], values[1], 1)
+
+    positions = torch.tensor([prompt_len, prompt_len], device=device, dtype=torch.long)
+    cache.set_write_position(positions)
+    cache.set_active_rows([0, 1])
+    new_keys = torch.randn(2, num_kv_heads, 1, head_dim, device=device, dtype=dtype)
+    new_values = torch.randn_like(new_keys)
+    cache.write(0, new_keys, new_values)
+
+    query = torch.randn(2, num_heads, 1, head_dim, device=device, dtype=dtype)
+    actual = cache.attention(0, query, 1.0 / (head_dim**0.5))
+    for row in range(2):
+        row_keys, row_values = cache.materialize(0, row, prompt_len + 1)
+        ratio = num_heads // num_kv_heads
+        expected = torch.nn.functional.scaled_dot_product_attention(
+            query[row:row + 1],
+            row_keys.unsqueeze(0).repeat_interleave(ratio, dim=1),
+            row_values.unsqueeze(0).repeat_interleave(ratio, dim=1),
+        )
+        actual_row = actual[row:row + 1].view(1, num_heads, 1, head_dim)
+        torch.testing.assert_close(actual_row, expected, atol=0.25, rtol=0.25)
 
 
 def test_prefix_reuse_shares_blocks_and_releases_after_last_row():
