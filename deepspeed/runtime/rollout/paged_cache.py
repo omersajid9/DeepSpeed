@@ -38,6 +38,13 @@ class _PagedLayer:
     def __init__(self, keys: torch.Tensor, values: torch.Tensor) -> None:
         self.keys = keys
         self.values = values
+        # Layers are fully allocated when PagedAttentionCache is constructed, so
+        # the lazy-initialization bookkeeping that the engine checks is always
+        # satisfied; lazy_initialization() is therefore a no-op.
+        self.is_initialized = True
+
+    def lazy_initialization(self, prefill_keys, prefill_values, max_batch_size=None) -> None:
+        """No-op: keys/values are pre-allocated at cache construction."""
 
 
 class PagedAttentionCache:
