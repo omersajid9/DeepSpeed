@@ -250,6 +250,70 @@ def test_paged_decode_kernel_fused_matches_reference():
     torch.testing.assert_close(out.float(), expected, atol=5e-2, rtol=5e-2)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="paged cache needs a CUDA device")  #ignore-cuda
+def test_fused_kernel_stores_through_the_real_cache_page_table():
+    """The fused K/V store lands on the slots the cache's own table names."""
+    from deepspeed.inference.v2.kernels.ragged_ops.blocked_flash.blocked_flash import get_kv_block_size
+    from deepspeed.ops.module_inject import get_fused_glu_op
+    from deepspeed.runtime.rollout.paged_cache import PagedAttentionCache
+
+    torch.manual_seed(0)
+    num_q_heads, num_kv_heads, head_dim, hidden_size = 8, 2, 64, 64
+    config = SimpleNamespace(num_hidden_layers=1,
+                             num_key_value_heads=num_kv_heads,
+                             num_attention_heads=num_q_heads,
+                             head_dim=head_dim,
+                             hidden_size=hidden_size)
+    cache = PagedAttentionCache(config, batch_size=2, max_cache_len=4 * 64, device=DEV, dtype=torch.bfloat16)
+    positions = torch.tensor([63, 70], dtype=torch.long, device=DEV)
+    cache.set_write_position(positions)
+    cache.set_active_rows([0, 1])
+
+    hidden = torch.randn(2, 1, hidden_size, dtype=torch.bfloat16, device=DEV)
+    q_w = torch.randn(num_q_heads * head_dim * 2, hidden_size, dtype=torch.float32, device=DEV).bfloat16()
+    k_w = torch.randn(num_kv_heads * head_dim, hidden_size, dtype=torch.float32, device=DEV).bfloat16()
+    v_w = torch.randn(num_kv_heads * head_dim, hidden_size, dtype=torch.float32, device=DEV).bfloat16()
+    rope_dim = head_dim // 4
+    cos_t = torch.randn(int(positions.max()) + 1, rope_dim, dtype=torch.float32, device=DEV)
+    sin_t = torch.randn_like(cos_t)
+    q_flat = torch.nn.functional.linear(hidden[:, 0, :], q_w).view(2, -1, head_dim * 2)
+
+    out = torch.empty(2, num_q_heads, head_dim, dtype=torch.bfloat16, device=DEV)
+    get_fused_glu_op().decode_attn_paged(
+        q_flat[..., :head_dim].reshape(2, num_q_heads, head_dim),
+        cache._key_views[0].view(-1, num_kv_heads * head_dim),
+        cache._value_views[0].view(-1, num_kv_heads * head_dim),
+        cache.block_ids,
+        positions,
+        out,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        int(positions.max()) + 1,
+        cache.block_size,
+        q_norm_w=torch.ones(head_dim, dtype=torch.float32, device=DEV),
+        cos_t=cos_t,
+        sin_t=sin_t,
+        gate=q_flat[..., head_dim:].reshape(2, num_q_heads, head_dim),
+        k_raw=torch.nn.functional.linear(hidden[:, 0, :], k_w).view(2, num_kv_heads, head_dim),
+        v_raw=torch.nn.functional.linear(hidden[:, 0, :], v_w).view(2, num_kv_heads, head_dim),
+        k_norm_w=torch.ones(head_dim, dtype=torch.float32, device=DEV),
+        eps=1e-6,
+        rope_dim=rope_dim)
+    cache.note_step_written()
+
+    _, _, k_ref, v_ref = ref_prologue(hidden[:, 0, :].float(), q_w.float(), k_w.float(), v_w.float(),
+                                      torch.zeros(head_dim), torch.zeros(head_dim), cos_t[positions],
+                                      sin_t[positions], head_dim, 1e-6)
+    for row in range(2):
+        keys, values = cache.materialize(0, row, int(positions[row]) + 1)
+        torch.testing.assert_close(keys[:, -1].float(), k_ref[row].float(), atol=5e-2, rtol=5e-2)
+        torch.testing.assert_close(values[:, -1].float(), v_ref[row].float(), atol=5e-2, rtol=5e-2)
+        assert int(cache.row_len[row]) == int(positions[row]) + 1
+    # the kernel writes through the page table, so K and V must land in the same slot
+    assert int(cache.block_ids[0, 0]) >= 0 and int(cache.block_ids[1, 1]) >= 0
+
+
 # ---------------------------------------------------------------------------
 # 4. Rollout wiring (CPU)
 # ---------------------------------------------------------------------------

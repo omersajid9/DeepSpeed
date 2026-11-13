@@ -197,3 +197,46 @@ Re-verify on the shared A100 (one GPU job at a time):
 - the static `mnt=3, warmup 0` row deserves a re-check: with the fix both paths are safe,
   but if its saved iteration-1 ids were correct on the pre-fix tree, that capture was not
   actually running — print iteration-1 and iteration-2 digests to confirm which it was.
+
+## Update — fused paged decode (segki `decode_attn` over block tables)
+
+The static-cache path runs each of the 8 full-attention decode steps in one
+fused kernel (`decode_attn`: q|gate projection chunk, per-head (1+w) RMSNorm,
+partial rotate-half RoPE, the KV store, split-KV online softmax, sigmoid output
+gate). The paged path could not use it because the kernel computed K/V
+addresses from a dense plane, which is why paged decode ran the same math as a
+chain of eager kernels plus `BlockedFlashAttn` and trailed the static path on
+wall time. That gap is closed by generalizing the kernel rather than
+duplicating it: a KV address policy resolves `(row, kv_head, position)`:
+
+- `DenseKVAddress`: `base + (row * kv_heads + kv_head) * plane_stride + pos * HEAD_DIM` — the old arithmetic, so the static path's codegen is unchanged;
+- `PagedKVAddress`: `table[row, pos / block_size] * block_size + pos % block_size` → `pool[slot * kv_heads + kv_head]`.
+
+`decode_attn_paged` takes the pool (`[slots * kv_heads, head_dim]`), the cache's
+int32 block table and the block size; the fused body (norms, RoPE, KV store,
+split-KV softmax, gate) is shared. `capabilities()["paged_decode_attn"]`
+advertises it.
+
+Wiring: `PagedAttentionCache.is_paged_cache` routes the segment-KI decode
+forward to the block-table kernel with the cache's own page table, pool views
+and write-position tensor, and every unsupported case (prefill, recording
+windows, padded prompts, missing kernel support, write-position mismatch) falls
+back to the native paged forward. The kernel stores K/V itself, so the cache
+only refreshes its row lengths (`note_step_written`). Config
+`use_segki_paged_decode` (off by default until the GPU contract tests pass);
+harness flags `--segki-paged-decode` and `--flashinfer-decode` (the FlashInfer
+paged-decode backend was implemented but never enabled in the bench).
+
+Verification status:
+
+- **CPU**: paged reference == dense reference with a shuffled page table; the
+  fused prologue == the HF Qwen3.5 attention module (norms, partial RoPE, gate);
+  dispatch and fallback contracts pinned with stubs
+  (`tests/unit/module_inject/test_segment_ki_paged_decode.py`); full rollout +
+  module_inject suite green (332 passed, 57 skipped).
+- **Compile**: the extension builds with the toolkit's nvcc on a GPU-less box;
+  dense-kernel register counts compared against the pre-refactor build.
+- **GPU (pending a free node)**: kernel vs reference at block boundaries for
+  head_dim 64/128/256, bare and fused; then the b=4 3072→1024 bench
+  (`--use-paged-cache --enable-paged-prefill --use-segki --segki-paged-decode`)
+  against static and the native paged path.

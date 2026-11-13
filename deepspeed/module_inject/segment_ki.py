@@ -860,14 +860,12 @@ def _ki_project_decode_qkv(module, hidden_states, input_shape):
         # One GEMV launch over q/k/v weights directly — replaces the
         # three separate F.linear launches. q_proj keeps its 2x-wide
         # query|gate layout, so the gate split below is unchanged from HF.
-        q_out, k_flat, v_flat = qkv_op.grouped_linear(hidden_states.view(-1),
-                                                      [module.q_proj.weight, module.k_proj.weight, module.v_proj.weight],
-                                                      False)
+        q_out, k_flat, v_flat = qkv_op.grouped_linear(
+            hidden_states.view(-1), [module.q_proj.weight, module.k_proj.weight, module.v_proj.weight], False)
         query_states, gate = torch.chunk(q_out.view(*input_shape, -1, module.head_dim * 2), 2, dim=-1)
     elif qkv_op is not None:
-        q_out, k_flat, v_flat = qkv_op.grouped_linear(hidden_states.reshape(-1, hidden_states.shape[-1]),
-                                                      [module.q_proj.weight, module.k_proj.weight, module.v_proj.weight],
-                                                      False)
+        q_out, k_flat, v_flat = qkv_op.grouped_linear(hidden_states.reshape(
+            -1, hidden_states.shape[-1]), [module.q_proj.weight, module.k_proj.weight, module.v_proj.weight], False)
         query_states, gate = torch.chunk(q_out.view(*input_shape, -1, module.head_dim * 2), 2, dim=-1)
     else:
         query_states, gate = torch.chunk(module.q_proj(hidden_states).view(*input_shape, -1, module.head_dim * 2),
@@ -912,27 +910,26 @@ def _paged_decode_attn_forward(self,
     keys = cache._key_views[slot].view(-1, num_kv_heads * head_dim)
     values = cache._value_views[slot].view(-1, num_kv_heads * head_dim)
     out = torch.empty(batch, num_q_heads, head_dim, dtype=hidden_states.dtype, device=hidden_states.device)
-    op.decode_attn_paged(
-        query_states.reshape(batch, num_q_heads, head_dim),
-        keys,
-        values,
-        cache.block_ids,
-        self._ki_write_pos,
-        out,
-        num_q_heads,
-        num_kv_heads,
-        head_dim,
-        self._ki_cos_t.shape[0],
-        cache.block_size,
-        q_norm_w=(1.0 + self.q_norm.weight.detach().float()).contiguous(),
-        cos_t=self._ki_cos_t,
-        sin_t=self._ki_sin_t,
-        gate=gate.reshape(batch, num_q_heads, head_dim),
-        k_raw=k_flat.reshape(batch, num_kv_heads, head_dim),
-        v_raw=v_flat.reshape(batch, num_kv_heads, head_dim),
-        k_norm_w=(1.0 + self.k_norm.weight.detach().float()).contiguous(),
-        eps=self.q_norm.eps,
-        rope_dim=self._ki_cos_t.shape[-1])
+    op.decode_attn_paged(query_states.reshape(batch, num_q_heads, head_dim),
+                         keys,
+                         values,
+                         cache.block_ids,
+                         self._ki_write_pos,
+                         out,
+                         num_q_heads,
+                         num_kv_heads,
+                         head_dim,
+                         self._ki_cos_t.shape[0],
+                         cache.block_size,
+                         q_norm_w=(1.0 + self.q_norm.weight.detach().float()).contiguous(),
+                         cos_t=self._ki_cos_t,
+                         sin_t=self._ki_sin_t,
+                         gate=gate.reshape(batch, num_q_heads, head_dim),
+                         k_raw=k_flat.reshape(batch, num_kv_heads, head_dim),
+                         v_raw=v_flat.reshape(batch, num_kv_heads, head_dim),
+                         k_norm_w=(1.0 + self.k_norm.weight.detach().float()).contiguous(),
+                         eps=self.q_norm.eps,
+                         rope_dim=self._ki_cos_t.shape[-1])
     cache.note_step_written()
     return self.o_proj(out.view(*input_shape, -1)), None
 
