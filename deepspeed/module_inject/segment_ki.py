@@ -955,7 +955,12 @@ def _decode_attn_forward(self,
         self._ki_attn_op.decode_attn(query_states.reshape(batch, num_q_heads, head_dim), key_states, value_states,
                                      self._ki_write_pos, out, num_q_heads, num_kv_heads, head_dim, key_states.shape[2])
 
-    attn_output = out.view(*input_shape, -1)
+    if not fuse_q:
+        # Only the fused-q path applies the sigmoid gate inside the kernel;
+        # the bare call must replay HF's attention epilogue here.
+        attn_output = out.view(*input_shape, -1) * torch.sigmoid(gate.reshape(*input_shape, -1))
+    else:
+        attn_output = out.view(*input_shape, -1)
     return self.o_proj(attn_output), None
 
 

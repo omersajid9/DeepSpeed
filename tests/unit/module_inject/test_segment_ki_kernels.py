@@ -414,12 +414,18 @@ class _CPUFusedAddNormOp:
 
 class _MiniQKNorm(torch.nn.Module):
     """Per-head RMSNorm stand-in: the (weight, eps) surface the fused
-    decode-attention path reads for its 1+w norm scales."""
+    decode-attention path reads for its 1+w norm scales, plus a forward
+    matching Qwen3_5RMSNorm for the bare decode path's eager k_norm."""
 
     def __init__(self, dim, eps=1e-5):
         super().__init__()
         self.weight = torch.nn.Parameter(torch.zeros(dim, dtype=torch.bfloat16))
         self.eps = eps
+
+    def forward(self, x):
+        h = x.float()
+        normed = h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + self.eps)
+        return (normed * (1.0 + self.weight.float())).type_as(x)
 
 
 class _RecordingAttnOp:
@@ -431,6 +437,20 @@ class _RecordingAttnOp:
 
     def decode_attn(self, *args, **kwargs):
         self.calls.append(kwargs)
+
+
+class _SentinelAttnOp:
+    """decode_attn stand-in that writes a fixed value to ``out`` so the
+    caller-side epilogue (the HF sigmoid gate multiply) is observable
+    without running the real kernel."""
+
+    def __init__(self, fill):
+        self.fill = fill
+        self.calls = 0
+
+    def decode_attn(self, q, K, V, wp, out, *args, **kwargs):
+        self.calls += 1
+        out.fill_(self.fill)
 
 
 class _MiniQKNormAttn(torch.nn.Module):
@@ -462,11 +482,16 @@ class _MiniStaticSlot:
 
 class _MiniStaticCache:
     """Just enough of the static-cache surface _decode_attn_forward checks:
-    the _write_position identity gate and _layers[slot].keys/values."""
+    the _write_position identity gate, _layers[slot].keys/values, and
+    update() for the bare (non-fused) decode path's KV write."""
 
     def __init__(self, slots, write_position):
         self._layers = slots
         self._write_position = write_position
+
+    def update(self, key_states, value_states, *args, **kwargs):
+        slot = self._layers[0]
+        return slot.keys, slot.values
 
 
 class TestInjectionInvariants:
@@ -608,6 +633,37 @@ class TestInjectionInvariants:
         # an install-time snapshot would replay the pre-update scale here
         torch.testing.assert_close(call["q_norm_w"], 1.0 + attn.q_norm.weight.float(), atol=1e-7, rtol=0)
         torch.testing.assert_close(call["k_norm_w"], 1.0 + attn.k_norm.weight.float(), atol=1e-7, rtol=0)
+
+    def test_bare_decode_attn_applies_sigmoid_gate(self):
+        """Without RoPE tables the 9-arg decode path runs, and the kernel
+        never sees the attention gate: the forward must replay HF's
+        ``attn_output * sigmoid(gate)`` epilogue itself. The sentinel
+        kernel output makes any dropped gate visible end-to-end (the
+        unfixed path returned the raw o_proj(sentinel) and a real model
+        degenerated to near-uniform logits)."""
+        from deepspeed.module_inject.segment_ki import install_decode_attention
+        torch.manual_seed(0)
+        attn = _MiniQKNormAttn().eval()
+        op = _SentinelAttnOp(0.5)
+        write_pos = torch.tensor([0])
+        assert install_decode_attention(attn, write_pos, op, cos_table=None, sin_table=None) == 1
+        cache = _MiniStaticCache([_MiniStaticSlot(2, 8, 64)], write_pos)
+        hidden = torch.randn(1, 1, 64, dtype=torch.bfloat16)
+        cos = torch.zeros(1, 1, attn.head_dim, dtype=torch.float32)
+        sin = torch.zeros(1, 1, attn.head_dim, dtype=torch.float32)
+
+        with torch.no_grad():
+            out, _ = attn(hidden, (cos, sin), None, cache)
+        assert op.calls == 1
+
+        # independent reference: same projection, sentinel attention
+        # output, HF's gate epilogue, same o_proj
+        with torch.no_grad():
+            query, gate = torch.chunk(attn.q_proj(hidden).view(1, 1, 4, 2 * attn.head_dim), 2, dim=-1)
+            gated = torch.full((1, 1, 4 * attn.head_dim), 0.5, dtype=torch.bfloat16) * \
+                torch.sigmoid(gate).reshape(1, 1, -1)
+            expected = attn.o_proj(gated)
+        torch.testing.assert_close(out.float(), expected.float(), atol=1e-2, rtol=1e-2)
 
 
 # ---------------------------------------------------------------------------
