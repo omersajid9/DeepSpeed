@@ -234,8 +234,13 @@ Verification status:
   dispatch and fallback contracts pinned with stubs
   (`tests/unit/module_inject/test_segment_ki_paged_decode.py`); full rollout +
   module_inject suite green (332 passed, 57 skipped).
-- **Compile**: the extension builds with the toolkit's nvcc on a GPU-less box;
-  dense-kernel register counts compared against the pre-refactor build.
+- **Compile**: the extension builds with the toolkit's nvcc (13.2, sm_90) on a
+  GPU-less box and exposes `decode_attn_paged`. ptxas register counts (no
+  spills; dense before → after, paged after): dim 64 `32 → 40` / `40`,
+  dim 128 `60 → 62` / `56`, dim 256 `88 → 90` / `86`. At dim 64 the dense
+  kernel trades one of four resident blocks per SM for the policy plumbing;
+  dim 128 keeps two blocks and dim 256 one, so the served head dimensions
+  keep their occupancy.
 - **GPU (pending a free node)**: kernel vs reference at block boundaries for
   head_dim 64/128/256, bare and fused; then the b=4 3072→1024 bench
   (`--use-paged-cache --enable-paged-prefill --use-segki --segki-paged-decode`)
