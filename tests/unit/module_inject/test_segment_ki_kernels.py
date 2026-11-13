@@ -18,6 +18,7 @@ Three groups:
 """
 
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -411,6 +412,63 @@ class _CPUFusedAddNormOp:
         return (combined * rms * weight.float()).to(hidden.dtype)
 
 
+class _MiniQKNorm(torch.nn.Module):
+    """Per-head RMSNorm stand-in: the (weight, eps) surface the fused
+    decode-attention path reads for its 1+w norm scales."""
+
+    def __init__(self, dim, eps=1e-5):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.zeros(dim, dtype=torch.bfloat16))
+        self.eps = eps
+
+
+class _RecordingAttnOp:
+    """Stands in for the fused_glu op's decode_attn entry: records the
+    norm-scale kwargs it is handed, performs no attention."""
+
+    def __init__(self):
+        self.calls = []
+
+    def decode_attn(self, *args, **kwargs):
+        self.calls.append(kwargs)
+
+
+class _MiniQKNormAttn(torch.nn.Module):
+    """Qwen3.5-style full-attention block skeleton that
+    install_decode_attention's structural selector matches: 2x-wide
+    query|gate q_proj, k/v projections, per-head q/k norms, config and
+    layer_idx for the layer_types cross-check."""
+
+    def __init__(self, num_q_heads=4, num_kv_heads=2, head_dim=64, hidden=64):
+        super().__init__()
+        self.head_dim = head_dim
+        self.layer_idx = 0
+        self.q_proj = torch.nn.Linear(hidden, 2 * num_q_heads * head_dim, bias=False, dtype=torch.bfloat16)
+        self.k_proj = torch.nn.Linear(hidden, num_kv_heads * head_dim, bias=False, dtype=torch.bfloat16)
+        self.v_proj = torch.nn.Linear(hidden, num_kv_heads * head_dim, bias=False, dtype=torch.bfloat16)
+        self.o_proj = torch.nn.Linear(num_q_heads * head_dim, hidden, bias=False, dtype=torch.bfloat16)
+        self.q_norm = _MiniQKNorm(head_dim)
+        self.k_norm = _MiniQKNorm(head_dim)
+        self.config = SimpleNamespace(layer_types=["full_attention"])
+
+
+class _MiniStaticSlot:
+
+    def __init__(self, kv_heads, max_len, head_dim):
+        shape = (1, kv_heads, max_len, head_dim)
+        self.keys = torch.zeros(shape, dtype=torch.bfloat16)
+        self.values = torch.zeros(shape, dtype=torch.bfloat16)
+
+
+class _MiniStaticCache:
+    """Just enough of the static-cache surface _decode_attn_forward checks:
+    the _write_position identity gate and _layers[slot].keys/values."""
+
+    def __init__(self, slots, write_position):
+        self._layers = slots
+        self._write_position = write_position
+
+
 class TestInjectionInvariants:
 
     def test_apply_and_forward_equivalence(self):
@@ -518,6 +576,38 @@ class TestInjectionInvariants:
         # output (an install-time scale snapshot would replay out_before)
         assert not torch.equal(out_after, out_before), \
             "fused-norm output ignored the post-step weight update"
+
+    def test_decode_attn_norms_track_live_parameters(self):
+        """The fused decode-attention forward must hand the kernel the live
+        1+q_norm/k_norm scale on every call. install_decode_attention used to
+        snapshot (1+w).detach() at install time, so after an in-place weight
+        update the kernel would keep normalizing with the stale scale; the
+        wrapper now rebuilds the scale from the Parameters each forward."""
+        from deepspeed.module_inject.segment_ki import install_decode_attention
+        torch.manual_seed(0)
+        attn = _MiniQKNormAttn().eval()
+        op = _RecordingAttnOp()
+        write_pos = torch.tensor([0])
+        cos = torch.zeros(4, attn.head_dim, dtype=torch.float32)
+        sin = torch.zeros(4, attn.head_dim, dtype=torch.float32)
+        assert install_decode_attention(attn, write_pos, op, cos_table=cos, sin_table=sin) == 1
+        cache = _MiniStaticCache([_MiniStaticSlot(2, 8, 64)], write_pos)
+        hidden = torch.randn(1, 1, 64, dtype=torch.bfloat16)
+
+        with torch.no_grad():
+            attn(hidden, None, None, cache)
+        call = op.calls[-1]
+        torch.testing.assert_close(call["q_norm_w"], 1.0 + attn.q_norm.weight.float(), atol=1e-7, rtol=0)
+        torch.testing.assert_close(call["k_norm_w"], 1.0 + attn.k_norm.weight.float(), atol=1e-7, rtol=0)
+
+        with torch.no_grad():
+            attn.q_norm.weight.add_(0.25)
+            attn.k_norm.weight.add_(0.5)
+            attn(hidden, None, None, cache)
+        call = op.calls[-1]
+        # an install-time snapshot would replay the pre-update scale here
+        torch.testing.assert_close(call["q_norm_w"], 1.0 + attn.q_norm.weight.float(), atol=1e-7, rtol=0)
+        torch.testing.assert_close(call["k_norm_w"], 1.0 + attn.k_norm.weight.float(), atol=1e-7, rtol=0)
 
 
 # ---------------------------------------------------------------------------
