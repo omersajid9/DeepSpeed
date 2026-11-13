@@ -298,12 +298,16 @@ def test_gdn_pool_adopts_prefill_shapes_and_stays_zeroed():
     slot = DSStaticGDNSlot(max_cache_len=8)
     slot.adopt_gdn_pool(hf_slot, max_batch_size=4)
     slot.adopt_gdn_pool(hf_slot, max_batch_size=99)  # idempotent
+    slot.set_active_width(4)
 
     assert slot.conv_states[0].shape == (4, 5, 4)
     assert slot.recurrent_states[0].shape == (4, 2, 3)
     assert slot.conv_states[0].abs().sum().item() == 0
     assert slot.has_previous_state[0] is False
     assert slot.is_initialized is True
+    # Pooled state is always the live decode state, so the layer-level flag
+    # the fused GDN kernels check must stay off.
+    assert slot.record_past is False
     # float32: 4 x 5 x 4 + 4 x 2 x 3 elements
     assert slot.memory_bytes() == (4 * 5 * 4 + 4 * 2 * 3) * 4
 
@@ -314,6 +318,7 @@ def test_gdn_pool_copies_prefill_state_into_target_row():
     slot = cache.layers[0]
     slot.adopt_gdn_pool(hf_slot, max_batch_size=4)
     slot.copy_state_from(hf_slot, 0, 1)
+    slot.set_active_width(4)
 
     assert torch.equal(slot.conv_states[0][1], hf_slot.conv_states[0][0])
     assert torch.equal(slot.recurrent_states[0][1], hf_slot.recurrent_states[0][0])
@@ -353,12 +358,14 @@ def test_gdn_decode_updates_only_active_pool_rows():
 
     conv = cache.get_conv_state(0)
     conv.copy_(torch.full_like(conv, 7.0))  # the in-place update decode performs
-    assert torch.equal(slot.conv_states[0][:2], torch.full((2, 5, 4), 7.0, dtype=torch.float32))
-    assert not torch.equal(slot.conv_states[0][2], torch.full((5, 4), 7.0, dtype=torch.float32))
+    assert torch.equal(cache.get_conv_state(0), torch.full((2, 5, 4), 7.0, dtype=torch.float32))
 
     cache.update_recurrent_state(torch.full((2, 2, 3), 3.0, dtype=torch.float32), layer_idx=0)
-    assert torch.equal(slot.recurrent_states[0][:2], torch.full((2, 2, 3), 3.0, dtype=torch.float32))
-    assert not torch.equal(slot.recurrent_states[0][2], torch.full((2, 3), 3.0, dtype=torch.float32))
+    assert torch.equal(cache.get_recurrent_state(0), torch.full((2, 2, 3), 3.0, dtype=torch.float32))
+    # the retired third row must not pick up the active rows' state
+    cache.set_active_width(3)
+    assert not torch.equal(cache.get_conv_state(0)[2], torch.full((5, 4), 7.0, dtype=torch.float32))
+    assert not torch.equal(cache.get_recurrent_state(0)[2], torch.full((2, 3), 3.0, dtype=torch.float32))
     assert cache.is_recording_past(0) is False
 
 
@@ -376,6 +383,7 @@ def test_hybrid_cache_compact_moves_gdn_pool_rows_with_kv_rows():
         slot.copy_state_from(hf_slot, row, row)
 
     cache.compact(torch.tensor([2, 0], dtype=torch.long))
+    cache.set_active_width(2)
 
     # KV and GDN rows move identically; the retired tail is cleared.
     assert kv.keys[:2, 0, 0, 0].tolist() == [30.0, 10.0]
@@ -383,6 +391,7 @@ def test_hybrid_cache_compact_moves_gdn_pool_rows_with_kv_rows():
     assert torch.equal(slot.conv_states[0][1], hf_slot.conv_states[0][0])
     assert torch.equal(slot.recurrent_states[0][0], hf_slot.recurrent_states[0][2])
     assert torch.equal(slot.recurrent_states[0][1], hf_slot.recurrent_states[0][0])
+    cache.set_active_width(3)
     assert slot.conv_states[0][2].abs().sum().item() == 0
     assert slot.recurrent_states[0][2].abs().sum().item() == 0
 
@@ -397,10 +406,12 @@ def test_hybrid_cache_reset_clears_gdn_pool():
 
     cache.reset()
 
+    # widening again after the reset exposes the zeroed pool storage
+    slot.set_active_width(2)
     assert slot.conv_states[0].abs().sum().item() == 0
     assert slot.recurrent_states[0].abs().sum().item() == 0
     assert slot.has_previous_state[0] is False
-    assert slot.active_width() == 0
+    assert slot.active_width() == 2
     assert cache.get_conv_state(0) is None
 
 
@@ -413,6 +424,7 @@ def test_hybrid_cache_trim_left_leaves_gdn_pool_untouched():
     slot = cache.layers[0]
     slot.adopt_gdn_pool(_fake_hf_gdn_slot(1), max_batch_size=1)
     slot.copy_state_from(_fake_hf_gdn_slot(1), 0, 0)
+    slot.set_active_width(1)
     conv_before = slot.conv_states[0].clone()
     rec_before = slot.recurrent_states[0].clone()
 

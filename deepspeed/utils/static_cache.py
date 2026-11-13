@@ -268,27 +268,29 @@ class DSStaticGDNSlot:
             raise ValueError("cannot pool a GDN layer whose prefill cache holds no conv state")
         rec_state = hf_slot.recurrent_states[0]
         device, dtype = conv_state.device, conv_state.dtype
-        self.conv_states = {0: torch.zeros((max_batch_size, *conv_state.shape[1:]), dtype=dtype, device=device)}
-        self.recurrent_states = {
-            0:
-            torch.zeros((max_batch_size, *rec_state.shape[1:]), dtype=rec_state.dtype, device=rec_state.device)
-            if rec_state is not None else None
-        }
-        torch._dynamo.mark_static_address(self.conv_states[0])
-        if self.recurrent_states[0] is not None:
-            torch._dynamo.mark_static_address(self.recurrent_states[0])
+        self._pool_conv = torch.zeros((max_batch_size, *conv_state.shape[1:]), dtype=dtype, device=device)
+        self._pool_rec = (torch.zeros(
+            (max_batch_size,
+             *rec_state.shape[1:]), dtype=rec_state.dtype, device=rec_state.device) if rec_state is not None else None)
+        torch._dynamo.mark_static_address(self._pool_conv)
+        if self._pool_rec is not None:
+            torch._dynamo.mark_static_address(self._pool_rec)
         self._owns_pool = True
         self._pool_batch_size = max_batch_size
         self._active_width = 0
         self.has_previous_state = {0: False}
+        # Pooled state is always the live decode state: the model's GDN layers
+        # must take the fused per-token update path, never the record-the-past
+        # chunked-prefill branch, so the layer-level flag stays False.
+        self.record_past = False
 
     def copy_state_from(self, hf_slot, source_row: int, target_row: int) -> None:
         """Move one row's prefilled conv/recurrent state into the pool."""
         if not self._owns_pool:
             raise ValueError("GDN state pools must be adopted before copying rows")
-        self.conv_states[0][target_row].copy_(hf_slot.conv_states[0][source_row])
-        if self.recurrent_states[0] is not None:
-            self.recurrent_states[0][target_row].copy_(hf_slot.recurrent_states[0][source_row])
+        self._pool_conv[target_row].copy_(hf_slot.conv_states[0][source_row])
+        if self._pool_rec is not None:
+            self._pool_rec[target_row].copy_(hf_slot.recurrent_states[0][source_row])
         self.has_previous_state[0] = True
 
     def compact_rows(self, active_indices: torch.Tensor) -> None:
@@ -298,11 +300,11 @@ class DSStaticGDNSlot:
         count = active_indices.numel()
         identity = torch.arange(count, device=active_indices.device, dtype=active_indices.dtype)
         if count and not torch.equal(active_indices, identity):
-            for states in (self.conv_states[0], self.recurrent_states[0]):
+            for states in (self._pool_conv, self._pool_rec):
                 if states is not None:
                     states[:count].copy_(states.index_select(0, active_indices).clone())
         if count < self._pool_batch_size:
-            for states in (self.conv_states[0], self.recurrent_states[0]):
+            for states in (self._pool_conv, self._pool_rec):
                 if states is not None:
                     states[count:].zero_()
 
@@ -323,11 +325,33 @@ class DSStaticGDNSlot:
         slot = self._slot
         return bool(getattr(slot, "is_initialized", False)) if slot is not None else False
 
+    @property
+    def conv_states(self):
+        # Pooled mode serves the active prefix so the model's in-place
+        # decode updates (conv_state.copy_) land on the active pool rows
+        # only; bound mode forwards the HF slot's own dict.
+        if self._owns_pool:
+            return {0: self._pool_conv[:self._active_width]}
+        slot = object.__getattribute__(self, "_slot")
+        if slot is None:
+            raise AttributeError("DSStaticGDNSlot not bound: conv_states")
+        return slot.conv_states
+
+    @property
+    def recurrent_states(self):
+        if self._owns_pool:
+            return {0: self._pool_rec[:self._active_width] if self._pool_rec is not None else None}
+        slot = object.__getattribute__(self, "_slot")
+        if slot is None:
+            raise AttributeError("DSStaticGDNSlot not bound: recurrent_states")
+        return slot.recurrent_states
+
     def memory_bytes(self) -> int:
         if self._owns_pool:
-            total = self.conv_states[0].nbytes
-            rec = self.recurrent_states[0]
-            return total + rec.nbytes if rec is not None else total
+            total = self._pool_conv.nbytes
+            if self._pool_rec is not None:
+                total += self._pool_rec.nbytes
+            return total
         # Bound mode: the state tensors belong to the prefill cache's slot,
         # which already accounts for them.
         return 0
@@ -346,9 +370,9 @@ class DSStaticGDNSlot:
 
     def reset(self) -> None:
         if self._owns_pool:
-            self.conv_states[0].zero_()
-            if self.recurrent_states[0] is not None:
-                self.recurrent_states[0].zero_()
+            self._pool_conv.zero_()
+            if self._pool_rec is not None:
+                self._pool_rec.zero_()
             self.has_previous_state[0] = False
             self._active_width = 0
         elif self._slot is not None:
@@ -449,7 +473,7 @@ class DeepSpeedStaticCache:
         if not kv_layers and not gdn_layers:
             return
         max_batch_size = kv_layers[0].max_batch_size if kv_layers else gdn_layers[0]._pool_batch_size
-        device = kv_layers[0].keys.device if kv_layers else gdn_layers[0].conv_states[0].device
+        device = kv_layers[0].keys.device if kv_layers else gdn_layers[0]._pool_conv.device
         active_indices = active_indices.to(device=device, dtype=torch.long)
         if active_indices.numel() > max_batch_size:
             raise ValueError("active_indices exceeds the cache batch size")
@@ -557,7 +581,7 @@ class DeepSpeedStaticCache:
     def update_recurrent_state(self, recurrent_state, layer_idx: int = 0, state_idx: int = 0):
         layer = self._layers[layer_idx]
         if isinstance(layer, DSStaticGDNSlot) and layer._owns_pool:
-            states = layer.recurrent_states[0]
+            states = layer._pool_rec
             if states is not None:
                 states[:layer.active_width()].copy_(recurrent_state)
             layer.has_previous_state[0] = True
@@ -567,7 +591,7 @@ class DeepSpeedStaticCache:
     def update_conv_state(self, conv_state, layer_idx: int = 0, **kwargs):
         layer = self._layers[layer_idx]
         if isinstance(layer, DSStaticGDNSlot) and layer._owns_pool:
-            states = layer.conv_states[0]
+            states = layer._pool_conv
             states[:layer.active_width()].copy_(conv_state[..., -states.shape[-1]:])
             layer.has_previous_state[0] = True
             return states[:layer.active_width()]
@@ -584,7 +608,7 @@ class DeepSpeedStaticCache:
         if isinstance(layer, DSStaticGDNSlot) and layer._owns_pool:
             if not layer.has_previous_state[state_idx]:
                 return None
-            return layer.conv_states[state_idx][:layer.active_width()]
+            return layer._pool_conv[:layer.active_width()]
         return layer.conv_states[state_idx]
 
     def get_recurrent_state(self, layer_idx: int, state_idx: int = 0):
@@ -592,7 +616,7 @@ class DeepSpeedStaticCache:
         if isinstance(layer, DSStaticGDNSlot) and layer._owns_pool:
             if not layer.has_previous_state[state_idx]:
                 return None
-            states = layer.recurrent_states[state_idx]
+            states = layer._pool_rec
             return None if states is None else states[:layer.active_width()]
         return layer.recurrent_states[state_idx]
 
