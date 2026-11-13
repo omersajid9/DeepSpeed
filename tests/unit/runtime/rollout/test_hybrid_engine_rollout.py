@@ -1199,7 +1199,7 @@ class TestZero3SynchronizedEarlyStop(DistributedTest):
         from transformers import Qwen2Config, Qwen2ForCausalLM
 
         rank = dist.get_rank()
-        device = torch.device(f"cuda:{rank}")
+        device = torch.device(get_accelerator().current_device_name())
         model = Qwen2ForCausalLM(
             Qwen2Config(
                 vocab_size=32,
@@ -2156,8 +2156,14 @@ class _ReplayedForward:
 def _replaying_graph_accelerator(mock_get_accelerator, captures):
     """Accelerator mock whose replays run the forward again, recording every capture."""
 
-    def fake_capture(module, cache, static_input, static_attention, static_write_positions, static_cache_position,
-                     static_position_ids, logits_kwargs=None):
+    def fake_capture(module,
+                     cache,
+                     static_input,
+                     static_attention,
+                     static_write_positions,
+                     static_cache_position,
+                     static_position_ids,
+                     logits_kwargs=None):
         graph = _ReplayedForward(module, cache, static_input, static_attention, static_write_positions,
                                  static_cache_position, static_position_ids, logits_kwargs or {})
         captures.append(graph)
@@ -2289,6 +2295,8 @@ def test_static_eager_chunked_prefill_matches_naive_generate():
     assert plain_widths[0] == 8
     assert chunked_output.input_ids.tolist() == plain_output.input_ids.tolist()
     assert chunked_output.attention_mask.tolist() == plain_output.attention_mask.tolist()
+
+
 def test_chunked_prefill_survives_row_compaction_while_staging():
     """Rows retiring under a staged prompt must not drag its staged slot out from under it.
 
@@ -2568,6 +2576,8 @@ def test_sampling_path_pads_after_eos_and_zeroes_retired_logprobs():
     assert output.input_ids[:, 3:].tolist() == [[5, 2, 1, 1]]
     assert output.attention_mask[:, 3:].tolist() == [[1, 1, 0, 0]]
     assert output.response_logprobs[:, 2:].tolist() == [[0.0, 0.0]]
+
+
 # -- sampling on the captured forward ------------------------------------
 
 
