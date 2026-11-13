@@ -39,6 +39,12 @@ class _PagedLayer:
         self.keys = keys
         self.values = values
 
+    @property
+    def is_initialized(self) -> bool:
+        # The blocked pool is allocated with the cache; there is no
+        # lazy-allocation step the graph capture would have to trigger.
+        return True
+
 
 class PagedAttentionCache:
     """Blocked KV cache with a device-resident block table per row.
