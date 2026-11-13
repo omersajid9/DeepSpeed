@@ -87,17 +87,18 @@ def paged_kv_slot(block_table, row, pos, block_size):
     return int(block_table[row, int(pos) // block_size])
 
 
-def write_paged_kv(K_pool, V_pool, block_table, pos, block_size, k, v):
+def write_paged_kv(K_pool, V_pool, block_table, pos, block_size, k, v, row=0):
     """Store one token's post-norm/post-RoPE K/V into the block pool in place.
 
     K_pool, V_pool: [num_slots, num_kv_heads, head_dim]
-    k, v: [num_kv_heads, head_dim] (or [1, num_kv_heads, head_dim]) for a single row
+    k, v: [num_kv_heads, head_dim] (or [1, num_kv_heads, head_dim]) for one row
     pos: the token's position within the row (int)
+    row: the pool row whose page table resolves ``pos``
     Returns the physical slot written.
     """
     k = k.reshape(k.shape[-2], k.shape[-1])
     v = v.reshape(v.shape[-2], v.shape[-1])
-    slot = paged_kv_slot(block_table, 0, pos, block_size) * block_size + int(pos) % block_size
+    slot = paged_kv_slot(block_table, row, pos, block_size) * block_size + int(pos) % block_size
     K_pool[slot].copy_(k)
     V_pool[slot].copy_(v)
     return slot
@@ -137,6 +138,46 @@ def decode_attn_paged(q, K_pool, V_pool, block_table, pos, block_size):
     return out.to(q.dtype)
 
 
+def qwen3_5_norm_rope(q_raw, k_raw, q_norm_w, k_norm_w, cos, sin, eps):
+    """Per-head (1+w) RMSNorm plus partial rotate-half RoPE on projected q/k.
+
+    q_raw/k_raw: [..., heads, head_dim] pre-norm projections.
+    q_norm_w/k_norm_w: [head_dim] HF weights (the kernel multiplies by 1 + w).
+    cos/sin: [..., rope_dim] tables at the rows' positions.
+    Returns (q, k) post-norm/post-RoPE — the fused kernel's q-side/k-side
+    contract, shared by the dense and paged references.
+    """
+    head_dim = q_raw.shape[-1]
+    rope_dim = cos.shape[-1]
+
+    def rms_norm(x, weight):
+        xf = x.float()
+        xf = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)
+        return (xf * (1.0 + weight.float())).to(x.dtype)
+
+    query = rms_norm(q_raw, q_norm_w)
+    key = rms_norm(k_raw, k_norm_w)
+    if rope_dim < head_dim:
+        q_rot, q_pass = query[..., :rope_dim], query[..., rope_dim:]
+        k_rot, k_pass = key[..., :rope_dim], key[..., rope_dim:]
+    else:
+        q_rot, k_rot = query, key
+        q_pass = k_pass = None
+    half = rope_dim // 2
+    c1, c2 = cos[..., :half].unsqueeze(-2), cos[..., half:].unsqueeze(-2)
+    s1, s2 = sin[..., :half].unsqueeze(-2), sin[..., half:].unsqueeze(-2)
+    q1, q2 = q_rot[..., :half], q_rot[..., half:]
+    k1, k2 = k_rot[..., :half], k_rot[..., half:]
+    q_rot = torch.cat([q1 * c1 - q2 * s1, q2 * c2 + q1 * s2], dim=-1)
+    k_rot = torch.cat([k1 * c1 - k2 * s1, k2 * c2 + k1 * s2], dim=-1)
+    if q_pass is not None:
+        query = torch.cat([q_rot, q_pass], dim=-1)
+        key = torch.cat([k_rot, k_pass], dim=-1)
+    else:
+        query, key = q_rot, k_rot
+    return query, key
+
+
 def qwen3_5_fused_prologue(hidden, q_proj_w, k_proj_w, v_proj_w, q_norm_w, k_norm_w, cos, sin, head_dim, eps):
     """The fused decode_attn prologue: q|gate split, per-head q/k RMSNorm, partial RoPE.
 
@@ -155,34 +196,7 @@ def qwen3_5_fused_prologue(hidden, q_proj_w, k_proj_w, v_proj_w, q_norm_w, k_nor
     query, gate = qg[..., :head_dim], qg[..., head_dim:]
     key = F.linear(hidden, k_proj_w).view(batch, num_kv_heads, head_dim)
     value = F.linear(hidden, v_proj_w).view(batch, num_kv_heads, head_dim)
-
-    def rms_norm(x, weight):
-        xf = x.float()
-        xf = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)
-        return (xf * (1.0 + weight.float())).to(x.dtype)
-
-    query = rms_norm(query, q_norm_w)
-    key = rms_norm(key, k_norm_w)
-    # HF partial RoPE: rotate_half over the first rope_dim dimensions, the rest passes through.
-    rope_dim = cos.shape[-1]
-    if rope_dim < head_dim:
-        q_rot, q_pass = query[..., :rope_dim], query[..., rope_dim:]
-        k_rot, k_pass = key[..., :rope_dim], key[..., rope_dim:]
-    else:
-        q_rot, k_rot = query, key
-        q_pass = k_pass = None
-    half = rope_dim // 2
-    c1, c2 = cos[..., :half].unsqueeze(1), cos[..., half:].unsqueeze(1)
-    s1, s2 = sin[..., :half].unsqueeze(1), sin[..., half:].unsqueeze(1)
-    q1, q2 = q_rot[..., :half], q_rot[..., half:]
-    k1, k2 = k_rot[..., :half], k_rot[..., half:]
-    q_rot = torch.cat([q1 * c1 - q2 * s1, q2 * c2 + q1 * s2], dim=-1)
-    k_rot = torch.cat([k1 * c1 - k2 * s1, k2 * c2 + k1 * s2], dim=-1)
-    if q_pass is not None:
-        query = torch.cat([q_rot, q_pass], dim=-1)
-        key = torch.cat([k_rot, k_pass], dim=-1)
-    else:
-        query, key = q_rot, k_rot
+    query, key = qwen3_5_norm_rope(query, key, q_norm_w, k_norm_w, cos, sin, eps)
     return query, gate, key, value
 
 

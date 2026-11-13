@@ -98,28 +98,34 @@ def test_paged_reference_matches_dense_reference(block_size):
     torch.testing.assert_close(paged, dense, atol=1e-6, rtol=1e-6)
 
 
+def _tiny_qwen3_5_config():
+    """A two-layer hybrid text config (one full-attention layer) at toy widths."""
+    from transformers import Qwen3_5TextConfig
+
+    return Qwen3_5TextConfig(hidden_size=64,
+                             intermediate_size=128,
+                             num_attention_heads=4,
+                             num_key_value_heads=2,
+                             head_dim=64,
+                             num_hidden_layers=2,
+                             layer_types=["full_attention", "linear_attention"],
+                             partial_rotary_factor=0.25,
+                             rope_theta=10000.0,
+                             vocab_size=128,
+                             linear_num_value_heads=4,
+                             linear_num_key_heads=2,
+                             linear_key_head_dim=32,
+                             linear_value_head_dim=32,
+                             linear_conv_kernel_dim=4)
+
+
 def test_fused_prologue_matches_hf_attention():
     """The fused prologue replays HF's q|gate split, per-head norms and partial RoPE."""
-    from transformers import Qwen3_5TextConfig
     from transformers.models.qwen3_5.modeling_qwen3_5 import (Qwen3_5Attention, Qwen3_5TextRotaryEmbedding,
                                                               apply_rotary_pos_emb)
 
     torch.manual_seed(0)
-    cfg = Qwen3_5TextConfig(hidden_size=64,
-                            intermediate_size=128,
-                            num_attention_heads=4,
-                            num_key_value_heads=2,
-                            head_dim=64,
-                            num_hidden_layers=2,
-                            layer_types=["full_attention", "linear_attention"],
-                            partial_rotary_factor=0.25,
-                            rope_theta=10000.0,
-                            vocab_size=128,
-                            linear_num_value_heads=4,
-                            linear_num_key_heads=2,
-                            linear_key_head_dim=32,
-                            linear_value_head_dim=32,
-                            linear_conv_kernel_dim=4)
+    cfg = _tiny_qwen3_5_config()
     attn = Qwen3_5Attention(cfg, layer_idx=0).eval()
     positions = torch.tensor([3, 7], dtype=torch.long)
     hidden = torch.randn(2, 1, cfg.hidden_size)
@@ -140,6 +146,147 @@ def test_fused_prologue_matches_hf_attention():
     torch.testing.assert_close(k, k_hf[:, 0], atol=1e-5, rtol=1e-5)
     torch.testing.assert_close(gate, gate_hf[:, 0], atol=1e-5, rtol=1e-5)
     torch.testing.assert_close(v, v_hf[:, 0], atol=1e-5, rtol=1e-5)
+
+
+class _ReferencePagedOp:
+    """CPU stand-in for the CUDA kernel: run the same math through the references.
+
+    The wired forward hands the kernel raw projections plus the norm scales,
+    RoPE tables, page table and write positions; this emulation performs the
+    norm/RoPE, the block-table K/V store, the attention and the sigmoid gate
+    exactly as the reference specifies them.
+    """
+
+    def __init__(self):
+        self.calls = 0
+
+    def decode_attn_paged(self,
+                          q,
+                          k_pool,
+                          v_pool,
+                          block_table,
+                          write_pos,
+                          out,
+                          num_q_heads,
+                          num_kv_heads,
+                          head_dim,
+                          table_len,
+                          block_size,
+                          q_norm_w=None,
+                          cos_t=None,
+                          sin_t=None,
+                          gate=None,
+                          k_raw=None,
+                          v_raw=None,
+                          k_norm_w=None,
+                          eps=1e-6,
+                          rope_dim=0):
+        from deepspeed.module_inject.kernel_reference import qwen3_5_norm_rope
+        self.calls += 1
+        batch = q.shape[0]
+        # the forward passes (1 + w) scales; the reference adds the 1 back
+        q_rope, k_rope = qwen3_5_norm_rope(q.reshape(batch, num_q_heads, head_dim),
+                                           k_raw.reshape(batch, num_kv_heads, head_dim), q_norm_w - 1.0,
+                                           k_norm_w - 1.0, cos_t[write_pos], sin_t[write_pos], eps)
+        pool_k = k_pool.view(-1, num_kv_heads, head_dim)
+        pool_v = v_pool.view(-1, num_kv_heads, head_dim)
+        for row in range(batch):
+            write_paged_kv(pool_k,
+                           pool_v,
+                           block_table,
+                           int(write_pos[row]),
+                           block_size,
+                           k_rope[row],
+                           v_raw[row],
+                           row=row)
+        attn = ref_decode_attn_paged(q_rope, pool_k, pool_v, block_table, write_pos, block_size)
+        out.copy_((attn * torch.sigmoid(gate.float())).to(out.dtype))
+
+
+def test_paged_forward_matches_hf_attention_module():
+    """The wired paged forward reproduces the HF attention module it replaces.
+
+    End-to-end through the module's real weights: projections, (1+w) norms,
+    partial RoPE, the block-table K/V store, attention, sigmoid gate and
+    o_proj, against HF's attention forward over a static cache holding the same
+    prompt.
+    """
+    from transformers import StaticCache
+    from transformers.models.qwen3_5.modeling_qwen3_5 import (Qwen3_5Attention, Qwen3_5TextRotaryEmbedding,
+                                                              apply_rotary_pos_emb)
+
+    torch.manual_seed(0)
+    cfg = _tiny_qwen3_5_config()
+    cfg._attn_implementation = "eager"
+    attn = Qwen3_5Attention(cfg, layer_idx=0).to(torch.bfloat16).eval()
+    rope = Qwen3_5TextRotaryEmbedding(config=cfg)
+    batch, prompt_len, head_dim = 2, 5, cfg.head_dim
+    num_q_heads, num_kv_heads = cfg.num_attention_heads, cfg.num_key_value_heads
+    max_len = prompt_len + 4
+
+    hidden = torch.randn(batch, prompt_len, cfg.hidden_size, dtype=torch.bfloat16)
+    cos_p, sin_p = rope(hidden, torch.arange(prompt_len).unsqueeze(0).expand(batch, -1))
+
+    with torch.no_grad():
+        # prompt K/V through HF's own projections, norms and RoPE, in the
+        # [batch, heads, seq, dim] layout the module's forward uses
+        qg = attn.q_proj(hidden).view(batch, prompt_len, -1, head_dim * 2)
+        q_p, _ = torch.chunk(qg, 2, dim=-1)
+        q_p = attn.q_norm(q_p).transpose(1, 2)
+        k_p = attn.k_norm(attn.k_proj(hidden).view(batch, prompt_len, -1, head_dim)).transpose(1, 2)
+        v_p = attn.v_proj(hidden).view(batch, prompt_len, -1, head_dim).transpose(1, 2)
+        _, k_p = apply_rotary_pos_emb(q_p, k_p, cos_p, sin_p)
+
+        hf_cache = StaticCache(config=cfg, max_cache_len=max_len)
+        hf_cache.update(k_p, v_p, 0)
+
+        hidden_d = torch.randn(batch, 1, cfg.hidden_size, dtype=torch.bfloat16)
+        decode_pos = torch.full((batch, ), prompt_len, dtype=torch.long)
+        cos_d, sin_d = rope(hidden_d, decode_pos.unsqueeze(-1))
+        mask = torch.full((batch, 1, 1, max_len), torch.finfo(torch.bfloat16).min, dtype=torch.bfloat16)
+        mask[..., :prompt_len + 1] = 0.0
+        hf_out, _ = attn(hidden_d,
+                         position_embeddings=(cos_d, sin_d),
+                         attention_mask=mask,
+                         past_key_values=hf_cache,
+                         cache_position=decode_pos)
+
+        # the same decode step through the wired paged forward
+        block_size = 4
+        blocks_per_row = _blocks_for(max_len, block_size)
+        cache = _PoolStub(num_slots=batch * blocks_per_row * block_size,
+                          num_kv_heads=num_kv_heads,
+                          head_dim=head_dim,
+                          block_size=block_size,
+                          blocks_per_row=blocks_per_row,
+                          batch=batch,
+                          dtype=torch.bfloat16)
+        pool_k, pool_v = cache._key_views[0], cache._value_views[0]
+        for row in range(batch):
+            for position in range(prompt_len):
+                write_paged_kv(pool_k,
+                               pool_v,
+                               cache.block_ids,
+                               position,
+                               block_size,
+                               k_p[row, :, position],
+                               v_p[row, :, position],
+                               row=row)
+        all_pos = torch.arange(max_len)
+        cos_all, sin_all = rope(torch.zeros(1, max_len, cfg.hidden_size, dtype=torch.bfloat16), all_pos.unsqueeze(0))
+        cache._write_position = decode_pos
+        attn._ki_attn_op = _ReferencePagedOp()
+        attn._ki_qkv_op = None
+        attn._ki_num_q_heads = num_q_heads
+        attn._ki_num_kv_heads = num_kv_heads
+        attn._ki_cos_t = cos_all[0].float().contiguous()
+        attn._ki_sin_t = sin_all[0].float().contiguous()
+        attn._ki_write_pos = decode_pos
+        attn._ki_orig_attn_forward = lambda *args, **kwargs: pytest.fail("paged fused path must not fall back")
+
+        out, _ = _paged_decode_attn_forward(attn, hidden_d, (cos_d, sin_d), None, cache)
+
+    torch.testing.assert_close(out.float(), hf_out.float(), atol=5e-2, rtol=5e-2)
 
 
 # ---------------------------------------------------------------------------
@@ -167,16 +314,9 @@ def test_paged_decode_kernel_matches_reference(head_dim, num_q_heads, num_kv_hea
     query = torch.randn(batch, num_q_heads, head_dim, dtype=torch.bfloat16, device=DEV)
 
     out = torch.empty(batch, num_q_heads, head_dim, dtype=torch.bfloat16, device=DEV)
-    get_fused_glu_op().decode_attn_paged(query,
-                                         pool_k.view(-1, num_kv_heads * head_dim),
-                                         pool_v.view(-1, num_kv_heads * head_dim),
-                                         table,
-                                         positions,
-                                         out,
-                                         num_q_heads,
-                                         num_kv_heads,
-                                         head_dim,
-                                         block_size)
+    get_fused_glu_op().decode_attn_paged(query, pool_k.view(-1, num_kv_heads * head_dim),
+                                         pool_v.view(-1, num_kv_heads * head_dim), table, positions, out, num_q_heads,
+                                         num_kv_heads, head_dim, block_size)
 
     expected = ref_decode_attn_paged(query.float(), pool_k.float(), pool_v.float(), table, positions, block_size)
     torch.testing.assert_close(out.float(), expected, atol=5e-2, rtol=5e-2)
@@ -215,33 +355,33 @@ def test_paged_decode_kernel_fused_matches_reference():
     v_raw = torch.nn.functional.linear(hidden[:, 0, :], v_w).view(batch, num_kv_heads, head_dim)
 
     out = torch.empty(batch, num_q_heads, head_dim, dtype=torch.bfloat16, device=DEV)
-    get_fused_glu_op().decode_attn_paged(
-        q_flat.view(batch, -1, head_dim * 2)[..., :head_dim].reshape(batch, num_q_heads, head_dim),
-        pool_k.view(-1, num_kv_heads * head_dim),
-        pool_v.view(-1, num_kv_heads * head_dim),
-        table,
-        positions,
-        out,
-        num_q_heads,
-        num_kv_heads,
-        head_dim,
-        length,
-        block_size,
-        q_norm_w=1.0 + q_norm_w,
-        cos_t=cos_t,
-        sin_t=sin_t,
-        gate=gate.reshape(batch, num_q_heads, head_dim),
-        k_raw=k_raw.reshape(batch, num_kv_heads, head_dim),
-        v_raw=v_raw.reshape(batch, num_kv_heads, head_dim),
-        k_norm_w=1.0 + k_norm_w,
-        eps=1e-6,
-        rope_dim=rope_dim)
+    get_fused_glu_op().decode_attn_paged(q_flat.view(batch, -1, head_dim * 2)[..., :head_dim].reshape(
+        batch, num_q_heads, head_dim),
+                                         pool_k.view(-1, num_kv_heads * head_dim),
+                                         pool_v.view(-1, num_kv_heads * head_dim),
+                                         table,
+                                         positions,
+                                         out,
+                                         num_q_heads,
+                                         num_kv_heads,
+                                         head_dim,
+                                         length,
+                                         block_size,
+                                         q_norm_w=1.0 + q_norm_w,
+                                         cos_t=cos_t,
+                                         sin_t=sin_t,
+                                         gate=gate.reshape(batch, num_q_heads, head_dim),
+                                         k_raw=k_raw.reshape(batch, num_kv_heads, head_dim),
+                                         v_raw=v_raw.reshape(batch, num_kv_heads, head_dim),
+                                         k_norm_w=1.0 + k_norm_w,
+                                         eps=1e-6,
+                                         rope_dim=rope_dim)
 
     # reference: prologue -> KV store through the page table -> attention -> gate
     ref_pool_k, ref_pool_v = pool_k.float().clone(), pool_v.float().clone()
-    q_ref, gate_ref, k_ref, v_ref = ref_prologue(hidden[:, 0, :].float(), q_w.float(), k_w.float(), v_w.float(),
-                                                 q_norm_w, k_norm_w, cos_t[positions], sin_t[positions], head_dim,
-                                                 1e-6)
+    q_ref, gate_ref, k_ref, v_ref = ref_prologue(hidden[:,
+                                                        0, :].float(), q_w.float(), k_w.float(), v_w.float(), q_norm_w,
+                                                 k_norm_w, cos_t[positions], sin_t[positions], head_dim, 1e-6)
     for row in range(batch):
         write_paged_kv(ref_pool_k, ref_pool_v, table, int(positions[row]), block_size, k_ref[row], v_ref[row])
     attn = ref_decode_attn_paged(q_ref, ref_pool_k, ref_pool_v, table, positions, block_size)
@@ -253,7 +393,6 @@ def test_paged_decode_kernel_fused_matches_reference():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="paged cache needs a CUDA device")  #ignore-cuda
 def test_fused_kernel_stores_through_the_real_cache_page_table():
     """The fused K/V store lands on the slots the cache's own table names."""
-    from deepspeed.inference.v2.kernels.ragged_ops.blocked_flash.blocked_flash import get_kv_block_size
     from deepspeed.ops.module_inject import get_fused_glu_op
     from deepspeed.runtime.rollout.paged_cache import PagedAttentionCache
 
@@ -279,32 +418,33 @@ def test_fused_kernel_stores_through_the_real_cache_page_table():
     q_flat = torch.nn.functional.linear(hidden[:, 0, :], q_w).view(2, -1, head_dim * 2)
 
     out = torch.empty(2, num_q_heads, head_dim, dtype=torch.bfloat16, device=DEV)
-    get_fused_glu_op().decode_attn_paged(
-        q_flat[..., :head_dim].reshape(2, num_q_heads, head_dim),
-        cache._key_views[0].view(-1, num_kv_heads * head_dim),
-        cache._value_views[0].view(-1, num_kv_heads * head_dim),
-        cache.block_ids,
-        positions,
-        out,
-        num_q_heads,
-        num_kv_heads,
-        head_dim,
-        int(positions.max()) + 1,
-        cache.block_size,
-        q_norm_w=torch.ones(head_dim, dtype=torch.float32, device=DEV),
-        cos_t=cos_t,
-        sin_t=sin_t,
-        gate=q_flat[..., head_dim:].reshape(2, num_q_heads, head_dim),
-        k_raw=torch.nn.functional.linear(hidden[:, 0, :], k_w).view(2, num_kv_heads, head_dim),
-        v_raw=torch.nn.functional.linear(hidden[:, 0, :], v_w).view(2, num_kv_heads, head_dim),
-        k_norm_w=torch.ones(head_dim, dtype=torch.float32, device=DEV),
-        eps=1e-6,
-        rope_dim=rope_dim)
+    get_fused_glu_op().decode_attn_paged(q_flat[..., :head_dim].reshape(2, num_q_heads, head_dim),
+                                         cache._key_views[0].view(-1, num_kv_heads * head_dim),
+                                         cache._value_views[0].view(-1, num_kv_heads * head_dim),
+                                         cache.block_ids,
+                                         positions,
+                                         out,
+                                         num_q_heads,
+                                         num_kv_heads,
+                                         head_dim,
+                                         int(positions.max()) + 1,
+                                         cache.block_size,
+                                         q_norm_w=torch.ones(head_dim, dtype=torch.float32, device=DEV),
+                                         cos_t=cos_t,
+                                         sin_t=sin_t,
+                                         gate=q_flat[..., head_dim:].reshape(2, num_q_heads, head_dim),
+                                         k_raw=torch.nn.functional.linear(hidden[:, 0, :],
+                                                                          k_w).view(2, num_kv_heads, head_dim),
+                                         v_raw=torch.nn.functional.linear(hidden[:, 0, :],
+                                                                          v_w).view(2, num_kv_heads, head_dim),
+                                         k_norm_w=torch.ones(head_dim, dtype=torch.float32, device=DEV),
+                                         eps=1e-6,
+                                         rope_dim=rope_dim)
     cache.note_step_written()
 
     _, _, k_ref, v_ref = ref_prologue(hidden[:, 0, :].float(), q_w.float(), k_w.float(), v_w.float(),
-                                      torch.zeros(head_dim), torch.zeros(head_dim), cos_t[positions],
-                                      sin_t[positions], head_dim, 1e-6)
+                                      torch.zeros(head_dim), torch.zeros(head_dim), cos_t[positions], sin_t[positions],
+                                      head_dim, 1e-6)
     for row in range(2):
         keys, values = cache.materialize(0, row, int(positions[row]) + 1)
         torch.testing.assert_close(keys[:, -1].float(), k_ref[row].float(), atol=5e-2, rtol=5e-2)
@@ -323,12 +463,19 @@ class _PoolStub:
     """The cache surface ``_paged_decode_attn_forward`` reads."""
 
     is_paged_cache = True
-    block_size = 8
 
-    def __init__(self, num_slots, num_kv_heads, head_dim):
-        self.block_ids = torch.zeros(1, 4, dtype=torch.int32)
-        self._key_views = [torch.zeros(num_slots, num_kv_heads, head_dim)]
-        self._value_views = [torch.zeros(num_slots, num_kv_heads, head_dim)]
+    def __init__(self,
+                 num_slots,
+                 num_kv_heads,
+                 head_dim,
+                 block_size=8,
+                 blocks_per_row=4,
+                 batch=1,
+                 dtype=torch.float32):
+        self.block_size = block_size
+        self.block_ids = torch.arange(batch * blocks_per_row, dtype=torch.int32).view(batch, blocks_per_row)
+        self._key_views = [torch.zeros(num_slots, num_kv_heads, head_dim, dtype=dtype)]
+        self._value_views = [torch.zeros(num_slots, num_kv_heads, head_dim, dtype=dtype)]
         self._write_position = None
         self._record_past = False
         self.note_calls = 0
@@ -373,7 +520,11 @@ class _AttnStub:
         self._ki_orig_calls = []
         self._ki_orig_attn_forward = self._orig_forward
 
-    def _orig_forward(self, hidden_states, position_embeddings=None, attention_mask=None, past_key_values=None,
+    def _orig_forward(self,
+                      hidden_states,
+                      position_embeddings=None,
+                      attention_mask=None,
+                      past_key_values=None,
                       **kwargs):
         self._ki_orig_calls.append(hidden_states.shape)
         return torch.zeros_like(hidden_states), None
