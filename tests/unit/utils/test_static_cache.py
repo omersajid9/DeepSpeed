@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from deepspeed.accelerator import get_accelerator
-from deepspeed.utils.static_cache import DeepSpeedStaticCache, DeepSpeedStaticLayer
+from deepspeed.utils.static_cache import DSStaticGDNSlot, DeepSpeedStaticCache, DeepSpeedStaticLayer
 
 
 @pytest.mark.parametrize("position, expected", [(None, 0), (0, 0), (3, 3), ([1, 3, -1], 3)])
@@ -268,3 +268,157 @@ def test_static_cache_memory_skips_layers_without_kv():
 
     # Only layer 0 holds KV: 4 rows x 3 heads x 4 positions x (5 key + 7 value dims) x 2 bytes.
     assert cache.memory_bytes() == 4 * 3 * 4 * (5 + 7) * 2
+
+
+# -- GDN state pool (continuous batching for hybrid models) ---------------
+
+
+def _hybrid_config():
+    return type(
+        "Config", (), {
+            "num_hidden_layers": 2,
+            "num_attention_heads": 1,
+            "hidden_size": 2,
+            "layer_types": ["linear_attention", "full_attention"],
+        })()
+
+
+def _fake_hf_gdn_slot(n_rows, conv_tail=(5, 4), rec_tail=(2, 3)):
+    """A prefill cache's linear-attention slot after one prefill: per-row
+    conv/recurrent states plus the HF has_previous_state flag."""
+    from types import SimpleNamespace
+
+    conv = torch.arange(n_rows * 5 * 4, dtype=torch.float32).reshape(n_rows, *conv_tail)
+    rec = torch.arange(n_rows * 2 * 3, dtype=torch.float32).reshape(n_rows, *rec_tail)
+    return SimpleNamespace(conv_states={0: conv}, recurrent_states={0: rec}, has_previous_state={0: True})
+
+
+def test_gdn_pool_adopts_prefill_shapes_and_stays_zeroed():
+    hf_slot = _fake_hf_gdn_slot(3)
+    slot = DSStaticGDNSlot(max_cache_len=8)
+    slot.adopt_gdn_pool(hf_slot, max_batch_size=4)
+    slot.adopt_gdn_pool(hf_slot, max_batch_size=99)  # idempotent
+
+    assert slot.conv_states[0].shape == (4, 5, 4)
+    assert slot.recurrent_states[0].shape == (4, 2, 3)
+    assert slot.conv_states[0].abs().sum().item() == 0
+    assert slot.has_previous_state[0] is False
+    assert slot.is_initialized is True
+    # float32: 4 x 5 x 4 + 4 x 2 x 3 elements
+    assert slot.memory_bytes() == (4 * 5 * 4 + 4 * 2 * 3) * 4
+
+
+def test_gdn_pool_copies_prefill_state_into_target_row():
+    cache = DeepSpeedStaticCache(_hybrid_config(), batch_size=1, max_cache_len=4, device="cpu", dtype=torch.float32)
+    hf_slot = _fake_hf_gdn_slot(3)
+    slot = cache.layers[0]
+    slot.adopt_gdn_pool(hf_slot, max_batch_size=4)
+    slot.copy_state_from(hf_slot, 0, 1)
+
+    assert torch.equal(slot.conv_states[0][1], hf_slot.conv_states[0][0])
+    assert torch.equal(slot.recurrent_states[0][1], hf_slot.recurrent_states[0][0])
+    assert slot.has_previous_state[0] is True
+    # untouched rows stay zero
+    assert slot.conv_states[0][0].abs().sum().item() == 0
+    assert slot.conv_states[0][2].abs().sum().item() == 0
+
+
+def test_gdn_pool_returns_none_state_until_a_prefill_lands():
+    cache = DeepSpeedStaticCache(_hybrid_config(), batch_size=1, max_cache_len=4, device="cpu", dtype=torch.float32)
+    slot = cache.layers[0]
+    slot.adopt_gdn_pool(_fake_hf_gdn_slot(1), max_batch_size=2)
+
+    assert cache.get_conv_state(0) is None
+    assert cache.get_recurrent_state(0) is None
+    assert cache.has_previous_state(0) is False
+
+    slot.copy_state_from(_fake_hf_gdn_slot(1), 0, 0)
+    cache.set_active_width(1)
+    assert cache.get_conv_state(0) is not None
+    assert cache.get_recurrent_state(0) is not None
+
+
+def test_gdn_decode_updates_only_active_pool_rows():
+    """The model's GDN decode path reads get_conv_state and updates it in
+    place (causal_conv1d_update), then writes the recurrent state through
+    update_recurrent_state - both must land on the active pool prefix only,
+    never on retired or not-yet-prefilled rows."""
+    cache = DeepSpeedStaticCache(_hybrid_config(), batch_size=1, max_cache_len=4, device="cpu", dtype=torch.float32)
+    hf_slot = _fake_hf_gdn_slot(3)
+    slot = cache.layers[0]
+    slot.adopt_gdn_pool(hf_slot, max_batch_size=3)
+    for row in range(3):
+        slot.copy_state_from(hf_slot, row, row)
+    cache.set_active_width(2)
+
+    conv = cache.get_conv_state(0)
+    conv.copy_(torch.full_like(conv, 7.0))  # the in-place update decode performs
+    assert torch.equal(slot.conv_states[0][:2], torch.full((2, 5, 4), 7.0, dtype=torch.float32))
+    assert not torch.equal(slot.conv_states[0][2], torch.full((5, 4), 7.0, dtype=torch.float32))
+
+    cache.update_recurrent_state(torch.full((2, 2, 3), 3.0, dtype=torch.float32), layer_idx=0)
+    assert torch.equal(slot.recurrent_states[0][:2], torch.full((2, 2, 3), 3.0, dtype=torch.float32))
+    assert not torch.equal(slot.recurrent_states[0][2], torch.full((2, 3), 3.0, dtype=torch.float32))
+    assert cache.is_recording_past(0) is False
+
+
+def test_hybrid_cache_compact_moves_gdn_pool_rows_with_kv_rows():
+    cache = DeepSpeedStaticCache(_hybrid_config(), batch_size=3, max_cache_len=4, device="cpu", dtype=torch.float32)
+    cache.set_write_position(torch.tensor([0, 1, 2], dtype=torch.long))
+    kv = cache.layers[1]
+    kv.lazy_initialization(torch.zeros((3, 1, 1, 2)), torch.zeros((3, 1, 1, 2)))
+    kv.keys[:, 0, 0, 0] = torch.tensor([10.0, 20.0, 30.0])
+    kv.values.copy_(kv.keys)
+    hf_slot = _fake_hf_gdn_slot(3)
+    slot = cache.layers[0]
+    slot.adopt_gdn_pool(hf_slot, max_batch_size=3)
+    for row in range(3):
+        slot.copy_state_from(hf_slot, row, row)
+
+    cache.compact(torch.tensor([2, 0], dtype=torch.long))
+
+    # KV and GDN rows move identically; the retired tail is cleared.
+    assert kv.keys[:2, 0, 0, 0].tolist() == [30.0, 10.0]
+    assert torch.equal(slot.conv_states[0][0], hf_slot.conv_states[0][2])
+    assert torch.equal(slot.conv_states[0][1], hf_slot.conv_states[0][0])
+    assert torch.equal(slot.recurrent_states[0][0], hf_slot.recurrent_states[0][2])
+    assert torch.equal(slot.recurrent_states[0][1], hf_slot.recurrent_states[0][0])
+    assert slot.conv_states[0][2].abs().sum().item() == 0
+    assert slot.recurrent_states[0][2].abs().sum().item() == 0
+
+
+def test_hybrid_cache_reset_clears_gdn_pool():
+    cache = DeepSpeedStaticCache(_hybrid_config(), batch_size=1, max_cache_len=4, device="cpu", dtype=torch.float32)
+    hf_slot = _fake_hf_gdn_slot(2)
+    slot = cache.layers[0]
+    slot.adopt_gdn_pool(hf_slot, max_batch_size=2)
+    slot.copy_state_from(hf_slot, 0, 0)
+    cache.set_active_width(2)
+
+    cache.reset()
+
+    assert slot.conv_states[0].abs().sum().item() == 0
+    assert slot.recurrent_states[0].abs().sum().item() == 0
+    assert slot.has_previous_state[0] is False
+    assert slot.active_width() == 0
+    assert cache.get_conv_state(0) is None
+
+
+def test_hybrid_cache_trim_left_leaves_gdn_pool_untouched():
+    cache = DeepSpeedStaticCache(_hybrid_config(), batch_size=1, max_cache_len=4, device="cpu", dtype=torch.float32)
+    kv = cache.layers[1]
+    kv.lazy_initialization(torch.zeros((1, 1, 1, 1)), torch.zeros((1, 1, 1, 1)))
+    kv.keys[0, 0, :, 0] = torch.tensor([0.0, 1.0, 2.0, 3.0])
+    kv.values.copy_(kv.keys)
+    slot = cache.layers[0]
+    slot.adopt_gdn_pool(_fake_hf_gdn_slot(1), max_batch_size=1)
+    slot.copy_state_from(_fake_hf_gdn_slot(1), 0, 0)
+    conv_before = slot.conv_states[0].clone()
+    rec_before = slot.recurrent_states[0].clone()
+
+    cache.trim_left(1)
+
+    # KV shifts; GDN state carries no positions and must stay put.
+    assert kv.keys[0, 0, :, 0].tolist() == [1.0, 2.0, 3.0, 0.0]
+    assert torch.equal(slot.conv_states[0], conv_before)
+    assert torch.equal(slot.recurrent_states[0], rec_before)
