@@ -661,7 +661,7 @@ class HybridEngineRollout(RolloutEngine):
                              "generate() path or upgrade transformers")
 
         from transformers import StaticCache
-        from deepspeed.utils.static_cache import DeepSpeedStaticCache
+        from deepspeed.utils.static_cache import DSStaticGDNSlot, DeepSpeedStaticCache
 
         device = requests[0].prompt_ids.device
         model_dtype = next(module.parameters()).dtype
@@ -778,7 +778,7 @@ class HybridEngineRollout(RolloutEngine):
                     else:
                         moved_bytes = sum((layer.keys[:, :, dead_prefix:, :].numel() * layer.keys.element_size() +
                                            layer.values[:, :, dead_prefix:, :].numel() * layer.values.element_size())
-                                          for layer in cache.layers)
+                                          for layer in cache.layers if not isinstance(layer, DSStaticGDNSlot))
                         moved_bytes += attention_mask[:, dead_prefix:].numel() * attention_mask.element_size()
                     cache.trim_left(dead_prefix)
                     remaining_columns = max_cache_len - dead_prefix
@@ -890,7 +890,16 @@ class HybridEngineRollout(RolloutEngine):
                     model_cache_position = model_positions
                 else:
                     model_input = decode_input
-                    model_attention_mask = attention_mask[:active_count]
+                    if cache.has_gdn_layers:
+                        # Hybrid models take a per-type mask: the GDN layers
+                        # take the position-free None entry, the
+                        # full-attention layers keep the dense row mask.
+                        model_attention_mask = {
+                            "full_attention": attention_mask[:active_count],
+                            "linear_attention": None
+                        }
+                    else:
+                        model_attention_mask = attention_mask[:active_count]
                     if self.align_decode_fronts:
                         model_position_ids = torch.tensor([logical_positions[request_id] for request_id in active_ids],
                                                           dtype=torch.long,
@@ -898,6 +907,7 @@ class HybridEngineRollout(RolloutEngine):
                     else:
                         model_position_ids = attention_mask[:active_count].sum(dim=1, keepdim=True)
                     model_cache_position = decode_cache_position
+                    cache.set_active_width(active_count)
                 decode_start = self._profile_start(profile)
                 output = self._call_model(
                     module,
@@ -1261,6 +1271,7 @@ class HybridEngineRollout(RolloutEngine):
         return output
 
     def _validate_continuous_graph_options(self, prompt_len, sampling):
+        self._validate_hybrid_continuous_options()
         if self.align_decode_fronts:
             raise ValueError("continuous graph capture does not support aligned decode fronts")
         if self.enable_cache_trimming:
@@ -1433,6 +1444,11 @@ class HybridEngineRollout(RolloutEngine):
         if isinstance(cache, PagedAttentionCache):
             cache.set_graph_mode(bucket.width)
             return {"full_attention": None, "sliding_attention": None}
+        if getattr(cache, "has_gdn_layers", False):
+            # Hybrid static decode passes a dict too: the GDN layers take the
+            # position-free None entry, the full-attention layers the dense
+            # bucket mask.
+            return {"full_attention": bucket.causal_attention, "linear_attention": None}
         return bucket.causal_attention
 
     def _capture_bucket(self, module, cache, bucket, cache_position, write_position, fi_positions=None):
@@ -1448,6 +1464,7 @@ class HybridEngineRollout(RolloutEngine):
                 cache.set_write_position(self._continuous_graph_state.static_write_positions)
             else:
                 cache.set_write_position(write_position)
+                cache.set_active_width(bucket.width)
             attention_mask = self._bucket_attention_mask(cache, bucket)
             if is_paged:
                 self._paged_decode_step(cache, fi_positions)
@@ -1479,6 +1496,7 @@ class HybridEngineRollout(RolloutEngine):
             cache.set_write_position(self._continuous_graph_state.static_write_positions)
         else:
             cache.set_write_position(write_position)
+            cache.set_active_width(bucket.width)
         output = self._call_model(
             module,
             bucket.input_ids,
@@ -1605,6 +1623,20 @@ class HybridEngineRollout(RolloutEngine):
 
         return max_cache_len
 
+    def _validate_hybrid_continuous_options(self):
+        """Hybrid models keep per-row GDN state in the static cache's state
+        pools; only the static-cache continuous path scatters and compacts
+        those rows, so paged and chunked-prefill runs fail up front with a
+        clear message instead of crashing mid-decode."""
+        config = getattr(self.engine.module, "config", None)
+        text_config = getattr(config, "text_config", config)
+        if "linear_attention" not in (getattr(text_config, "layer_types", None) or []):
+            return
+        if self.use_paged_cache:
+            raise ValueError("paged cache does not yet support hybrid models with linear-attention layers")
+        if self.enable_chunked_prefill:
+            raise ValueError("chunked prefill does not yet support hybrid models with linear-attention layers")
+
     def _validate_continuous_inputs(self, requests, sampling, max_batch_size):
         if not requests:
             raise ValueError("continuous batching requires at least one request")
@@ -1621,14 +1653,7 @@ class HybridEngineRollout(RolloutEngine):
                 raise ValueError("paged cache does not support aligned decode fronts yet")
             if self.enable_cache_trimming:
                 raise ValueError("paged cache only supports block-aligned trimming")
-        # Hybrid models: GDN layers keep per-row conv/recurrent state that
-        # the continuous-batching cache does not yet scatter or compact, so
-        # a run would crash on an unbound pass-through slot mid-decode. Fail
-        # with a clear message up front instead.
-        config = getattr(self.engine.module, "config", None)
-        text_config = getattr(config, "text_config", config)
-        if "linear_attention" in (getattr(text_config, "layer_types", None) or []):
-            raise ValueError("continuous batching does not yet support hybrid models with linear-attention layers")
+        self._validate_hybrid_continuous_options()
 
         prompt_len = requests[0].prompt_ids.shape[1]
         device = requests[0].prompt_ids.device
@@ -1682,6 +1707,8 @@ class HybridEngineRollout(RolloutEngine):
         """
         if not update.admitted:
             return {}, None
+
+        from deepspeed.utils.static_cache import DSStaticGDNSlot
 
         if self.use_paged_cache and self.enable_paged_prefill:
             if target_slots is None:
@@ -1752,6 +1779,15 @@ class HybridEngineRollout(RolloutEngine):
                     write_positions[target_row] = valid_len
             else:
                 for layer_idx in range(self._cache_layer_count(prefill_cache)):
+                    target_layer = cache.layers[layer_idx]
+                    if isinstance(target_layer, DSStaticGDNSlot):
+                        # GDN layers carry no KV: move each admitted row's
+                        # prefilled conv/recurrent state into the pool.
+                        hf_slot = prefill_cache.layers[layer_idx]
+                        target_layer.adopt_gdn_pool(hf_slot, attention_mask.shape[0])
+                        for source_row, target_row in enumerate(target_slots):
+                            target_layer.copy_state_from(hf_slot, source_row, target_row)
+                        continue
                     prefill_keys, prefill_values = self._cache_layer_tensors(prefill_cache, layer_idx)
                     target_layer = self._continuous_cache_layer(cache, layer_idx, prefill_keys, prefill_values,
                                                                 attention_mask.shape[0])
@@ -1798,6 +1834,13 @@ class HybridEngineRollout(RolloutEngine):
             if cache_start < 0:
                 raise ValueError("continuous batching prompt does not fit behind the decode front")
             for layer_idx in range(self._cache_layer_count(prefill_cache)):
+                target_layer = cache.layers[layer_idx]
+                if isinstance(target_layer, DSStaticGDNSlot):
+                    # Single-row prefill: the whole prompt lives in source row 0.
+                    hf_slot = prefill_cache.layers[layer_idx]
+                    target_layer.adopt_gdn_pool(hf_slot, attention_mask.shape[0])
+                    target_layer.copy_state_from(hf_slot, 0, target_row)
+                    continue
                 prefill_keys, prefill_values = self._cache_layer_tensors(prefill_cache, layer_idx)
                 target_layer = self._continuous_cache_layer(cache, layer_idx, prefill_keys, prefill_values,
                                                             attention_mask.shape[0])

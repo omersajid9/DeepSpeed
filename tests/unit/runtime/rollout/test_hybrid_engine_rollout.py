@@ -130,6 +130,42 @@ def test_continuous_generation_rejects_unsupported_inputs():
                                     continuous_batch_size=1))
 
 
+def _hybrid_engine():
+    engine = _make_engine()
+    engine.module.config = SimpleNamespace(layer_types=["linear_attention", "full_attention"])
+    return engine
+
+
+def test_continuous_generation_rejects_hybrid_models_without_state_pool_support():
+    # GDN state pools only exist in the static-cache continuous path; paged
+    # decode and chunked prefill must be rejected up front by both CB
+    # validators (the eager loop and the captured-graph loop).
+    rollout = HybridEngineRollout(_hybrid_engine(), _make_tokenizer())
+    request = RolloutRequest(
+        prompt_ids=torch.tensor([[0, 1, 2]]),
+        prompt_attention_mask=torch.tensor([[0, 1, 1]]),
+    )
+    sampling = SamplingConfig(max_new_tokens=2, temperature=0, continuous_batch_size=1)
+
+    # The static path accepts hybrid models.
+    rollout._validate_continuous_inputs((request, ), sampling, 1)
+    rollout._validate_continuous_graph_options(3, sampling)
+
+    rollout.use_paged_cache = True
+    with pytest.raises(ValueError, match="paged cache does not yet support hybrid"):
+        rollout._validate_continuous_inputs((request, ), sampling, 1)
+    with pytest.raises(ValueError, match="paged cache does not yet support hybrid"):
+        rollout._validate_continuous_graph_options(3, sampling)
+
+    rollout.use_paged_cache = False
+    rollout.enable_chunked_prefill = True
+    rollout.prefill_chunk_size = 512
+    with pytest.raises(ValueError, match="chunked prefill does not yet support hybrid"):
+        rollout._validate_continuous_inputs((request, ), sampling, 1)
+    with pytest.raises(ValueError, match="chunked prefill does not yet support hybrid"):
+        rollout._validate_continuous_graph_options(3, sampling)
+
+
 @pytest.mark.parametrize(
     ("cfg", "message"),
     [
@@ -362,6 +398,9 @@ def test_continuous_graph_state_reuses_matching_capture_and_rebuilds_for_weight_
             self.reset_calls = 0
 
         def set_write_position(self, _write_position):
+            return None
+
+        def set_active_width(self, _width):
             return None
 
         def reset(self):
