@@ -157,3 +157,43 @@ fused q-side over paged KV, flashinfer-style decode/prefill paths.
 - Untracked 6.9 GB core dump in the DeepSpeed repo
   (`core.omp.1794277609.92210.3236077.dt-login03.delta.ncsa.illinois.edu`) —
   safe to delete.
+
+## Update — root cause of blocker 1 (capture-time GDN state)
+
+Blocker 1 is a capture bug, not a paged-cache bug. Bucket capture runs the model for
+real — three warmup forwards plus the captured forward (`_capture_continuous_graph`) —
+against the live cache. For a hybrid model those forwards advance the GDN
+conv/recurrent state in place: the fused decode reads
+`cache.layers[i].conv_states[0]` / `recurrent_states[0]` (pool views) and updates them
+(`causal_conv1d_update`, the recurrent delta rule, then `update_recurrent_state`), while
+the KV writers only rewrite the same columns. The non-continuous `_generate_graph` path
+snapshots and restores that state around warmup+capture for exactly this reason; the
+bucket capture did not, so the first replay of a newly captured bucket started from a
+state that had already consumed the decode token four extra times.
+
+Why it looked like an `mnt` dependency: the harness saves the *first* measured
+iteration's ids, so with `--warmup 0` the capture call is the one being saved. Every run
+with `--warmup 1` (all of the earlier `mnt=1024` and perf runs) captures during the
+discarded warmup call and replays later calls against a freshly reset cache. The same
+hazard applies to any bucket first captured *during* a measured run — e.g. a width that
+only appears after a row retires at b>1.
+
+Fix (`baadae27f`, "fix(rollout): restore hybrid GDN state around graph-capture warmups"):
+`_capture_bucket` snapshots the live conv/recurrent views (`_snapshot_gdn_state`) before
+capture and restores them in a `finally`, including when capture raises; `_generate_graph`
+now shares the same helpers. The capture's polluted logits are harmless — every capture
+is followed by a replay from the same buffers, which overwrites them in place.
+
+Regression tests (CPU, fail before the fix with state 4.0, pass after):
+`test_graph_capture_restores_gdn_state_advanced_by_its_warmups`,
+`test_failed_graph_capture_still_restores_gdn_state` in
+`tests/unit/runtime/rollout/test_hybrid_engine_rollout.py`.
+
+Re-verify on the shared A100 (one GPU job at a time):
+
+- the original repro (b=1, `--max-new-tokens 3`, `--warmup 0`, paged + paged prefill)
+  must now return `[294, 507, 553]`;
+- `--no-graph-capture` with the same settings is the control (was expected correct);
+- the static `mnt=3, warmup 0` row deserves a re-check: with the fix both paths are safe,
+  but if its saved iteration-1 ids were correct on the pre-fix tree, that capture was not
+  actually running — print iteration-1 and iteration-2 digests to confirm which it was.
