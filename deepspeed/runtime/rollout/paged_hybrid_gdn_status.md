@@ -233,7 +233,9 @@ Verification status:
   fused prologue == the HF Qwen3.5 attention module (norms, partial RoPE, gate);
   dispatch and fallback contracts pinned with stubs
   (`tests/unit/module_inject/test_segment_ki_paged_decode.py`); full rollout +
-  module_inject suite green (332 passed, 57 skipped).
+  module_inject suite green (333 passed, 58 skipped). The same contract tests
+  also pass under the cluster toolchain (torch 2.13.0+cu130, transformers
+  5.10.4) on the GPU-less box, so the GPU run exercises only the kernel.
 - **Compile**: the extension builds with the toolkit's nvcc (13.2, sm_90) on a
   GPU-less box and exposes `decode_attn_paged`. ptxas register counts (no
   spills; dense before → after, paged after): dim 64 `32 → 40` / `40`,
