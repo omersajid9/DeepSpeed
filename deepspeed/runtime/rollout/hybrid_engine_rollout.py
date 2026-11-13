@@ -2809,10 +2809,11 @@ class HybridEngineRollout(RolloutEngine):
 
         The decode_attn forward only runs when its cache's write-position
         object is exactly the one installed here (object identity is the
-        graph-safety gate), so every static-cache path re-installs with the
-        position tensor its own cache writes through; later installs re-bind
-        the module to the new tensor. Paged caches address KV through block
-        tables the kernel cannot read, so callers gate on ``use_paged_cache``.
+        graph-safety gate), so every cache path re-installs with the position
+        tensor its own cache writes through; later installs re-bind the module
+        to the new tensor. Dense caches run the plane-addressed kernel; paged
+        caches reach the block-table variant of the same kernel when
+        ``use_segki_paged_decode`` enabled the install.
         """
         if not self.use_segki:
             return 0
