@@ -358,16 +358,38 @@ void quad_gemv(at::Tensor hidden,
 // per (row, kv head) — a position is plane_base + pos * HEAD_DIM. A paged
 // cache keeps one block table per row over a shared block pool, so the same
 // position resolves through the page table to
-// pool[(block * block_size + offset) * num_kv_heads + kv_head]. Both policies
-// expose the same at(row, kv_head, position) accessor, which keeps the kernel
-// body (norm, partial RoPE, online softmax, gate) one implementation.
+// pool[(block * block_size + offset) * num_kv_heads + kv_head]. Both cache
+// types build a per-block row context and expose at(position, kv_head) on it,
+// which keeps the kernel body (norm, partial RoPE, online softmax, gate) one
+// implementation.
+template <int HEAD_DIM>
+struct DenseKVRow {
+    __nv_bfloat16* __restrict__ plane;
+    __device__ __forceinline__ __nv_bfloat16* at(int idx, int /*kv_head*/) const {
+        return plane + (long)idx * HEAD_DIM;
+    }
+};
+
+template <int HEAD_DIM>
+struct PagedKVRow {
+    __nv_bfloat16* __restrict__ pool;
+    const int* __restrict__ table_row;
+    int block_size;
+    int num_kv_heads;
+    __device__ __forceinline__ __nv_bfloat16* at(int idx, int kv_head) const {
+        const int block = table_row[idx / block_size];
+        const int slot = block * block_size + (idx - (idx / block_size) * block_size);
+        return pool + ((long)slot * num_kv_heads + kv_head) * HEAD_DIM;
+    }
+};
+
 template <int HEAD_DIM>
 struct DenseKVAddress {
     __nv_bfloat16* __restrict__ base;
     long plane_stride;  // max_len * HEAD_DIM
     int num_kv_heads;
-    __device__ __forceinline__ __nv_bfloat16* at(int row, int kv_head, int idx) const {
-        return base + ((long)(row * num_kv_heads + kv_head)) * plane_stride + (long)idx * HEAD_DIM;
+    __device__ __forceinline__ DenseKVRow<HEAD_DIM> row(int row, int kv_head) const {
+        return DenseKVRow<HEAD_DIM>{base + ((long)(row * num_kv_heads + kv_head)) * plane_stride};
     }
 };
 
@@ -378,12 +400,13 @@ struct PagedKVAddress {
     int block_size;
     int blocks_per_row;
     int num_kv_heads;
-    __device__ __forceinline__ __nv_bfloat16* at(int row, int kv_head, int idx) const {
-        const int block = table[(long)row * blocks_per_row + idx / block_size];
-        const int slot = block * block_size + (idx - (idx / block_size) * block_size);
-        return pool + ((long)slot * num_kv_heads + kv_head) * HEAD_DIM;
+    __device__ __forceinline__ PagedKVRow<HEAD_DIM> row(int row, int kv_head) const {
+        return PagedKVRow<HEAD_DIM>{pool, table + (long)row * blocks_per_row, block_size, num_kv_heads};
     }
 };
+
+// Both row contexts expose at(position, kv_head), so the kernel body is one
+// implementation over either cache type.
 
 template <int HEAD_DIM, class KVAddress>
 __global__ void __launch_bounds__(512)
@@ -425,6 +448,10 @@ __global__ void __launch_bounds__(512)
     // valid KV positions: 0..pos inclusive; a shared scalar when pos_stride
     // is 0, one per row otherwise
     const int pos = (int)write_pos[row * pos_stride];
+    // This block's K/V row context: the dense plane base (computed once, as
+    // the pre-paged kernel did) or this row's page-table slice.
+    auto k_row = k_addr.row(row, kv_head);
+    auto v_row = v_addr.row(row, kv_head);
 
     // q/gate may be sliced out of a wider fused row block (e.g. fused[:, :qn]
     // of a q|k|v concat), so rows advance by the caller-provided row stride,
@@ -507,8 +534,8 @@ __global__ void __launch_bounds__(512)
             for (int e = 0; e < EPL; e++)
                 k_reg[e] = k_reg[e] * kcrow[e] + (kfirst ? -kpair[e] : kpair[e]) * ksrow[e];
         }
-        __nv_bfloat16* k_slot = k_addr.at(row, kv_head, pos);
-        __nv_bfloat16* v_slot = v_addr.at(row, kv_head, pos);
+        __nv_bfloat16* k_slot = k_row.at(pos, kv_head);
+        __nv_bfloat16* v_slot = v_row.at(pos, kv_head);
         const __nv_bfloat16* v_in_row = v_raw + ((long)(row * num_kv_heads + kv_head)) * HEAD_DIM;
 #pragma unroll
         for (int e = 0; e < EPL; e++) {
@@ -532,7 +559,7 @@ __global__ void __launch_bounds__(512)
         for (int u = 0; u < UNROLL; u++) {
             idx[u] = base + u * split;
             if (idx[u] <= pos) {
-                const __nv_bfloat16* krow = k_addr.at(row, kv_head, idx[u]);
+                const __nv_bfloat16* krow = k_row.at(idx[u], kv_head);
 #pragma unroll
                 for (int e = 0; e < EPL; e++) k_reg[u][e] = __bfloat162float(krow[lane * EPL + e]);
             }
@@ -553,7 +580,7 @@ __global__ void __launch_bounds__(512)
             sum_exp = sum_exp * rescale + weight;
 #pragma unroll
             for (int e = 0; e < EPL; e++) out_reg[e] *= rescale;
-            const __nv_bfloat16* vrow = v_addr.at(row, kv_head, idx[u]);
+            const __nv_bfloat16* vrow = v_row.at(idx[u], kv_head);
 #pragma unroll
             for (int e = 0; e < EPL; e++)
                 out_reg[e] += weight * __bfloat162float(vrow[lane * EPL + e]);
