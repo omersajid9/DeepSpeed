@@ -47,13 +47,15 @@ def gdn_gates(a, b, a_log, dt_bias):
     return beta, g.to(b.dtype)
 
 
-def decode_attn(q, K, V, pos):
+def decode_attn(q, K, V, pos, kv_start=None):
     """Single-query attention over valid KV positions, batched.
 
     q: [b, num_heads, head_dim]
     K, V: [b, num_kv_heads, max_len, head_dim]
     pos: int or LongTensor [b] (valid positions, 0-indexed inclusive;
          an int applies to every row)
+    kv_start: optional int or LongTensor [b], first valid position per row
+         (left-padded prompts, or a row behind a moved decode front)
 
     Returns [b, num_heads, head_dim] with GQA (K/V heads shared across query
     heads).
@@ -65,10 +67,14 @@ def decode_attn(q, K, V, pos):
     scale = 1.0 / math.sqrt(head_dim)
 
     lens = (pos + 1).tolist() if torch.is_tensor(pos) else [pos + 1] * q.shape[0]
+    if kv_start is None:
+        starts = [0] * q.shape[0]
+    else:
+        starts = kv_start.tolist() if torch.is_tensor(kv_start) else [kv_start] * q.shape[0]
     out = torch.empty(q.shape, dtype=torch.float32, device=q.device)
     for r in range(q.shape[0]):
-        K_valid = K[r, :, :lens[r], :]  # [nkv, len, hd]
-        V_valid = V[r, :, :lens[r], :]
+        K_valid = K[r, :, starts[r]:lens[r], :]  # [nkv, len, hd]
+        V_valid = V[r, :, starts[r]:lens[r], :]
         if n_rep > 1:
             K_valid = K_valid.repeat_interleave(n_rep, dim=0)
             V_valid = V_valid.repeat_interleave(n_rep, dim=0)
@@ -104,7 +110,7 @@ def write_paged_kv(K_pool, V_pool, block_table, pos, block_size, k, v, row=0):
     return slot
 
 
-def decode_attn_paged(q, K_pool, V_pool, block_table, pos, block_size):
+def decode_attn_paged(q, K_pool, V_pool, block_table, pos, block_size, kv_start=None):
     """Paged single-query attention: the block-table sibling of ``decode_attn``.
 
     q: [b, num_heads, head_dim]
@@ -124,9 +130,16 @@ def decode_attn_paged(q, K_pool, V_pool, block_table, pos, block_size):
     scale = 1.0 / math.sqrt(head_dim)
 
     lens = (pos + 1).tolist() if torch.is_tensor(pos) else [pos + 1] * q.shape[0]
+    if kv_start is None:
+        starts = [0] * q.shape[0]
+    else:
+        starts = kv_start.tolist() if torch.is_tensor(kv_start) else [kv_start] * q.shape[0]
     out = torch.empty(q.shape, dtype=torch.float32, device=q.device)
     for r in range(q.shape[0]):
-        slots = [paged_kv_slot(block_table, r, i, block_size) * block_size + i % block_size for i in range(lens[r])]
+        slots = [
+            paged_kv_slot(block_table, r, i, block_size) * block_size + i % block_size
+            for i in range(starts[r], lens[r])
+        ]
         K_valid = K_pool[slots]  # [len, nkv, hd]
         V_valid = V_pool[slots]
         if n_rep > 1:

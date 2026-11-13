@@ -207,6 +207,7 @@ class _DecodeBucket:
     causal_attention: torch.Tensor
     position_ids: torch.Tensor
     write_positions: torch.Tensor
+    kv_starts: Optional[torch.Tensor] = None
     graph: object = None
     logits: Optional[torch.Tensor] = None
     disabled: bool = False
@@ -263,11 +264,13 @@ class _ContinuousGraphState:
     ladder: Tuple[int, ...]
     cache: object
     staging_cache: object
+    max_cache_len: int
     static_input: torch.Tensor
     static_attention: torch.Tensor
     static_causal_attention: torch.Tensor
     static_position_ids: torch.Tensor
     static_write_positions: torch.Tensor
+    static_kv_starts: torch.Tensor
     static_cache_position: torch.Tensor
     decode: Dict[int, _DecodeBucket] = field(default_factory=dict)
     prefill: Dict[int, _PrefillBucket] = field(default_factory=dict)
@@ -1054,6 +1057,7 @@ class HybridEngineRollout(RolloutEngine):
         static_causal_attention = state.static_causal_attention
         static_position_ids = state.static_position_ids
         static_write_positions = state.static_write_positions
+        static_kv_starts = state.static_kv_starts
         staging_cache = state.staging_cache
         if not self.use_paged_cache or self.use_segki_paged_decode:
             # The static-cache path always runs the decode kernels; a paged
@@ -1063,7 +1067,13 @@ class HybridEngineRollout(RolloutEngine):
             # of it, and the forward's identity gate is re-bound to each
             # bucket's slice at capture/replay below; the paged path uses the
             # whole tensor.
-            self._install_segki_decode_kernels(module, static_write_positions, max_cache_len, device, model_dtype)
+            self._install_segki_decode_kernels(module,
+                                               static_write_positions,
+                                               max_cache_len,
+                                               device,
+                                               model_dtype,
+                                               kv_start=static_kv_starts,
+                                               rope_pos=state.static_position_ids)
         staging_bytes = self._cache_bytes(staging_cache)
         captures_before = state.captures
         stats = {
@@ -1104,6 +1114,7 @@ class HybridEngineRollout(RolloutEngine):
 
             for request_id in update.retired:
                 static_attention[slot_by_request[request_id]].zero_()
+                static_kv_starts[slot_by_request[request_id]] = max_cache_len - 1
                 slot_by_request.pop(request_id, None)
                 write_positions.pop(request_id, None)
                 next_tokens.pop(request_id, None)
@@ -1140,6 +1151,7 @@ class HybridEngineRollout(RolloutEngine):
                     chunk_size=chunk_size,
                     stage_prompts=self._stage_staged_prompt,
                     sampling=sampling,
+                    kv_starts=static_kv_starts,
                 )
                 next_tokens.update(admitted_tokens)
                 if admitted_logprobs is not None:
@@ -1382,6 +1394,9 @@ class HybridEngineRollout(RolloutEngine):
                                                   device=device)
             static_position_ids = torch.zeros((max_batch_size, 1), dtype=torch.long, device=device)
             static_write_positions = torch.zeros(max_batch_size, dtype=torch.long, device=device)
+            # First valid KV column per row: an idle row gets a one-token window
+            # at the end of the cache until a prompt is admitted into it.
+            static_kv_starts = torch.full((max_batch_size, ), max_cache_len - 1, dtype=torch.int32, device=device)
             cache.set_write_position(static_write_positions)
             # Transformers uses cache_position to build the causal mask. Per-row
             # validity is represented by static_attention, so a fixed upper bound
@@ -1394,11 +1409,13 @@ class HybridEngineRollout(RolloutEngine):
                 ladder,
                 cache,
                 staging_cache,
+                max_cache_len,
                 static_input,
                 static_attention,
                 static_causal_attention,
                 static_position_ids,
                 static_write_positions,
+                static_kv_starts,
                 static_cache_position,
             )
             self._continuous_graph_state = state
@@ -1409,6 +1426,7 @@ class HybridEngineRollout(RolloutEngine):
         state.static_causal_attention.zero_()
         state.static_position_ids.zero_()
         state.static_write_positions.zero_()
+        state.static_kv_starts.fill_(state.max_cache_len - 1)
         return state
 
     def _decode_bucket(self, highest_row):
@@ -1422,7 +1440,8 @@ class HybridEngineRollout(RolloutEngine):
         bucket = state.decode.get(width)
         if bucket is None:
             bucket = _DecodeBucket(width, state.static_input[:width], state.static_causal_attention[:width],
-                                   state.static_position_ids[:width], state.static_write_positions[:width])
+                                   state.static_position_ids[:width], state.static_write_positions[:width],
+                                   state.static_kv_starts[:width])
             state.decode[width] = bucket
         return bucket
 
@@ -1503,7 +1522,7 @@ class HybridEngineRollout(RolloutEngine):
                     # identity: bind the forward to this bucket's slice so
                     # the captured kernel reads the storage the cache writes.
                     from deepspeed.module_inject.segment_ki import rebind_decode_write_pos
-                    rebind_decode_write_pos(module, write_position)
+                    rebind_decode_write_pos(module, write_position, bucket.kv_starts, bucket.position_ids.view(-1))
             attention_mask = self._bucket_attention_mask(cache, bucket)
             if is_paged:
                 self._paged_decode_step(cache, fi_positions)
@@ -1572,7 +1591,7 @@ class HybridEngineRollout(RolloutEngine):
                 # decode_attn's write-position gate compares object identity:
                 # the eager fallback must read the storage the cache writes.
                 from deepspeed.module_inject.segment_ki import rebind_decode_write_pos
-                rebind_decode_write_pos(module, write_position)
+                rebind_decode_write_pos(module, write_position, bucket.kv_starts, bucket.position_ids.view(-1))
         output = self._call_model(
             module,
             bucket.input_ids,
@@ -1786,7 +1805,8 @@ class HybridEngineRollout(RolloutEngine):
                             prefill_chunks=None,
                             chunk_size=0,
                             stage_prompts=None,
-                            sampling=None):
+                            sampling=None,
+                            kv_starts=None):
         """Prefill newly admitted prompts and return their first response tokens.
 
         Returns ``(tokens, logprobs)`` keyed by request id; ``logprobs`` is ``None`` for a
@@ -1865,6 +1885,8 @@ class HybridEngineRollout(RolloutEngine):
                     attention_mask[target_row].zero_()
                     attention_mask[target_row, :valid_len] = 1
                     write_positions[target_row] = valid_len
+                    if kv_starts is not None:
+                        kv_starts[target_row] = 0  # paged rows are compact
             else:
                 for layer_idx in range(self._cache_layer_count(prefill_cache)):
                     target_layer = cache.layers[layer_idx]
@@ -1888,6 +1910,10 @@ class HybridEngineRollout(RolloutEngine):
                     attention_mask[target_row,
                                    cache_start:cache_start + prompt_len].copy_(prompt_attention[source_row])
                     write_positions[target_row] = cache_start + prompt_len
+                    if kv_starts is not None:
+                        # The row's own KV starts after its left-pad columns.
+                        pad = prompt_len - int(prompt_attention[source_row].sum())
+                        kv_starts[target_row] = cache_start + pad
             self._profile_end(profile, "cache_management_overhead_ms", cache_copy_start)
             tokens = dict(zip(admitted_ids, prefill_tokens.split(1, dim=0)))
             if prefill_logprobs is None:
@@ -2107,7 +2133,7 @@ class HybridEngineRollout(RolloutEngine):
         # draw it from the same distribution as the rest of the response.
         return self._draw_token(output.logits[:, -1, :], sampling)
 
-    def _publish_prefill_chunk(self, chunk, cache, attention_mask, write_positions):
+    def _publish_prefill_chunk(self, chunk, cache, attention_mask, write_positions, kv_starts=None):
         """Move a completed staged prompt into its row of the decode cache.
 
         The prompt lands at column zero of its own row: the cache is row-major, so a row's
@@ -2137,6 +2163,12 @@ class HybridEngineRollout(RolloutEngine):
                 target_layer.values[chunk.slot, :, :prompt_end].copy_(staged_values[0])
             attention_mask[chunk.slot, :prompt_end].copy_(chunk.prompt_attention[0])
         write_positions[chunk.slot] = prompt_end
+        if kv_starts is not None:
+            if self.use_paged_cache:
+                kv_starts[chunk.slot] = 0  # paged rows are compact
+            else:
+                # The staged row starts with its prompt's left padding.
+                kv_starts[chunk.slot] = chunk.prompt_len - int(chunk.prompt_attention[0].sum())
         return prompt_end
 
     def _run_chunked_prefill(self,
@@ -2150,7 +2182,8 @@ class HybridEngineRollout(RolloutEngine):
                              chunk_stats,
                              profile=None,
                              request_write_positions=None,
-                             sampling=None):
+                             sampling=None,
+                             kv_starts=None):
         """Advance the staged prompts by at most ``chunk_size`` tokens in total.
 
         The budget is spent in admission order, so the number of extra forwards in a step
@@ -2176,7 +2209,7 @@ class HybridEngineRollout(RolloutEngine):
             chunk_stats["peak_staging_bytes"] = max(chunk_stats["peak_staging_bytes"], chunk.staging_bytes())
             if first_token is None:
                 continue
-            prompt_end = self._publish_prefill_chunk(chunk, cache, attention_mask, write_positions)
+            prompt_end = self._publish_prefill_chunk(chunk, cache, attention_mask, write_positions, kv_starts)
             if request_write_positions is not None:
                 request_write_positions[request_id] = prompt_end
             completed[request_id] = first_token
@@ -2286,7 +2319,7 @@ class HybridEngineRollout(RolloutEngine):
                 continue
             # The chunk that completes the prompt also predicts the first response token.
             first_token, first_logprob = self._draw_token(logits[row_index:row_index + 1, -1, :], sampling)
-            self._publish_staged_prompt(chunk, state, cache, attention_mask, write_positions)
+            self._publish_staged_prompt(chunk, state, cache, attention_mask, write_positions, state.static_kv_starts)
             if request_write_positions is not None:
                 request_write_positions[request_id] = prompt_len
             completed[request_id] = first_token
@@ -2320,7 +2353,7 @@ class HybridEngineRollout(RolloutEngine):
             bucket.causal_attention[row_index, 0].copy_(torch.where(valid, 0.0, min_dtype))
         bucket.write_positions.fill_(window)
 
-    def _publish_staged_prompt(self, chunk, state, cache, attention_mask, write_positions):
+    def _publish_staged_prompt(self, chunk, state, cache, attention_mask, write_positions, kv_starts=None):
         """Move a finished staged prompt into its row of the decode cache.
 
         The prompt lands at column zero of its own row, exactly like a one-shot prefill, so
@@ -2328,12 +2361,16 @@ class HybridEngineRollout(RolloutEngine):
         function of the prompt and the response budget, never of how many chunks it took.
         """
         prompt_len = chunk.prompt_len
+        valid_len = int(chunk.prompt_attention[0].sum())
         if self.use_paged_cache:
+            # Paged rows are compact: strip the staged row's left padding and
+            # park the first response token right behind the real prompt.
             for layer_idx in range(self._cache_layer_count(state.staging_cache)):
                 staged_keys, staged_values = self._cache_layer_tensors(state.staging_cache, layer_idx)
-                cache.copy_from_dense(layer_idx, staged_keys[chunk.row], staged_values[chunk.row], chunk.slot)
+                cache.copy_from_dense(layer_idx, staged_keys[chunk.row], staged_values[chunk.row], chunk.slot,
+                                      chunk.prompt_attention[0].bool())
             attention_mask[chunk.slot].zero_()
-            attention_mask[chunk.slot, :prompt_len] = 1
+            attention_mask[chunk.slot, :valid_len] = 1
         else:
             for layer_idx in range(self._cache_layer_count(state.staging_cache)):
                 staged_keys, staged_values = self._cache_layer_tensors(state.staging_cache, layer_idx)
@@ -2347,7 +2384,9 @@ class HybridEngineRollout(RolloutEngine):
                 target_layer.keys[chunk.slot, :, :prompt_len].copy_(staged_keys[chunk.row, :, :prompt_len])
                 target_layer.values[chunk.slot, :, :prompt_len].copy_(staged_values[chunk.row, :, :prompt_len])
             attention_mask[chunk.slot, :prompt_len].copy_(chunk.prompt_attention[0])
-        write_positions[chunk.slot] = prompt_len
+        write_positions[chunk.slot] = valid_len if self.use_paged_cache else prompt_len
+        if kv_starts is not None:
+            kv_starts[chunk.slot] = 0 if self.use_paged_cache else prompt_len - valid_len
 
     @staticmethod
     def _cache_bytes(cache):
@@ -2804,7 +2843,14 @@ class HybridEngineRollout(RolloutEngine):
     # Graph capture decode loop
     # ------------------------------------------------------------------
 
-    def _install_segki_decode_kernels(self, module, write_pos, max_len, device, model_dtype):
+    def _install_segki_decode_kernels(self,
+                                      module,
+                                      write_pos,
+                                      max_len,
+                                      device,
+                                      model_dtype,
+                                      kv_start=None,
+                                      rope_pos=None):
         """Install the segki decode kernels bound to ``write_pos``.
 
         The decode_attn forward only runs when its cache's write-position
@@ -2832,8 +2878,9 @@ class HybridEngineRollout(RolloutEngine):
                     cos_t, sin_t = rotary(torch.zeros(1, max_len, dtype=model_dtype, device=device), positions)
                     cos_t = cos_t[0].float().contiguous()
                     sin_t = sin_t[0].float().contiguous()
-            patched = install_decode_attention(module, write_pos, attn_op, cos_table=cos_t,
-                                               sin_table=sin_t) if hasattr(attn_op, "decode_attn") else 0
+            patched = install_decode_attention(
+                module, write_pos, attn_op, cos_table=cos_t, sin_table=sin_t, kv_start=kv_start,
+                rope_pos=rope_pos) if hasattr(attn_op, "decode_attn") else 0
             install_fused_norm(module, attn_op)
             install_lm_head(module, attn_op)
             return patched

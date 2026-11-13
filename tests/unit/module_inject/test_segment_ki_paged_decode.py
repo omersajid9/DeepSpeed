@@ -18,7 +18,9 @@ layers of checks:
    reaches the native forward instead.
 """
 
+from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -26,6 +28,8 @@ import torch
 from deepspeed.accelerator import get_accelerator
 from deepspeed.module_inject.kernel_reference import decode_attn as ref_decode_attn
 from deepspeed.module_inject.kernel_reference import decode_attn_paged as ref_decode_attn_paged
+from deepspeed.runtime.rollout.base import RolloutRequest, SamplingConfig
+from deepspeed.runtime.rollout.hybrid_engine_rollout import HybridEngineRollout, HybridEngineRolloutConfig
 from deepspeed.module_inject.kernel_reference import qwen3_5_fused_prologue as ref_prologue
 from deepspeed.module_inject.kernel_reference import write_paged_kv
 from deepspeed.module_inject.segment_ki import _paged_decode_attn_forward
@@ -180,10 +184,13 @@ class _ReferencePagedOp:
                           v_raw=None,
                           k_norm_w=None,
                           eps=1e-6,
-                          rope_dim=0):
+                          rope_dim=0,
+                          kv_start=None,
+                          rope_pos=None):
         from deepspeed.module_inject.kernel_reference import qwen3_5_norm_rope
         self.calls += 1
         batch = q.shape[0]
+        rope = write_pos if rope_pos is None else rope_pos
         # the forward passes (1 + w) scales; the reference adds the 1 back
         q_rope, k_rope = qwen3_5_norm_rope(q.reshape(batch, num_q_heads, head_dim),
                                            k_raw.reshape(batch, num_kv_heads, head_dim), q_norm_w - 1.0,
@@ -199,7 +206,7 @@ class _ReferencePagedOp:
                            k_rope[row],
                            v_raw[row],
                            row=row)
-        attn = ref_decode_attn_paged(q_rope, pool_k, pool_v, block_table, write_pos, block_size)
+        attn = ref_decode_attn_paged(q_rope, pool_k, pool_v, block_table, write_pos, block_size, kv_start)
         out.copy_((attn * torch.sigmoid(gate.float())).to(out.dtype))
 
 
@@ -331,6 +338,10 @@ def test_paged_decode_kernel_fused_matches_reference():
     batch, num_q_heads, num_kv_heads, head_dim, block_size = 2, 8, 2, 64, 64
     hidden_size, rope_dim = 64, 16
     positions = torch.tensor([block_size - 1, 3 * block_size], dtype=torch.long, device=DEV)
+    # A clipped window (pad/stale columns skipped) and a rope position that
+    # differs from the write column (a padded prompt roped at its logic).
+    starts = torch.tensor([block_size // 2, 2 * block_size], dtype=torch.int32, device=DEV)
+    ropes = torch.tensor([3, 3 * block_size - 5], dtype=torch.long, device=DEV)
     length = int(positions.max()) + 1
     pool_k, pool_v, table = _paged_pool(batch,
                                         num_kv_heads,
@@ -375,16 +386,17 @@ def test_paged_decode_kernel_fused_matches_reference():
                                          v_raw=v_raw.reshape(batch, num_kv_heads, head_dim),
                                          k_norm_w=1.0 + k_norm_w,
                                          eps=1e-6,
-                                         rope_dim=rope_dim)
+                                         rope_dim=rope_dim,
+                                         kv_start=starts,
+                                         rope_pos=ropes)
 
     # reference: prologue -> KV store through the page table -> attention -> gate
     ref_pool_k, ref_pool_v = pool_k.float().clone(), pool_v.float().clone()
-    q_ref, gate_ref, k_ref, v_ref = ref_prologue(hidden[:,
-                                                        0, :].float(), q_w.float(), k_w.float(), v_w.float(), q_norm_w,
-                                                 k_norm_w, cos_t[positions], sin_t[positions], head_dim, 1e-6)
+    q_ref, gate_ref, k_ref, v_ref = ref_prologue(hidden[:, 0, :].float(), q_w.float(), k_w.float(), v_w.float(),
+                                                 q_norm_w, k_norm_w, cos_t[ropes], sin_t[ropes], head_dim, 1e-6)
     for row in range(batch):
-        write_paged_kv(ref_pool_k, ref_pool_v, table, int(positions[row]), block_size, k_ref[row], v_ref[row])
-    attn = ref_decode_attn_paged(q_ref, ref_pool_k, ref_pool_v, table, positions, block_size)
+        write_paged_kv(ref_pool_k, ref_pool_v, table, int(positions[row]), block_size, k_ref[row], v_ref[row], row=row)
+    attn = ref_decode_attn_paged(q_ref, ref_pool_k, ref_pool_v, table, positions, block_size, starts)
     expected = attn * torch.sigmoid(gate_ref.float())
 
     torch.testing.assert_close(out.float(), expected, atol=5e-2, rtol=5e-2)
@@ -454,6 +466,166 @@ def test_fused_kernel_stores_through_the_real_cache_page_table():
     assert int(cache.block_ids[0, 0]) >= 0 and int(cache.block_ids[1, 1]) >= 0
 
 
+class _ReferenceDenseOp:
+    """CPU stand-in for the dense decode kernel (static cache rows)."""
+
+    def __init__(self):
+        self.calls = 0
+        self.windows = []
+        self.rope_positions = []
+
+    def decode_attn(self,
+                    q,
+                    K,
+                    V,
+                    write_pos,
+                    out,
+                    num_q_heads,
+                    num_kv_heads,
+                    head_dim,
+                    max_len,
+                    q_norm_w=None,
+                    cos_t=None,
+                    sin_t=None,
+                    gate=None,
+                    k_raw=None,
+                    v_raw=None,
+                    k_norm_w=None,
+                    eps=1e-6,
+                    rope_dim=0,
+                    kv_start=None,
+                    rope_pos=None):
+        from deepspeed.module_inject.kernel_reference import qwen3_5_norm_rope
+        self.calls += 1
+        batch = q.shape[0]
+        rope = write_pos if rope_pos is None else rope_pos
+        self.rope_positions.append(rope.tolist())
+        q_rope, k_rope = qwen3_5_norm_rope(q.reshape(batch, num_q_heads, head_dim),
+                                           k_raw.reshape(batch, num_kv_heads, head_dim), q_norm_w - 1.0,
+                                           k_norm_w - 1.0, cos_t[rope], sin_t[rope], eps)
+        q_rope, k_rope = q_rope.to(q.dtype), k_rope.to(q.dtype)
+        starts = [0] * batch if kv_start is None else kv_start.tolist()
+        self.windows.append(list(zip(starts, write_pos.tolist())))
+        for row in range(batch):
+            position = int(write_pos[row])
+            K[row, :, position, :] = k_rope[row]
+            V[row, :, position, :] = v_raw[row]
+        attn = ref_decode_attn(q_rope, K.float(), V.float(), write_pos, kv_start)
+        out.copy_((attn * torch.sigmoid(gate.float())).to(out.dtype))
+
+
+def _tiny_hybrid_model():
+    """A tiny random-weight Qwen3.5 hybrid model (one full-attention layer)."""
+    from transformers import Qwen3_5ForCausalLM
+
+    torch.manual_seed(0)
+    model = Qwen3_5ForCausalLM(_tiny_qwen3_5_config()).to(torch.bfloat16)
+    return model.eval()
+
+
+def _mock_graph_accelerator(mock_get_accelerator):
+    stream = MagicMock()
+    accelerator = mock_get_accelerator.return_value
+    accelerator.Stream.return_value = stream
+    accelerator.current_stream.return_value = stream
+    accelerator.stream.side_effect = lambda _stream: nullcontext()
+    accelerator.capture_to_graph.side_effect = lambda _graph: nullcontext()
+    return accelerator
+
+
+@patch("deepspeed.runtime.rollout.hybrid_engine_rollout.get_accelerator")
+def test_fused_decode_skips_prompt_padding_in_continuous_batching(mock_get_accelerator):
+    """Left-padded prompts must not leak pad columns into the fused decode.
+
+    A dense cache row holds the whole padded prompt, and the dense mask hides
+    its pad columns; the fused kernel has no mask, so it clips its scan at the
+    row's first valid column instead (kv_start). Without that window the padded
+    rows drift — the static decode_attn token mismatch the paged path did not
+    have, because paged prefill strips padding.
+    """
+    _mock_graph_accelerator(mock_get_accelerator)
+    model = _tiny_hybrid_model()
+    # Make the pad token's embeddings dominate, so attending pad columns moves
+    # the logits far more than bf16 rounding ever could.
+    with torch.no_grad():
+        model.model.embed_tokens.weight[0].mul_(50.0)
+    prompt = torch.tensor([[0, 0, 0, 1, 2, 3], [4, 5, 6, 7, 8, 9]])
+    attention = torch.tensor([[0, 0, 0, 1, 1, 1], [1, 1, 1, 1, 1, 1]])
+    request = RolloutRequest(prompt, attention)
+    sampling = SamplingConfig(max_new_tokens=4, temperature=0, continuous_batch_size=2)
+    engine = SimpleNamespace(module=model)
+    tokenizer = SimpleNamespace(pad_token_id=0, eos_token_id=None)
+
+    plain = HybridEngineRollout(engine, tokenizer, cfg=HybridEngineRolloutConfig(use_graph_capture=True))
+    with torch.no_grad():
+        masked = plain.generate(request, sampling).input_ids.tolist()
+
+    def run_with(op):
+        with patch("deepspeed.ops.module_inject.get_fused_glu_op", return_value=op), \
+                patch.object(HybridEngineRollout, "_apply_segki", return_value=None):
+            rollout = HybridEngineRollout(engine,
+                                          tokenizer,
+                                          cfg=HybridEngineRolloutConfig(use_graph_capture=True, use_segki=True))
+            with torch.no_grad():
+                return rollout.generate(request, sampling).input_ids.tolist()
+
+    windowed_op = _ReferenceDenseOp()
+    windowed = run_with(windowed_op)
+
+    assert windowed_op.calls, "the fused decode kernel must have run"
+    # Row 0 starts after three pad columns and ropes at its logical position
+    # (3, not the padded column 6); row 1 starts at column 0 and ropes there.
+    assert [start for start, _ in windowed_op.windows[-1]] == [3, 0], windowed_op.windows[-1]
+    assert windowed_op.rope_positions[-1] == [3, 6], windowed_op.rope_positions[-1]
+    # Clipping the window and roping at the logical position must reproduce the
+    # masked path exactly; dropping either one moves the tokens (the static
+    # decode_attn drift the handoff flagged).
+    assert windowed == masked
+
+
+# ---------------------------------------------------------------------------
+# 5. GPU: the kernel honors the KV window start
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="native kernels are CUDA-only")  #ignore-cuda
+def test_paged_decode_kernel_clips_to_the_kv_window():
+    """A window start must make the kernel ignore everything before it."""
+    from deepspeed.ops.module_inject import get_fused_glu_op
+
+    torch.manual_seed(0)
+    head_dim, num_q_heads, num_kv_heads, block_size, batch = 64, 8, 2, 64, 2
+    positions = torch.tensor([2 * block_size, 2 * block_size + 7], dtype=torch.long, device=DEV)
+    starts = torch.tensor([block_size + 3, block_size], dtype=torch.int32, device=DEV)
+    length = int(positions.max()) + 1
+    pool_k, pool_v, table = _paged_pool(batch,
+                                        num_kv_heads,
+                                        head_dim,
+                                        length,
+                                        block_size,
+                                        device=DEV,
+                                        dtype=torch.bfloat16)
+    query = torch.randn(batch, num_q_heads, head_dim, dtype=torch.bfloat16, device=DEV)
+
+    out = torch.empty(batch, num_q_heads, head_dim, dtype=torch.bfloat16, device=DEV)
+    get_fused_glu_op().decode_attn_paged(query,
+                                         pool_k.view(-1, num_kv_heads * head_dim),
+                                         pool_v.view(-1, num_kv_heads * head_dim),
+                                         table,
+                                         positions,
+                                         out,
+                                         num_q_heads,
+                                         num_kv_heads,
+                                         head_dim,
+                                         length,
+                                         block_size,
+                                         kv_start=starts)
+
+    expected = ref_decode_attn_paged(query.float(), pool_k.float(), pool_v.float(), table, positions, block_size,
+                                     starts)
+    torch.testing.assert_close(out.float(), expected, atol=5e-2, rtol=5e-2)
+
+
 # ---------------------------------------------------------------------------
 # 4. Rollout wiring (CPU)
 # ---------------------------------------------------------------------------
@@ -495,6 +667,9 @@ class _OpStub:
             self.decode_attn_paged = self._record
 
     def _record(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+
+    def decode_attn(self, *args, **kwargs):
         self.calls.append((args, kwargs))
 
 

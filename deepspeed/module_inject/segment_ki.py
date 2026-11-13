@@ -929,7 +929,9 @@ def _paged_decode_attn_forward(self,
                          v_raw=v_flat.reshape(batch, num_kv_heads, head_dim),
                          k_norm_w=(1.0 + self.k_norm.weight.detach().float()).contiguous(),
                          eps=self.q_norm.eps,
-                         rope_dim=self._ki_cos_t.shape[-1])
+                         rope_dim=self._ki_cos_t.shape[-1],
+                         kv_start=getattr(self, "_ki_kv_start", None),
+                         rope_pos=getattr(self, "_ki_rope_pos", None))
     cache.note_step_written()
     return self.o_proj(out.view(*input_shape, -1)), None
 
@@ -1022,7 +1024,9 @@ def _decode_attn_forward(self,
             v_raw=(v_flat.reshape(batch, num_kv_heads, head_dim) if fuse_k else key_states.new_empty(0)),
             k_norm_w=((1.0 + self.k_norm.weight.detach().float()).contiguous() if fuse_k else key_states.new_empty(0)),
             eps=self.q_norm.eps,
-            rope_dim=self._ki_cos_t.shape[-1])
+            rope_dim=self._ki_cos_t.shape[-1],
+            kv_start=getattr(self, "_ki_kv_start", None),
+            rope_pos=getattr(self, "_ki_rope_pos", None))
     else:
         self._ki_attn_op.decode_attn(query_states.reshape(batch, num_q_heads, head_dim), key_states, value_states,
                                      self._ki_write_pos, out, num_q_heads, num_kv_heads, head_dim, key_states.shape[2])
@@ -1036,16 +1040,22 @@ def _decode_attn_forward(self,
     return self.o_proj(attn_output), None
 
 
-def rebind_decode_write_pos(model: torch.nn.Module, write_pos: torch.Tensor) -> int:
+def rebind_decode_write_pos(model: torch.nn.Module,
+                            write_pos: torch.Tensor,
+                            kv_start: torch.Tensor | None = None,
+                            rope_pos: torch.Tensor | None = None) -> int:
     """Point every installed decode-attention layer's write-position gate at
-    ``write_pos``. Bucket caches hold slices of one static position tensor,
-    and the forward's gate compares object identity, so the slice the cache
-    writes through must also be the slice the forward reads. Returns the
-    number of layers re-bound."""
+    ``write_pos`` and its KV-window start at ``kv_start``. Bucket caches hold
+    slices of one static position tensor, and the forward's gate compares
+    object identity, so the slice the cache writes through must also be the
+    slice the forward reads; the window start rides the same slice. Returns
+    the number of layers re-bound."""
     n = 0
     for module in model.modules():
         if getattr(module, "_ki_attn_op", None) is not None:
             module._ki_write_pos = write_pos
+            module._ki_kv_start = kv_start
+            module._ki_rope_pos = rope_pos
             n += 1
     return n
 
@@ -1103,7 +1113,9 @@ def install_decode_attention(model: torch.nn.Module,
                              write_pos: torch.Tensor,
                              kernel_op,
                              cos_table: torch.Tensor = None,
-                             sin_table: torch.Tensor = None) -> int:
+                             sin_table: torch.Tensor = None,
+                             kv_start: torch.Tensor | None = None,
+                             rope_pos: torch.Tensor | None = None) -> int:
     """Patch full-attention layers to use the custom decode_attn kernel.
 
     Detection mirrors find_glu_segments: structural (q/k/v/o projections
@@ -1160,6 +1172,13 @@ def install_decode_attention(model: torch.nn.Module,
         unbiased_qkv = all(p.bias is None for p in projections[:3])
         module._ki_qkv_op = kernel_op if (hasattr(kernel_op, "grouped_linear") and unbiased_qkv) else None
         module._ki_write_pos = write_pos
+        # First valid KV column per row: dense caches hold left-padded prompts
+        # and rows that sit behind a decode front, which the kernel's scan
+        # must skip.
+        module._ki_kv_start = kv_start
+        # RoPE position per row: it equals the write column unless the prompt
+        # carries leading pad columns (then it is the logical position).
+        module._ki_rope_pos = rope_pos
         module._ki_rope = apply_rotary_pos_emb
         module._ki_num_q_heads = num_q_heads
         module._ki_num_kv_heads = num_kv_heads

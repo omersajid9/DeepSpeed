@@ -414,6 +414,8 @@ __global__ void __launch_bounds__(512)
                        KVAddress k_addr,
                        KVAddress v_addr,
                        const int64_t* __restrict__ write_pos,
+                       const int* __restrict__ kv_start,
+                       const int64_t* __restrict__ rope_pos,
                        __nv_bfloat16* __restrict__ out,
                        int num_q_heads,
                        int num_kv_heads,
@@ -421,6 +423,8 @@ __global__ void __launch_bounds__(512)
                        long q_rs,
                        float scale,
                        int pos_stride,
+                       int start_stride,
+                       int rope_stride,
                        const float* __restrict__ q_norm_w,       // [HEAD_DIM], pre-scaled (1+w)
                        const float* __restrict__ cos_t,          // [max_len, rope_dim]
                        const float* __restrict__ sin_t,          // [max_len, rope_dim]
@@ -445,9 +449,19 @@ __global__ void __launch_bounds__(512)
     const int lane = threadIdx.x & 31;
     const int s = warp_id;
 
-    // valid KV positions: 0..pos inclusive; a shared scalar when pos_stride
-    // is 0, one per row otherwise
+    // valid KV positions: [start, pos] inclusive; a shared scalar when the
+    // strides are 0, one per row otherwise. A dense cache row may hold a
+    // left-padded prompt (pad columns first) or sit behind a decode front that
+    // moved past earlier columns, so the batch supplies the first valid column
+    // — exactly the span the dense mask would reveal.
     const int pos = (int)write_pos[row * pos_stride];
+    const int start = kv_start == nullptr ? 0 : (int)kv_start[row * start_stride];
+    const int window = pos - start + 1;  // number of valid positions
+    // RoPE position of this step's token. A padded prompt is stored at its
+    // padded columns but roped at its logic positions, so the two differ
+    // whenever the row carries leading pad columns; absent means "same as the
+    // write column".
+    const int rope = rope_pos == nullptr ? pos : (int)rope_pos[row * rope_stride];
     // This block's K/V row context: the dense plane base (computed once, as
     // the pre-paged kernel did) or this row's page-table slice.
     auto k_row = k_addr.row(row, kv_head);
@@ -492,8 +506,8 @@ __global__ void __launch_bounds__(512)
         for (int e = 0; e < EPL; e++) pair[e] = __shfl_sync(0xffffffff, q_reg[e], partner);
         if (j0 < rope_dim) {
             const bool first_half = j0 < rope_dim / 2;
-            const float* crow = cos_t + (long)pos * rope_dim + j0;
-            const float* srow = sin_t + (long)pos * rope_dim + j0;
+            const float* crow = cos_t + (long)rope * rope_dim + j0;
+            const float* srow = sin_t + (long)rope * rope_dim + j0;
 #pragma unroll
             for (int e = 0; e < EPL; e++)
                 q_reg[e] = q_reg[e] * crow[e] + (first_half ? -pair[e] : pair[e]) * srow[e];
@@ -528,8 +542,8 @@ __global__ void __launch_bounds__(512)
         for (int e = 0; e < EPL; e++) kpair[e] = __shfl_sync(0xffffffff, k_reg[e], kpartner);
         if (kj0 < rope_dim) {
             const bool kfirst = kj0 < rope_dim / 2;
-            const float* kcrow = cos_t + (long)pos * rope_dim + kj0;
-            const float* ksrow = sin_t + (long)pos * rope_dim + kj0;
+            const float* kcrow = cos_t + (long)rope * rope_dim + kj0;
+            const float* ksrow = sin_t + (long)rope * rope_dim + kj0;
 #pragma unroll
             for (int e = 0; e < EPL; e++)
                 k_reg[e] = k_reg[e] * kcrow[e] + (kfirst ? -kpair[e] : kpair[e]) * ksrow[e];
@@ -551,14 +565,16 @@ __global__ void __launch_bounds__(512)
     for (int e = 0; e < EPL; e++) out_reg[e] = 0.0f;
 
     // UNROLL positions in flight so their K loads overlap and hide HBM latency.
+    // The warps partition the valid window [start, pos]: warp s takes offsets
+    // s, s + split, ... within it, so a clipped window costs only its own span.
     constexpr int UNROLL = 4;
-    for (int base = s; base <= pos; base += UNROLL * split) {
+    for (int base = s; base < window; base += UNROLL * split) {
         float k_reg[UNROLL][EPL];
         int idx[UNROLL];
 #pragma unroll
         for (int u = 0; u < UNROLL; u++) {
-            idx[u] = base + u * split;
-            if (idx[u] <= pos) {
+            idx[u] = start + base + u * split;
+            if (base + u * split < window) {
                 const __nv_bfloat16* krow = k_row.at(idx[u], kv_head);
 #pragma unroll
                 for (int e = 0; e < EPL; e++) k_reg[u][e] = __bfloat162float(krow[lane * EPL + e]);
@@ -566,7 +582,7 @@ __global__ void __launch_bounds__(512)
         }
 #pragma unroll
         for (int u = 0; u < UNROLL; u++) {
-            if (idx[u] > pos) continue;  // uniform across the warp
+            if (base + u * split >= window) continue;  // uniform across the warp
             float dot = 0.0f;
 #pragma unroll
             for (int e = 0; e < EPL; e++) dot += q_reg[e] * k_reg[u][e];
@@ -613,7 +629,7 @@ __global__ void __launch_bounds__(512)
 #pragma unroll
             for (int e = 0; e < EPL; e++) acc[e] += s_out[t][lane * EPL + e] * wm;
         }
-        float inv = 1.0f / S;
+        float inv = S > 0.0f ? 1.0f / S : 0.0f;  // an empty window yields zeros, not NaNs
 #pragma unroll
         for (int e = 0; e < EPL; e++) {
             float v = acc[e] * inv;
@@ -625,18 +641,62 @@ __global__ void __launch_bounds__(512)
     }
 }
 
+// Optional per-row first valid KV column. Dense caches hold left-padded
+// prompts and rows that sit behind a decode front which moved past earlier
+// columns, so the decode scan must start where the row's own KV begins — the
+// span the dense attention mask would reveal. Absent means "scan from 0".
+static const int* kv_start_ptr(const c10::optional<at::Tensor>& kv_start)
+{
+    return kv_start.has_value() && kv_start->defined() ? kv_start->data_ptr<int>() : nullptr;
+}
+
+static int kv_start_stride(const c10::optional<at::Tensor>& kv_start)
+{
+    return kv_start.has_value() && kv_start->defined() && kv_start->numel() > 1 ? 1 : 0;
+}
+
+static const int64_t* rope_pos_ptr(const c10::optional<at::Tensor>& rope_pos)
+{
+    return rope_pos.has_value() && rope_pos->defined() ? rope_pos->data_ptr<int64_t>() : nullptr;
+}
+
+static int rope_pos_stride(const c10::optional<at::Tensor>& rope_pos)
+{
+    return rope_pos.has_value() && rope_pos->defined() && rope_pos->numel() > 1 ? 1 : 0;
+}
+
+static void check_rope_pos(const c10::optional<at::Tensor>& rope_pos, int64_t batch)
+{
+    if (!rope_pos.has_value() || !rope_pos->defined()) return;
+    TORCH_CHECK(rope_pos->is_cuda() && rope_pos->scalar_type() == at::ScalarType::Long &&
+                    (rope_pos->numel() == 1 || rope_pos->numel() == batch),
+                "rope_pos must be a CUDA int64 scalar or one entry per row");
+}
+
+static void check_kv_start(const c10::optional<at::Tensor>& kv_start, int64_t batch)
+{
+    if (!kv_start.has_value() || !kv_start->defined()) return;
+    TORCH_CHECK(kv_start->is_cuda() && kv_start->scalar_type() == at::ScalarType::Int &&
+                    (kv_start->numel() == 1 || kv_start->numel() == batch),
+                "kv_start must be a CUDA int32 scalar or one entry per row");
+}
+
 // Shared launch state for decode attention (dense and paged) so the kernel
 // wrapper lives in one place and both cache types run the same body.
 struct DecodeAttnShared {
     const __nv_bfloat16* q;
     __nv_bfloat16* out;
     const int64_t* write_pos;
+    const int* kv_start;
+    const int64_t* rope_pos;
     int num_q_heads;
     int num_kv_heads;
     long q_hs;
     long q_rs;
     float scale;
     int pos_stride;
+    int start_stride;
+    int rope_stride;
     const float* q_norm_w;
     const float* cos_t;
     const float* sin_t;
@@ -662,6 +722,8 @@ static void decode_attn_launch(const DecodeAttnShared& a, KVAddress k_addr, KVAd
         k_addr,
         v_addr,
         a.write_pos,
+        a.kv_start,
+        a.rope_pos,
         a.out,
         a.num_q_heads,
         a.num_kv_heads,
@@ -669,6 +731,8 @@ static void decode_attn_launch(const DecodeAttnShared& a, KVAddress k_addr, KVAd
         a.q_rs,
         a.scale,
         a.pos_stride,
+        a.start_stride,
+        a.rope_stride,
         a.q_norm_w,
         a.cos_t,
         a.sin_t,
@@ -698,7 +762,9 @@ void decode_attn(at::Tensor q,
                  at::Tensor v_raw,
                  at::Tensor k_norm_w,
                  double eps,
-                 int64_t rope_dim)
+                 int64_t rope_dim,
+                 c10::optional<at::Tensor> kv_start,
+                 c10::optional<at::Tensor> rope_pos)
 {
     TORCH_CHECK(q.is_cuda() && q.scalar_type() == at::ScalarType::BFloat16, "q must be CUDA bf16");
     // accept packed or chunked-[q|gate] layouts: last dim dense, uniform
@@ -738,6 +804,8 @@ void decode_attn(at::Tensor q,
     TORCH_CHECK(write_pos.numel() == 1 || write_pos.numel() == batch,
                 "write_pos must be a scalar or one entry per row");
     const int pos_stride = write_pos.numel() == 1 ? 0 : 1;
+    check_kv_start(kv_start, batch);
+    check_rope_pos(rope_pos, batch);
 
     // Optional fused q-side preprocessing: q_norm_w [head_dim] fp32
     // (pre-scaled 1+w), cos/sin tables [max_len, head_dim] fp32, gate with
@@ -775,12 +843,16 @@ void decode_attn(at::Tensor q,
     DecodeAttnShared shared{q_ptr,
                             o_ptr,
                             write_pos.data_ptr<int64_t>(),
+                            kv_start_ptr(kv_start),
+                            rope_pos_ptr(rope_pos),
                             (int)num_q_heads,
                             (int)num_kv_heads,
                             q_hs,
                             q_rs,
                             scale,
                             pos_stride,
+                            kv_start_stride(kv_start),
+                            rope_pos_stride(rope_pos),
                             qn_ptr,
                             cos_ptr,
                             sin_ptr,
@@ -833,7 +905,9 @@ void decode_attn_paged(at::Tensor q,
                        at::Tensor v_raw,
                        at::Tensor k_norm_w,
                        double eps,
-                       int64_t rope_dim)
+                       int64_t rope_dim,
+                       c10::optional<at::Tensor> kv_start,
+                       c10::optional<at::Tensor> rope_pos)
 {
     TORCH_CHECK(q.is_cuda() && q.scalar_type() == at::ScalarType::BFloat16, "q must be CUDA bf16");
     TORCH_CHECK(q.stride(-1) == 1, "q last dim must be dense");
@@ -860,6 +934,8 @@ void decode_attn_paged(at::Tensor q,
     TORCH_CHECK(out.numel() == q.numel(), "out shape mismatch");
     TORCH_CHECK(write_pos.numel() == 1 || write_pos.numel() == batch,
                 "write_pos must be a scalar or one entry per row");
+    check_kv_start(kv_start, batch);
+    check_rope_pos(rope_pos, batch);
     TORCH_CHECK(block_size > 0, "block_size must be positive");
     TORCH_CHECK(block_table.is_cuda() && block_table.scalar_type() == at::ScalarType::Int &&
                     block_table.dim() == 2 && block_table.is_contiguous(),
@@ -900,12 +976,16 @@ void decode_attn_paged(at::Tensor q,
     DecodeAttnShared shared{q_ptr,
                             o_ptr,
                             write_pos.data_ptr<int64_t>(),
+                            kv_start_ptr(kv_start),
+                            rope_pos_ptr(rope_pos),
                             (int)num_q_heads,
                             (int)num_kv_heads,
                             q_hs,
                             q_rs,
                             1.0f / sqrtf((float)head_dim),
                             write_pos.numel() == 1 ? 0 : 1,
+                            kv_start_stride(kv_start),
+                            rope_pos_stride(rope_pos),
                             qn_ptr,
                             cos_ptr,
                             sin_ptr,
@@ -1966,7 +2046,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
                                {},
                                {},
                                1e-6,
-                               0);
+                               0,
+                               c10::nullopt,
+                               c10::nullopt);
         },
         "batched decode attention (GQA, valid-length)",
         py::arg("q"),
@@ -2022,7 +2104,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("v_raw"),
           py::arg("k_norm_w"),
           py::arg("eps"),
-          py::arg("rope_dim"));
+          py::arg("rope_dim"),
+          py::arg("kv_start") = py::none(),
+          py::arg("rope_pos") = py::none());
     m.def(
         "decode_attn_paged",
         [](at::Tensor q,
@@ -2054,7 +2138,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
                                      {},
                                      {},
                                      1e-6,
-                                     0);
+                                     0,
+                                     c10::nullopt,
+                                     c10::nullopt);
         },
         "paged decode attention, bare path (GQA, block-table K/V)",
         py::arg("q"),
@@ -2089,7 +2175,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("v_raw"),
           py::arg("k_norm_w"),
           py::arg("eps"),
-          py::arg("rope_dim"));
+          py::arg("rope_dim"),
+          py::arg("kv_start") = py::none(),
+          py::arg("rope_pos") = py::none());
     m.def("decode_step_graph", &decode_step_graph, "graph-capturable decode step (CUDA)");
     m.def("gdn_gates", &gdn_gates, "fused GDN beta/g gating (CUDA)");
     m.def("fused_add_norm",
