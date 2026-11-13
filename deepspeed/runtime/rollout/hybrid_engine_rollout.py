@@ -1054,6 +1054,13 @@ class HybridEngineRollout(RolloutEngine):
         static_position_ids = state.static_position_ids
         static_write_positions = state.static_write_positions
         staging_cache = state.staging_cache
+        if not self.use_paged_cache:
+            # Only the static-cache path runs the decode kernels: paged caches
+            # address KV through block tables the kernel cannot read. Bind to
+            # this state's write-position storage — bucket caches hold slices
+            # of it, and the forward's identity gate is re-bound to each
+            # bucket's slice at capture/replay below.
+            self._install_segki_decode_kernels(module, static_write_positions, max_cache_len, device, model_dtype)
         staging_bytes = self._cache_bytes(staging_cache)
         captures_before = state.captures
         stats = {
@@ -1465,6 +1472,12 @@ class HybridEngineRollout(RolloutEngine):
             else:
                 cache.set_write_position(write_position)
                 cache.set_active_width(bucket.width)
+                if self.use_segki:
+                    # decode_attn's write-position gate compares object
+                    # identity: bind the forward to this bucket's slice so
+                    # the captured kernel reads the storage the cache writes.
+                    from deepspeed.module_inject.segment_ki import rebind_decode_write_pos
+                    rebind_decode_write_pos(module, write_position)
             attention_mask = self._bucket_attention_mask(cache, bucket)
             if is_paged:
                 self._paged_decode_step(cache, fi_positions)
@@ -1497,6 +1510,11 @@ class HybridEngineRollout(RolloutEngine):
         else:
             cache.set_write_position(write_position)
             cache.set_active_width(bucket.width)
+            if self.use_segki:
+                # decode_attn's write-position gate compares object identity:
+                # the eager fallback must read the storage the cache writes.
+                from deepspeed.module_inject.segment_ki import rebind_decode_write_pos
+                rebind_decode_write_pos(module, write_position)
         output = self._call_model(
             module,
             bucket.input_ids,
@@ -2703,6 +2721,41 @@ class HybridEngineRollout(RolloutEngine):
     # Graph capture decode loop
     # ------------------------------------------------------------------
 
+    def _install_segki_decode_kernels(self, module, write_pos, max_len, device, model_dtype):
+        """Install the segki decode kernels bound to ``write_pos``.
+
+        The decode_attn forward only runs when its cache's write-position
+        object is exactly the one installed here (object identity is the
+        graph-safety gate), so every static-cache path re-installs with the
+        position tensor its own cache writes through; later installs re-bind
+        the module to the new tensor. Paged caches address KV through block
+        tables the kernel cannot read, so callers gate on ``use_paged_cache``.
+        """
+        if not self.use_segki:
+            return 0
+        try:
+            from deepspeed.module_inject.segment_ki import install_decode_attention, install_fused_norm, install_lm_head
+            from deepspeed.ops.module_inject import get_fused_glu_op
+            attn_op = get_fused_glu_op()
+            # Full-length RoPE tables for the fused q-side path; positions
+            # are indexed on-device at replay time, so the addresses stay
+            # fixed for the captured graph.
+            cos_t = sin_t = None
+            rotary = getattr(getattr(module, "model", module), "rotary_emb", None)
+            if rotary is not None:
+                with torch.no_grad():
+                    positions = torch.arange(max_len, device=device)[None, :]
+                    cos_t, sin_t = rotary(torch.zeros(1, max_len, dtype=model_dtype, device=device), positions)
+                    cos_t = cos_t[0].float().contiguous()
+                    sin_t = sin_t[0].float().contiguous()
+            patched = install_decode_attention(module, write_pos, attn_op, cos_table=cos_t,
+                                               sin_table=sin_t) if hasattr(attn_op, "decode_attn") else 0
+            install_fused_norm(module, attn_op)
+            install_lm_head(module, attn_op)
+            return patched
+        except Exception:
+            return 0
+
     def _generate_from_staged_prefill(self, prompt_ids, prompt_attn, max_new_tokens, pad_token_id, module, device):
         """Stage a long prompt in chunks, then let HuggingFace generate from the filled cache.
 
@@ -2874,34 +2927,10 @@ class HybridEngineRollout(RolloutEngine):
         write_pos.fill_(prompt_len)
 
         # Replace SDPA in the full-attention layers with the custom
-        # decode_attn kernel for the b=1 decode steps (prefill and any
+        # decode_attn kernel for the decode steps (prefill and any
         # non-graph path keep the original forward). Must happen before the
         # warmup forwards so the captured graph records the kernel.
-        attn_patched = 0
-        module._ki_fused_norm_patched = 0
-        if self.use_segki:
-            try:
-                from deepspeed.module_inject.segment_ki import install_decode_attention, install_fused_norm, install_lm_head
-                from deepspeed.ops.module_inject import get_fused_glu_op
-                attn_op = get_fused_glu_op()
-                # Full-length RoPE tables for the fused q-side path; positions
-                # are indexed on-device at replay time, so the addresses stay
-                # fixed for the captured graph.
-                cos_t = sin_t = None
-                rotary = getattr(getattr(module, "model", module), "rotary_emb", None)
-                if rotary is not None:
-                    with torch.no_grad():
-                        positions = torch.arange(max_len, device=device)[None, :]
-                        cos_t, sin_t = rotary(torch.zeros(1, max_len, dtype=model_dtype, device=device), positions)
-                        cos_t = cos_t[0].float().contiguous()
-                        sin_t = sin_t[0].float().contiguous()
-                attn_patched = install_decode_attention(module, write_pos, attn_op, cos_table=cos_t,
-                                                        sin_table=sin_t) if hasattr(attn_op, "decode_attn") else 0
-                module._ki_fused_norm_patched = install_fused_norm(module, attn_op)
-                install_lm_head(module, attn_op)
-            except Exception:
-                attn_patched = 0
-                module._ki_fused_norm_patched = 0
+        self._install_segki_decode_kernels(module, write_pos, max_len, device, model_dtype)
 
         # Snapshot the GDN states right after prefill: the warmup forwards
         # advance conv/recurrent states by extra steps, so they must be
