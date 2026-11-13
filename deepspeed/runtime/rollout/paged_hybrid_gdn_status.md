@@ -247,3 +247,28 @@ Verification status:
   head_dim 64/128/256, bare and fused; then the b=4 3072→1024 bench
   (`--use-paged-cache --enable-paged-prefill --use-segki --segki-paged-decode`)
   against static and the native paged path.
+
+## Update — static decode drift fixed, hybrid chunked prefill enabled
+
+**Bug 2 (static fused `decode_attn` token drift).** Root cause: a dense cache row holds the
+whole left-padded prompt and the dense mask hides its pad columns, but the fused kernel
+scanned every column up to the write position; it also roped the step's token at the write
+column, while the prompt's keys were roped at their logic positions
+(`_prefill_position_ids` = the mask's cumsum). Neither can show up outside continuous
+batching — the non-continuous path falls back to SDPA for padded prompts
+(`_ki_prompt_padded`) — which is why the handoff saw it as a static-only, b=4-row-2 flip
+(279 vs 393). Fix: a per-row `kv_start` clips the scan to `[start, pos]` and a per-row
+`rope_pos` selects the cos/sin row; the graph path binds the same slices the cache writes
+through (identity-gated like `write_pos`), rows behind a moved decode front are clipped the
+same way, and idle rows park at a one-token window instead of scanning the whole cache.
+Register counts are unchanged (paged 40/56/86, dense 40/62/90 at dim 64/128/256, no spills).
+
+**Hybrid chunked prefill.** Staged prompts now keep their GDN state in the staging cache's
+own pools (`hybrid_gdn_state_shapes` + `adopt_gdn_pools`, active-prefix updates per chunk),
+the pooled conv update follows HF's protocol for windows shorter than the conv kernel
+(state-plus-window out, left-padded tail stored), and publish moves a staged row's
+conv/recurrent state together with its KV — into the decode cache's pooled slot (static) or
+its per-row GDN pools (paged hybrid). The validator's blanket rejection is gone; prefix
+reuse and trimming stay fail-closed, and the paged path still requires
+`enable_paged_prefill`. A chunked run lands on the same cache state and tokens as the
+one-shot prefill (bit-exact on CPU).
