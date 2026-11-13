@@ -184,6 +184,11 @@ class HybridEngineRolloutConfig:
     enable_torch_compile: bool = False
     use_flashinfer_prefill: bool = False
     use_flashinfer_decode: bool = False
+    # Run the segki fused decode-attention kernel over a paged cache (the
+    # block-table variant of the static path's decode_attn). Requires
+    # use_segki and a CUDA build with decode_attn_paged; unsupported shapes
+    # fall back to the native paged forward.
+    use_segki_paged_decode: bool = False
     enable_compiled_sampler: bool = False
 
 
@@ -341,6 +346,7 @@ class HybridEngineRollout(RolloutEngine):
         self.enable_torch_compile = getattr(cfg, 'enable_torch_compile', False) if cfg else False
         self.use_flashinfer_prefill = getattr(cfg, 'use_flashinfer_prefill', False) if cfg else False
         self.use_flashinfer_decode = getattr(cfg, 'use_flashinfer_decode', False) if cfg else False
+        self.use_segki_paged_decode = getattr(cfg, 'use_segki_paged_decode', False) if cfg else False
         self.enable_compiled_sampler = getattr(cfg, 'enable_compiled_sampler', False) if cfg else False
         if self.enable_compiled_sampler:
             configure_compiled_sampler(True)
@@ -1049,12 +1055,14 @@ class HybridEngineRollout(RolloutEngine):
         static_position_ids = state.static_position_ids
         static_write_positions = state.static_write_positions
         staging_cache = state.staging_cache
-        if not self.use_paged_cache:
-            # Only the static-cache path runs the decode kernels: paged caches
-            # address KV through block tables the kernel cannot read. Bind to
+        if not self.use_paged_cache or self.use_segki_paged_decode:
+            # The static-cache path always runs the decode kernels; a paged
+            # cache takes the block-table variant of the same kernel when it is
+            # enabled (the dense kernel cannot read a block table). Bind to
             # this state's write-position storage — bucket caches hold slices
             # of it, and the forward's identity gate is re-bound to each
-            # bucket's slice at capture/replay below.
+            # bucket's slice at capture/replay below; the paged path uses the
+            # whole tensor.
             self._install_segki_decode_kernels(module, static_write_positions, max_cache_len, device, model_dtype)
         staging_bytes = self._cache_bytes(staging_cache)
         captures_before = state.captures

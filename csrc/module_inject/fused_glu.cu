@@ -354,18 +354,48 @@ void quad_gemv(at::Tensor hidden,
 // merged through shared memory. Each lane owns a contiguous 16B slice of
 // the head dimension (HEAD_DIM/32 elements) for coalesced K/V row loads.
 
+// KV addressing for decode attention. Dense caches keep one contiguous plane
+// per (row, kv head) — a position is plane_base + pos * HEAD_DIM. A paged
+// cache keeps one block table per row over a shared block pool, so the same
+// position resolves through the page table to
+// pool[(block * block_size + offset) * num_kv_heads + kv_head]. Both policies
+// expose the same at(row, kv_head, position) accessor, which keeps the kernel
+// body (norm, partial RoPE, online softmax, gate) one implementation.
 template <int HEAD_DIM>
+struct DenseKVAddress {
+    __nv_bfloat16* __restrict__ base;
+    long plane_stride;  // max_len * HEAD_DIM
+    int num_kv_heads;
+    __device__ __forceinline__ __nv_bfloat16* at(int row, int kv_head, int idx) const {
+        return base + ((long)(row * num_kv_heads + kv_head)) * plane_stride + (long)idx * HEAD_DIM;
+    }
+};
+
+template <int HEAD_DIM>
+struct PagedKVAddress {
+    __nv_bfloat16* __restrict__ pool;    // [num_slots * num_kv_heads, HEAD_DIM]
+    const int* __restrict__ table;       // [rows, blocks_per_row] block ids
+    int block_size;
+    int blocks_per_row;
+    int num_kv_heads;
+    __device__ __forceinline__ __nv_bfloat16* at(int row, int kv_head, int idx) const {
+        const int block = table[(long)row * blocks_per_row + idx / block_size];
+        const int slot = block * block_size + (idx - (idx / block_size) * block_size);
+        return pool + ((long)slot * num_kv_heads + kv_head) * HEAD_DIM;
+    }
+};
+
+template <int HEAD_DIM, class KVAddress>
 __global__ void __launch_bounds__(512)
     decode_attn_kernel(const __nv_bfloat16* __restrict__ q,
-                       __nv_bfloat16* __restrict__ K,
-                       __nv_bfloat16* __restrict__ V,
+                       KVAddress k_addr,
+                       KVAddress v_addr,
                        const int64_t* __restrict__ write_pos,
                        __nv_bfloat16* __restrict__ out,
                        int num_q_heads,
                        int num_kv_heads,
                        long q_hs,
                        long q_rs,
-                       int max_len,
                        float scale,
                        int pos_stride,
                        const float* __restrict__ q_norm_w,       // [HEAD_DIM], pre-scaled (1+w)
@@ -396,8 +426,6 @@ __global__ void __launch_bounds__(512)
     // is 0, one per row otherwise
     const int pos = (int)write_pos[row * pos_stride];
 
-    __nv_bfloat16* Kg = K + ((long)(row * num_kv_heads + kv_head)) * max_len * HEAD_DIM;
-    __nv_bfloat16* Vg = V + ((long)(row * num_kv_heads + kv_head)) * max_len * HEAD_DIM;
     // q/gate may be sliced out of a wider fused row block (e.g. fused[:, :qn]
     // of a q|k|v concat), so rows advance by the caller-provided row stride,
     // not the packed num_q_heads * q_hs
@@ -479,8 +507,8 @@ __global__ void __launch_bounds__(512)
             for (int e = 0; e < EPL; e++)
                 k_reg[e] = k_reg[e] * kcrow[e] + (kfirst ? -kpair[e] : kpair[e]) * ksrow[e];
         }
-        __nv_bfloat16* k_slot = Kg + (long)pos * HEAD_DIM;
-        __nv_bfloat16* v_slot = Vg + (long)pos * HEAD_DIM;
+        __nv_bfloat16* k_slot = k_addr.at(row, kv_head, pos);
+        __nv_bfloat16* v_slot = v_addr.at(row, kv_head, pos);
         const __nv_bfloat16* v_in_row = v_raw + ((long)(row * num_kv_heads + kv_head)) * HEAD_DIM;
 #pragma unroll
         for (int e = 0; e < EPL; e++) {
@@ -504,7 +532,7 @@ __global__ void __launch_bounds__(512)
         for (int u = 0; u < UNROLL; u++) {
             idx[u] = base + u * split;
             if (idx[u] <= pos) {
-                const __nv_bfloat16* krow = Kg + (long)idx[u] * HEAD_DIM;
+                const __nv_bfloat16* krow = k_addr.at(row, kv_head, idx[u]);
 #pragma unroll
                 for (int e = 0; e < EPL; e++) k_reg[u][e] = __bfloat162float(krow[lane * EPL + e]);
             }
@@ -525,7 +553,7 @@ __global__ void __launch_bounds__(512)
             sum_exp = sum_exp * rescale + weight;
 #pragma unroll
             for (int e = 0; e < EPL; e++) out_reg[e] *= rescale;
-            const __nv_bfloat16* vrow = Vg + (long)idx[u] * HEAD_DIM;
+            const __nv_bfloat16* vrow = v_addr.at(row, kv_head, idx[u]);
 #pragma unroll
             for (int e = 0; e < EPL; e++)
                 out_reg[e] += weight * __bfloat162float(vrow[lane * EPL + e]);
@@ -568,6 +596,62 @@ __global__ void __launch_bounds__(512)
                 __float2bfloat16_rn(v);
         }
     }
+}
+
+// Shared launch state for decode attention (dense and paged) so the kernel
+// wrapper lives in one place and both cache types run the same body.
+struct DecodeAttnShared {
+    const __nv_bfloat16* q;
+    __nv_bfloat16* out;
+    const int64_t* write_pos;
+    int num_q_heads;
+    int num_kv_heads;
+    long q_hs;
+    long q_rs;
+    float scale;
+    int pos_stride;
+    const float* q_norm_w;
+    const float* cos_t;
+    const float* sin_t;
+    const __nv_bfloat16* gate;
+    const __nv_bfloat16* k_raw;
+    const __nv_bfloat16* v_raw;
+    const float* k_norm_w;
+    float eps;
+    int rope_dim;
+    int64_t batch;
+};
+
+template <int HEAD_DIM, class KVAddress>
+static void decode_attn_launch(const DecodeAttnShared& a, KVAddress k_addr, KVAddress v_addr)
+{
+    // 16 warps/block (512 threads) so each query head gets a 4-way KV split —
+    // the per-warp stream is otherwise latency-bound at these sizes. More
+    // warps than this exhaust registers with __launch_bounds__(512).
+    const int warps_per_block = 16;
+    auto stream = at::cuda::getCurrentCUDAStream();
+    decode_attn_kernel<HEAD_DIM, KVAddress><<<(int)(a.batch * a.num_q_heads), warps_per_block * 32, 0, stream>>>(
+        a.q,
+        k_addr,
+        v_addr,
+        a.write_pos,
+        a.out,
+        a.num_q_heads,
+        a.num_kv_heads,
+        a.q_hs,
+        a.q_rs,
+        a.scale,
+        a.pos_stride,
+        a.q_norm_w,
+        a.cos_t,
+        a.sin_t,
+        a.gate,
+        a.k_raw,
+        a.v_raw,
+        a.k_norm_w,
+        a.eps,
+        a.rope_dim);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 void decode_attn(at::Tensor q,
@@ -646,7 +730,6 @@ void decode_attn(at::Tensor q,
                 "rope_dim/2 must be a multiple of the per-lane element count");
 
     float scale = 1.0f / sqrtf((float)head_dim);
-    auto stream = at::cuda::getCurrentCUDAStream();
     auto q_ptr = reinterpret_cast<const __nv_bfloat16*>(q.data_ptr<at::BFloat16>());
     auto k_ptr = reinterpret_cast<__nv_bfloat16*>(K.data_ptr<at::BFloat16>());
     auto v_ptr = reinterpret_cast<__nv_bfloat16*>(V.data_ptr<at::BFloat16>());
@@ -662,84 +745,175 @@ void decode_attn(at::Tensor q,
     auto g_ptr = use_gate ? reinterpret_cast<const __nv_bfloat16*>(gate.data_ptr<at::BFloat16>())
                           : nullptr;
 
+    DecodeAttnShared shared{q_ptr,
+                            o_ptr,
+                            write_pos.data_ptr<int64_t>(),
+                            (int)num_q_heads,
+                            (int)num_kv_heads,
+                            q_hs,
+                            q_rs,
+                            scale,
+                            pos_stride,
+                            qn_ptr,
+                            cos_ptr,
+                            sin_ptr,
+                            g_ptr,
+                            k_raw_ptr,
+                            v_raw_ptr,
+                            k_norm_ptr,
+                            (float)eps,
+                            (int)rope_dim,
+                            batch};
+    const long plane_stride = (long)max_len * head_dim;
     switch (head_dim) {
         case 64:
-            decode_attn_kernel<64><<<(int)(batch * num_q_heads), warps_per_block * 32, 0, stream>>>(
-                q_ptr,
-                k_ptr,
-                v_ptr,
-                write_pos.data_ptr<int64_t>(),
-                o_ptr,
-                (int)num_q_heads,
-                (int)num_kv_heads,
-                q_hs,
-                q_rs,
-                (int)max_len,
-                scale,
-                pos_stride,
-                qn_ptr,
-                cos_ptr,
-                sin_ptr,
-                g_ptr,
-                k_raw_ptr,
-                v_raw_ptr,
-                k_norm_ptr,
-                (float)eps,
-                (int)rope_dim);
+            decode_attn_launch<64>(shared, DenseKVAddress<64>{k_ptr, plane_stride, (int)num_kv_heads},
+                                   DenseKVAddress<64>{v_ptr, plane_stride, (int)num_kv_heads});
             break;
         case 128:
-            decode_attn_kernel<128>
-                <<<(int)(batch * num_q_heads), warps_per_block * 32, 0, stream>>>(
-                    q_ptr,
-                    k_ptr,
-                    v_ptr,
-                    write_pos.data_ptr<int64_t>(),
-                    o_ptr,
-                    (int)num_q_heads,
-                    (int)num_kv_heads,
-                    q_hs,
-                    q_rs,
-                    (int)max_len,
-                    scale,
-                    pos_stride,
-                    qn_ptr,
-                    cos_ptr,
-                    sin_ptr,
-                    g_ptr,
-                    k_raw_ptr,
-                    v_raw_ptr,
-                    k_norm_ptr,
-                    (float)eps,
-                    (int)rope_dim);
+            decode_attn_launch<128>(shared, DenseKVAddress<128>{k_ptr, plane_stride, (int)num_kv_heads},
+                                    DenseKVAddress<128>{v_ptr, plane_stride, (int)num_kv_heads});
             break;
         case 256:
-            decode_attn_kernel<256>
-                <<<(int)(batch * num_q_heads), warps_per_block * 32, 0, stream>>>(
-                    q_ptr,
-                    k_ptr,
-                    v_ptr,
-                    write_pos.data_ptr<int64_t>(),
-                    o_ptr,
-                    (int)num_q_heads,
-                    (int)num_kv_heads,
-                    q_hs,
-                    q_rs,
-                    (int)max_len,
-                    scale,
-                    pos_stride,
-                    qn_ptr,
-                    cos_ptr,
-                    sin_ptr,
-                    g_ptr,
-                    k_raw_ptr,
-                    v_raw_ptr,
-                    k_norm_ptr,
-                    (float)eps,
-                    (int)rope_dim);
+            decode_attn_launch<256>(shared, DenseKVAddress<256>{k_ptr, plane_stride, (int)num_kv_heads},
+                                    DenseKVAddress<256>{v_ptr, plane_stride, (int)num_kv_heads});
             break;
         default: TORCH_CHECK(false, "Unsupported head_dim: ", head_dim);
     }
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// Paged decode attention: same fused body, but K/V are addressed through a
+// per-row block table over a shared block pool. The caller passes the pool as
+// a flat [num_slots * num_kv_heads, head_dim] tensor, the int32 block table
+// [rows, blocks_per_row] of the paged cache, and the block size; a position's
+// slot is block_table[row, pos / block_size] * block_size + pos % block_size.
+void decode_attn_paged(at::Tensor q,
+                       at::Tensor K_pool,
+                       at::Tensor V_pool,
+                       at::Tensor block_table,
+                       at::Tensor write_pos,
+                       at::Tensor out,
+                       int64_t num_q_heads,
+                       int64_t num_kv_heads,
+                       int64_t head_dim,
+                       int64_t table_len,
+                       int64_t block_size,
+                       at::Tensor q_norm_w,
+                       at::Tensor cos_t,
+                       at::Tensor sin_t,
+                       at::Tensor gate,
+                       at::Tensor k_raw,
+                       at::Tensor v_raw,
+                       at::Tensor k_norm_w,
+                       double eps,
+                       int64_t rope_dim)
+{
+    TORCH_CHECK(q.is_cuda() && q.scalar_type() == at::ScalarType::BFloat16, "q must be CUDA bf16");
+    TORCH_CHECK(q.stride(-1) == 1, "q last dim must be dense");
+    const long q_hs = q.stride(-2);
+    const long q_rs = (q.dim() == 3) ? q.stride(0) : num_q_heads * q_hs;
+    TORCH_CHECK(gate.defined() ? (gate.stride(-1) == 1 && gate.stride(-2) == q_hs &&
+                                  (gate.dim() != 3 || gate.stride(0) == q_rs))
+                               : true,
+                "gate layout must match q");
+    TORCH_CHECK(write_pos.is_cuda() && write_pos.scalar_type() == at::ScalarType::Long,
+                "write_pos must be a CUDA int64 tensor");
+    TORCH_CHECK(num_q_heads % num_kv_heads == 0,
+                "GQA requires num_q_heads divisible by num_kv_heads");
+    const int q_per_kv = (int)(num_q_heads / num_kv_heads);
+    const int warps_per_block = 16;
+    TORCH_CHECK(warps_per_block % q_per_kv == 0,
+                "q heads per KV head (",
+                q_per_kv,
+                ") must divide ",
+                warps_per_block);
+    TORCH_CHECK(head_dim % 32 == 0, "head_dim must be a multiple of 32, got ", head_dim);
+    const int64_t batch = q.numel() / (num_q_heads * head_dim);
+    TORCH_CHECK(batch >= 1 && q.numel() == batch * num_q_heads * head_dim, "q shape mismatch");
+    TORCH_CHECK(out.numel() == q.numel(), "out shape mismatch");
+    TORCH_CHECK(write_pos.numel() == 1 || write_pos.numel() == batch,
+                "write_pos must be a scalar or one entry per row");
+    TORCH_CHECK(block_size > 0, "block_size must be positive");
+    TORCH_CHECK(block_table.is_cuda() && block_table.scalar_type() == at::ScalarType::Int &&
+                    block_table.dim() == 2 && block_table.is_contiguous(),
+                "block_table must be a contiguous CUDA int32 [rows, blocks] tensor");
+    TORCH_CHECK(block_table.size(0) >= batch, "block_table must cover every decoding row");
+    TORCH_CHECK(K_pool.is_contiguous() && V_pool.is_contiguous(), "paged K/V pool must be contiguous");
+    TORCH_CHECK(K_pool.dim() == 2 && K_pool.size(-1) == head_dim, "paged K pool must be [slots * kv_heads, head_dim]");
+    TORCH_CHECK(V_pool.numel() == K_pool.numel(), "paged V pool must match the K pool");
+
+    const bool fuse_q = q_norm_w.defined() && q_norm_w.numel() == head_dim;
+    const bool use_gate = gate.defined() && gate.numel() == q.numel();
+    const bool fuse_k = k_raw.defined() && k_raw.numel() > 0 && k_norm_w.defined();
+    TORCH_CHECK(!fuse_k || (k_raw.is_contiguous() && v_raw.is_contiguous()),
+                "k_raw/v_raw must be contiguous");
+    TORCH_CHECK(!fuse_k || (fuse_q), "fused K requires the fused Q path (shared cos/sin)");
+    TORCH_CHECK(!fuse_q || (cos_t.defined() && sin_t.defined() &&
+                            cos_t.numel() == table_len * rope_dim && sin_t.numel() == cos_t.numel()),
+                "fused q path needs cos/sin tables of [table_len, rope_dim]");
+    TORCH_CHECK(!fuse_q || (rope_dim % (2 * (head_dim / 32)) == 0),
+                "rope_dim/2 must be a multiple of the per-lane element count");
+
+    auto q_ptr = reinterpret_cast<const __nv_bfloat16*>(q.data_ptr<at::BFloat16>());
+    auto k_ptr = reinterpret_cast<__nv_bfloat16*>(K_pool.data_ptr<at::BFloat16>());
+    auto v_ptr = reinterpret_cast<__nv_bfloat16*>(V_pool.data_ptr<at::BFloat16>());
+    auto o_ptr = reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>());
+    auto table_ptr = block_table.data_ptr<int>();
+    auto k_raw_ptr = fuse_k ? reinterpret_cast<const __nv_bfloat16*>(k_raw.data_ptr<at::BFloat16>())
+                            : nullptr;
+    auto v_raw_ptr = fuse_k ? reinterpret_cast<const __nv_bfloat16*>(v_raw.data_ptr<at::BFloat16>())
+                            : nullptr;
+    auto k_norm_ptr = fuse_k ? k_norm_w.data_ptr<float>() : nullptr;
+    auto qn_ptr = fuse_q ? q_norm_w.data_ptr<float>() : nullptr;
+    auto cos_ptr = fuse_q ? cos_t.data_ptr<float>() : nullptr;
+    auto sin_ptr = fuse_q ? sin_t.data_ptr<float>() : nullptr;
+    auto g_ptr = use_gate ? reinterpret_cast<const __nv_bfloat16*>(gate.data_ptr<at::BFloat16>())
+                          : nullptr;
+
+    DecodeAttnShared shared{q_ptr,
+                            o_ptr,
+                            write_pos.data_ptr<int64_t>(),
+                            (int)num_q_heads,
+                            (int)num_kv_heads,
+                            q_hs,
+                            q_rs,
+                            1.0f / sqrtf((float)head_dim),
+                            write_pos.numel() == 1 ? 0 : 1,
+                            qn_ptr,
+                            cos_ptr,
+                            sin_ptr,
+                            g_ptr,
+                            k_raw_ptr,
+                            v_raw_ptr,
+                            k_norm_ptr,
+                            (float)eps,
+                            (int)rope_dim,
+                            batch};
+    const int blocks_per_row = (int)block_table.size(1);
+    switch (head_dim) {
+        case 64:
+            decode_attn_launch<64>(shared,
+                                   PagedKVAddress<64>{k_ptr, table_ptr, (int)block_size, blocks_per_row,
+                                                      (int)num_kv_heads},
+                                   PagedKVAddress<64>{v_ptr, table_ptr, (int)block_size, blocks_per_row,
+                                                      (int)num_kv_heads});
+            break;
+        case 128:
+            decode_attn_launch<128>(shared,
+                                    PagedKVAddress<128>{k_ptr, table_ptr, (int)block_size, blocks_per_row,
+                                                        (int)num_kv_heads},
+                                    PagedKVAddress<128>{v_ptr, table_ptr, (int)block_size, blocks_per_row,
+                                                        (int)num_kv_heads});
+            break;
+        case 256:
+            decode_attn_launch<256>(shared,
+                                    PagedKVAddress<256>{k_ptr, table_ptr, (int)block_size, blocks_per_row,
+                                                        (int)num_kv_heads},
+                                    PagedKVAddress<256>{v_ptr, table_ptr, (int)block_size, blocks_per_row,
+                                                        (int)num_kv_heads});
+            break;
+        default: TORCH_CHECK(false, "Unsupported head_dim: ", head_dim);
+    }
 }
 
 // ─── Fused residual add + RMSNorm (b=1 decode) ───
@@ -1447,6 +1621,8 @@ py::dict segki_capabilities()
     d["fused_rope_q"] = true;
     d["fused_rope_k"] = true;
     d["fused_cache_write"] = true;
+    d["paged_cache_write"] = true;
+    d["paged_decode_attn"] = true;
     d["inplace_recurrent"] = true;
     return d;
 }
@@ -1811,6 +1987,73 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("num_kv_heads"),
           py::arg("head_dim"),
           py::arg("max_len"),
+          py::arg("q_norm_w"),
+          py::arg("cos_t"),
+          py::arg("sin_t"),
+          py::arg("gate"),
+          py::arg("k_raw"),
+          py::arg("v_raw"),
+          py::arg("k_norm_w"),
+          py::arg("eps"),
+          py::arg("rope_dim"));
+    m.def(
+        "decode_attn_paged",
+        [](at::Tensor q,
+           at::Tensor K_pool,
+           at::Tensor V_pool,
+           at::Tensor block_table,
+           at::Tensor write_pos,
+           at::Tensor out,
+           int64_t num_q_heads,
+           int64_t num_kv_heads,
+           int64_t head_dim,
+           int64_t block_size) {
+            return decode_attn_paged(q,
+                                     K_pool,
+                                     V_pool,
+                                     block_table,
+                                     write_pos,
+                                     out,
+                                     num_q_heads,
+                                     num_kv_heads,
+                                     head_dim,
+                                     0,
+                                     block_size,
+                                     {},
+                                     {},
+                                     {},
+                                     {},
+                                     {},
+                                     {},
+                                     {},
+                                     1e-6,
+                                     0);
+        },
+        "paged decode attention, bare path (GQA, block-table K/V)",
+        py::arg("q"),
+        py::arg("K_pool"),
+        py::arg("V_pool"),
+        py::arg("block_table"),
+        py::arg("write_pos"),
+        py::arg("out"),
+        py::arg("num_q_heads"),
+        py::arg("num_kv_heads"),
+        py::arg("head_dim"),
+        py::arg("block_size"));
+    m.def("decode_attn_paged",
+          &decode_attn_paged,
+          "paged decode attention (block-table K/V, GQA, valid-length, fused q-norm/rope/gate)",
+          py::arg("q"),
+          py::arg("K_pool"),
+          py::arg("V_pool"),
+          py::arg("block_table"),
+          py::arg("write_pos"),
+          py::arg("out"),
+          py::arg("num_q_heads"),
+          py::arg("num_kv_heads"),
+          py::arg("head_dim"),
+          py::arg("table_len"),
+          py::arg("block_size"),
           py::arg("q_norm_w"),
           py::arg("cos_t"),
           py::arg("sin_t"),

@@ -53,7 +53,12 @@ class PagedAttentionCache:
     allocated when a row first crosses a block boundary and released when the
     row retires (``compact``/``reset``). ``attention`` builds the atom list on
     the host, uploads it, and calls the blocked flash kernel.
+
+    ``is_paged_cache`` marks the cache for the segment-KI decode-attention
+    forward, which dispatches between its dense and block-table kernels on it.
     """
+
+    is_paged_cache = True
 
     def __init__(
         self,
@@ -585,6 +590,19 @@ class PagedAttentionCache:
             self._ensure_blocks(row, int(positions[local_row]) + q_len)
         self._step_prepared = True
         self._step_atoms = None
+
+    def note_step_written(self) -> None:
+        """Record that an external kernel wrote this step's K/V.
+
+        The fused decode-attention kernel stores K and V itself through the
+        block table, so the eager ``write`` path never runs for that step;
+        only the per-row lengths it would have updated need refreshing (they
+        back ``materialize`` and the tests).
+        """
+        if self._write_positions is None:
+            raise RuntimeError("paged cache write position was not set")
+        rows = self._active_rows
+        self.row_len[rows] = (self._write_positions[rows] + 1).to(torch.int32)
 
     def write(self, layer_idx: int, key_states: torch.Tensor, value_states: torch.Tensor) -> None:
         """Write post-RoPE K/V for the active rows at their current positions."""
