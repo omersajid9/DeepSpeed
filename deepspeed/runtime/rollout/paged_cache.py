@@ -59,6 +59,7 @@ class PagedAttentionCache:
         block_size: Optional[int] = None,
         use_flashinfer_prefill: bool = False,
         use_flashinfer_decode: bool = False,
+        num_kv_layers: Optional[int] = None,
     ) -> None:
         if batch_size <= 0:
             raise ValueError("paged cache requires a positive batch size")
@@ -67,6 +68,14 @@ class PagedAttentionCache:
 
         text_config = getattr(config, "text_config", config)
         self.num_layers = int(getattr(text_config, "num_hidden_layers"))
+        # Hybrid models carry KV only on their full-attention layers; the KV
+        # pool is sized for those and the layer table maps HF layer indices to
+        # slots (identity here, remapped by the hybrid subclass).
+        self.num_kv_layers = self.num_layers if num_kv_layers is None else int(num_kv_layers)
+        if not 1 <= self.num_kv_layers <= self.num_layers:
+            raise ValueError(f"num_kv_layers {self.num_kv_layers} outside [1, {self.num_layers}]")
+        self._layer_to_slot = list(range(self.num_kv_layers)) if self.num_kv_layers == self.num_layers \
+            else [None] * self.num_layers
         self.num_kv_heads = int(
             getattr(text_config, "num_key_value_heads", getattr(text_config, "num_attention_heads")))
         self.num_q_heads = int(getattr(text_config, "num_attention_heads"))
@@ -91,13 +100,13 @@ class PagedAttentionCache:
 
         cache_config = KVCacheConfig(
             block_size=self.block_size,
-            cache_shape=(self.num_layers, self.num_kv_heads, self.head_dim),
+            cache_shape=(self.num_kv_layers, self.num_kv_heads, self.head_dim),
             cache_dtype=DtypeEnum(dtype),
         )
         memory_config = MemoryConfig(mode=AllocationMode.ALLOCATE, size=num_blocks)
         self.kv_cache = BlockedKVCache((cache_config, ), memory_config)
         self._key_views, self._value_views = [], []
-        for layer_idx in range(self.num_layers):
+        for layer_idx in range(self.num_kv_layers):
             key, value = split_kv(self.kv_cache.get_cache(layer_idx))
             self._key_views.append(key)
             self._value_views.append(value)
@@ -151,6 +160,16 @@ class PagedAttentionCache:
     def layers(self) -> list[_PagedLayer]:
         return [_PagedLayer(key, value) for key, value in zip(self._key_views, self._value_views)]
 
+    def _kv_slot(self, layer_idx: int) -> int:
+        """Map an HF layer index to this cache's KV slot.
+
+        Pure-attention models map identity; hybrid caches raise for their
+        linear-attention layers, which keep no KV."""
+        slot = self._layer_to_slot[layer_idx]
+        if slot is None:
+            raise ValueError(f"layer {layer_idx} is a linear-attention layer and holds no paged KV")
+        return slot
+
     @property
     def memory_bytes(self) -> int:
         storage = sum(key.numel() * key.element_size() + value.numel() * value.element_size()
@@ -201,9 +220,10 @@ class PagedAttentionCache:
         self._zero_storage()
         self._init_graph_atom_structure()
         if self._graph_outputs is None:
-            self._graph_outputs = torch.empty((self.num_layers, self.max_batch_size, self.num_q_heads * self.head_dim),
-                                              dtype=self.dtype,
-                                              device=self.device)
+            self._graph_outputs = torch.empty(
+                (self.num_kv_layers, self.max_batch_size, self.num_q_heads * self.head_dim),
+                dtype=self.dtype,
+                device=self.device)
         if self.use_flashinfer_decode:
             self._init_flashinfer_decode_graph()
 
@@ -420,6 +440,7 @@ class PagedAttentionCache:
 
     def _flashinfer_decode_attention(self, layer_idx: int, query_states: torch.Tensor, scale: float) -> torch.Tensor:
         """Decode one token per row through FlashInfer's split-KV paged backend."""
+        slot = self._kv_slot(layer_idx)
         if not self._fi_step_planned:
             # No host plan was issued this step; derive one from the device state.
             rows = self._active_rows.tolist()
@@ -429,12 +450,12 @@ class PagedAttentionCache:
             wrapper = self._flashinfer_decode_wrapper
             self._fi_decode_q[:num_rows].copy_(query_states.squeeze(2))
             query = self._fi_decode_q
-            output = self._graph_outputs[layer_idx].view(self.max_batch_size, num_heads, head_dim)
+            output = self._graph_outputs[slot].view(self.max_batch_size, num_heads, head_dim)
         else:
             wrapper = self._get_eager_flashinfer_decode_wrapper()
             query = query_states.squeeze(2)
             output = torch.empty((num_rows, num_heads, head_dim), dtype=query_states.dtype, device=query_states.device)
-        paged_kv = (self._key_views[layer_idx], self._value_views[layer_idx])
+        paged_kv = (self._key_views[slot], self._value_views[slot])
         wrapper.run(query, paged_kv, out=output)
         return output[:num_rows].view(num_rows, 1, num_heads * head_dim)
 
@@ -533,13 +554,14 @@ class PagedAttentionCache:
             keys = keys[:, valid_mask]
             values = values[:, valid_mask]
         prompt_len = keys.shape[1]
+        slot = self._kv_slot(layer_idx)
         if not self._graph_safe:
             self._free_row(target_row)
         self._ensure_blocks(target_row, prompt_len)
         positions = torch.arange(prompt_len, device=self.device)
         slots = self._slots(torch.tensor([target_row], device=self.device), positions[:1], prompt_len)[0]
-        key_view = self._key_views[layer_idx].view(-1, self.num_kv_heads, self.head_dim)
-        value_view = self._value_views[layer_idx].view(-1, self.num_kv_heads, self.head_dim)
+        key_view = self._key_views[slot].view(-1, self.num_kv_heads, self.head_dim)
+        value_view = self._value_views[slot].view(-1, self.num_kv_heads, self.head_dim)
         key_view[slots] = keys.transpose(0, 1)
         value_view[slots] = values.transpose(0, 1)
         self.row_len[target_row] = prompt_len
@@ -562,6 +584,7 @@ class PagedAttentionCache:
         """Write post-RoPE K/V for the active rows at their current positions."""
         if self._write_positions is None:
             raise RuntimeError("paged cache write position was not set")
+        slot = self._kv_slot(layer_idx)
         rows = self._active_rows
         q_len = key_states.shape[2]
         if not self._graph_mode:
@@ -570,8 +593,8 @@ class PagedAttentionCache:
             raise ValueError("graph replay paged writes expect one token per row")
         positions = self._write_positions[rows]
         slots = self._slots(rows, positions, q_len)
-        key_view = self._key_views[layer_idx].view(-1, self.num_kv_heads, self.head_dim)
-        value_view = self._value_views[layer_idx].view(-1, self.num_kv_heads, self.head_dim)
+        key_view = self._key_views[slot].view(-1, self.num_kv_heads, self.head_dim)
+        value_view = self._value_views[slot].view(-1, self.num_kv_heads, self.head_dim)
         key_view[slots.reshape(-1)] = key_states.permute(0, 2, 1, 3).reshape(-1, self.num_kv_heads, self.head_dim)
         value_view[slots.reshape(-1)] = value_states.permute(0, 2, 1, 3).reshape(-1, self.num_kv_heads, self.head_dim)
         self.row_len[rows] = (positions + q_len).to(torch.int32)
@@ -625,6 +648,7 @@ class PagedAttentionCache:
 
     def _flashinfer_prefill_attention(self, layer_idx: int, query_states: torch.Tensor, scale: float) -> torch.Tensor:
         """Prefill a single prompt row through FlashInfer's paged-KV backend."""
+        slot = self._kv_slot(layer_idx)
         if query_states.shape[0] != 1:
             raise ValueError("FlashInfer prefill currently supports one active row")
         if self._graph_mode:
@@ -662,7 +686,7 @@ class PagedAttentionCache:
                      sm_scale=scale,
                      q_data_type=query_states.dtype,
                      kv_data_type=query_states.dtype)
-        output = wrapper.run(q, (self._key_views[layer_idx], self._value_views[layer_idx]))
+        output = wrapper.run(q, (self._key_views[slot], self._value_views[slot]))
         return output.view(1, q.shape[0], query_states.shape[1] * query_states.shape[3])
 
     def attention(self, layer_idx: int, query_states: torch.Tensor, scale: float) -> torch.Tensor:
@@ -675,6 +699,7 @@ class PagedAttentionCache:
         performs no host work.
         """
         num_rows, num_heads, q_len, head_dim = query_states.shape
+        slot = self._kv_slot(layer_idx)
         if q_len > 1 and self.use_flashinfer_prefill:
             return self._flashinfer_prefill_attention(layer_idx, query_states, scale)
         if q_len == 1 and self.use_flashinfer_decode:
@@ -687,24 +712,25 @@ class PagedAttentionCache:
             if num_rows != self._graph_width:
                 raise ValueError(f"graph replay row count {num_rows} does not match width {self._graph_width}")
             atoms = self._graph_atoms
-            output = self._graph_outputs[layer_idx][:num_rows]
+            output = self._graph_outputs[slot][:num_rows]
         else:
             atoms = self._build_atoms(q_len)
             output = torch.empty((num_rows * q_len, num_heads * head_dim),
                                  dtype=query_states.dtype,
                                  device=query_states.device)
         query = query_states.transpose(1, 2).reshape(num_rows * q_len, num_heads * head_dim)
-        self._kernel(output, query, self._key_views[layer_idx], self._value_views[layer_idx], atoms, scale)
+        self._kernel(output, query, self._key_views[slot], self._value_views[slot], atoms, scale)
         return output.view(num_rows, q_len, num_heads * head_dim)
 
     def materialize(self, layer_idx: int, row: int, length: Optional[int] = None) -> tuple[torch.Tensor, torch.Tensor]:
         """Gather a row's blocks into dense ``[heads, length, head_dim]`` K/V for tests."""
         if length is None:
             length = int(self.row_len[row])
+        slot = self._kv_slot(layer_idx)
         positions = torch.arange(length, device=self.device)
         slots = self._slots(torch.tensor([row], device=self.device), positions[:1], length)[0]
-        keys = self._key_views[layer_idx].view(-1, self.num_kv_heads, self.head_dim)[slots]
-        values = self._value_views[layer_idx].view(-1, self.num_kv_heads, self.head_dim)[slots]
+        keys = self._key_views[slot].view(-1, self.num_kv_heads, self.head_dim)[slots]
+        values = self._value_views[slot].view(-1, self.num_kv_heads, self.head_dim)[slots]
         return keys.transpose(0, 1), values.transpose(0, 1)
 
     def compact(self, active_indices: torch.Tensor) -> None:
@@ -785,6 +811,322 @@ class PagedAttentionCache:
         return self.num_layers
 
 
+class _HybridGDNLayer:
+    """Per-layer GDN state surface a hybrid paged cache exposes in ``layers``.
+
+    The model's GDN forward (and the segki fused GDN block) reads
+    ``record_past``, ``conv_states[0]`` and ``recurrent_states[0]`` off the
+    object it finds at ``cache.layers[layer_idx]``. The cache keeps those
+    entries as views into the per-row state pools, so the model's in-place
+    decode updates land on the pool rows directly."""
+
+    def __init__(self, layer_idx: int):
+        self.layer_idx = layer_idx
+        self.record_past = False
+        self.conv_states: dict = {0: None}
+        self.recurrent_states: dict = {0: None}
+
+    @property
+    def is_initialized(self) -> bool:
+        # The pools are preallocated with the cache; nothing to lazy-init.
+        return True
+
+
+class HybridPagedAttentionCache(PagedAttentionCache):
+    """Paged KV for full-attention layers plus per-row GDN state pools.
+
+    Hybrid models carry two cache types with opposite growth profiles: KV
+    scales with sequence length and is block-table addressed; GDN conv/
+    recurrent state is fixed-size per row and cannot be paged (there is no
+    temporal token structure to evict). This cache keeps the two in
+    physically distinct pools behind one cache object, the way an asymmetric
+    page table would: the KV pool is sized for the full-attention layers only,
+    and every GDN layer owns row-aligned pools that the model's GDN forward
+    updates in place through the HF cache protocol (get/update conv state,
+    get/update recurrent state, is_recording_past).
+
+    Row semantics: decode forwards run on the contiguous row prefix
+    ``[0, active_width)``, which the CUDA-graph buckets and the eager
+    compaction both guarantee (the in-place conv update needs a slice view of
+    the pool, so arbitrary row sets are rejected); a paged prefill targets
+    exactly one row, selected by ``set_active_rows`` while recording is on.
+    """
+
+    def __init__(
+        self,
+        config,
+        batch_size: int,
+        max_cache_len: int,
+        device,
+        dtype,
+        block_size: Optional[int] = None,
+        use_flashinfer_prefill: bool = False,
+        use_flashinfer_decode: bool = False,
+    ) -> None:
+        text_config = getattr(config, "text_config", config)
+        layer_types = list(getattr(text_config, "layer_types", None) or [])
+        gdn_idx = [i for i, t in enumerate(layer_types) if t == "linear_attention"]
+        if not gdn_idx:
+            raise ValueError("HybridPagedAttentionCache requires a config with linear-attention layers")
+        kv_idx = [i for i, t in enumerate(layer_types) if t != "linear_attention"]
+        super().__init__(config,
+                         batch_size,
+                         max_cache_len,
+                         device,
+                         dtype,
+                         block_size=block_size,
+                         use_flashinfer_prefill=use_flashinfer_prefill,
+                         use_flashinfer_decode=use_flashinfer_decode,
+                         num_kv_layers=len(kv_idx))
+        slot_of = [None] * self.num_layers
+        for slot, layer_idx in enumerate(kv_idx):
+            slot_of[layer_idx] = slot
+        self._layer_to_slot = slot_of
+        self._gdn_layer_idx = gdn_idx
+        self._gdn_slot = {layer_idx: i for i, layer_idx in enumerate(gdn_idx)}
+
+        num_v_heads = int(getattr(text_config, "linear_num_value_heads"))
+        num_k_heads = int(getattr(text_config, "linear_num_key_heads"))
+        head_k = int(getattr(text_config, "linear_key_head_dim"))
+        head_v = int(getattr(text_config, "linear_value_head_dim"))
+        self._gdn_kernel = int(getattr(text_config, "linear_conv_kernel_dim"))
+        conv_dim = 2 * num_k_heads * head_k + num_v_heads * head_v
+        # The cached conv state holds the last kernel-sized window; the
+        # per-token decode kernel reads its final kernel-1 entries from it.
+        self._pool_conv = [
+            torch.zeros((batch_size, conv_dim, self._gdn_kernel), dtype=dtype, device=self.device) for _ in gdn_idx
+        ]
+        self._pool_rec = [
+            torch.zeros((batch_size, num_v_heads, head_k, head_v), dtype=dtype, device=self.device) for _ in gdn_idx
+        ]
+        for pool in self._pool_conv + self._pool_rec:
+            # Decode kernels update these in place under graph capture; the
+            # addresses must stay fixed for the captured graph's lifetime.
+            torch._dynamo.mark_static_address(pool)
+        self._gdn_objs = [_HybridGDNLayer(layer_idx) for layer_idx in gdn_idx]
+        self._gdn_layer_obj = [None] * self.num_layers
+        for layer_idx, obj in zip(gdn_idx, self._gdn_objs):
+            self._gdn_layer_obj[layer_idx] = obj
+
+        self._record_past = False
+        self._gdn_width = 0
+        self._gdn_prefill_row: Optional[int] = None
+        # Rows whose prefill has started: chunk-1 conv state reads return None
+        # for a row that has no state yet, matching the HF cache's
+        # has_previous_state semantics.
+        self._gdn_rows_with_state: set = set()
+        self._gdn_has_state = False
+        self._rebuild_gdn_views()
+
+    # ------------------------------------------------------------------
+    # GDN pool row selection
+    # ------------------------------------------------------------------
+
+    @property
+    def has_gdn_layers(self) -> bool:
+        return True
+
+    def set_recording(self, flag: bool) -> None:
+        """Toggle GDN state recording around the paged prefill forwards."""
+        self._record_past = bool(flag)
+        self._rebuild_gdn_views()
+
+    def set_active_width(self, width: int) -> None:
+        """Select the GDN pool rows a decode forward runs on: the prefix [0, width)."""
+        self._gdn_width = int(width)
+        self._rebuild_gdn_views()
+
+    def set_active_rows(self, rows) -> None:
+        super().set_active_rows(rows)
+        flat = list(rows) if isinstance(rows, (list, tuple)) else rows.flatten().tolist()
+        if self._record_past:
+            # Paged prefill runs one request at a time; the GDN pools update
+            # that row's state in place.
+            if len(flat) != 1:
+                raise ValueError("hybrid paged prefill targets exactly one row")
+            self._gdn_prefill_row = int(flat[0])
+        else:
+            if flat != list(range(len(flat))):
+                raise ValueError("hybrid paged decode needs the active rows as the contiguous prefix [0, width); "
+                                 "compact the cache after retires")
+            self._gdn_width = len(flat)
+        self._rebuild_gdn_views()
+
+    def set_graph_mode(self, width: int) -> None:
+        super().set_graph_mode(width)
+        self._gdn_width = width
+        self._rebuild_gdn_views()
+
+    def _gdn_span(self) -> tuple:
+        if self._record_past:
+            if self._gdn_prefill_row is None:
+                return (0, 0)
+            return (self._gdn_prefill_row, self._gdn_prefill_row + 1)
+        return (0, self._gdn_width)
+
+    def _rebuild_gdn_views(self) -> None:
+        start, stop = self._gdn_span()
+        for obj, conv, rec in zip(self._gdn_objs, self._pool_conv, self._pool_rec):
+            obj.conv_states[0] = conv[start:stop]
+            obj.recurrent_states[0] = rec[start:stop]
+            obj.record_past = self._record_past
+
+    def begin_prefill_row(self, row: int) -> None:
+        """Reset one row's GDN state before a new prompt prefills into it.
+
+        The row's KV blocks are rewritten from column zero, so its conv and
+        recurrent state must start empty too; the prefill chunks rebuild it
+        through the update_* protocol.
+        """
+        for conv, rec in zip(self._pool_conv, self._pool_rec):
+            conv[row].zero_()
+            rec[row].zero_()
+        self._gdn_rows_with_state.discard(row)
+
+    # ------------------------------------------------------------------
+    # HF GDN cache protocol (the model's GDN forward talks to this cache
+    # through these entries; the static-cache pool does the same)
+    # ------------------------------------------------------------------
+
+    def get_conv_state(self, layer_idx: int, state_idx: int = 0):
+        if layer_idx not in self._gdn_slot:
+            raise ValueError(f"layer {layer_idx} holds no GDN state")
+        pool = self._pool_conv[self._gdn_slot[layer_idx]]
+        if not self._record_past:
+            return pool[:self._gdn_width]
+        row = self._gdn_prefill_row
+        if row is None or row not in self._gdn_rows_with_state:
+            return None
+        return pool[row:row + 1]
+
+    def get_recurrent_state(self, layer_idx: int, state_idx: int = 0):
+        if layer_idx not in self._gdn_slot:
+            raise ValueError(f"layer {layer_idx} holds no GDN state")
+        pool = self._pool_rec[self._gdn_slot[layer_idx]]
+        if not self._record_past:
+            return pool[:self._gdn_width]
+        if self._gdn_prefill_row is None:
+            return None
+        return pool[self._gdn_prefill_row:self._gdn_prefill_row + 1]
+
+    def update_conv_state(self, conv_state: torch.Tensor, layer_idx: int = 0, **kwargs) -> torch.Tensor:
+        """Store the row's new conv state and return the left-extended input.
+
+        The GDN forward runs the causal conv over the returned tensor and
+        slices away the context prefix, so this mirrors HF's
+        update_conv_state: fresh rows return the input as-is, rows with a
+        state return state-plus-input.
+        """
+        if layer_idx not in self._gdn_slot:
+            raise ValueError(f"layer {layer_idx} holds no GDN state")
+        pool = self._pool_conv[self._gdn_slot[layer_idx]]
+        kernel = self._gdn_kernel
+        if not self._record_past:
+            # One-token forwards that lost their state take the chunked
+            # branch; the state still lands on the active prefix rows.
+            if self._gdn_width:
+                full = torch.cat([pool[:self._gdn_width], conv_state], dim=-1)
+                pool[:self._gdn_width].copy_(full[..., -kernel:])
+            else:
+                full = conv_state
+        else:
+            row = self._gdn_prefill_row
+            if row in self._gdn_rows_with_state:
+                full = torch.cat([pool[row:row + 1], conv_state], dim=-1)
+            else:
+                full = conv_state
+            # The pool row holds exactly the last kernel window; a prompt
+            # shorter than the kernel is left-padded with zeros, which is the
+            # causal conv's boundary context.
+            tail = full[..., -kernel:]
+            if tail.shape[-1] < kernel:
+                tail = torch.nn.functional.pad(tail, (kernel - tail.shape[-1], 0))
+            pool[row:row + 1].copy_(tail)
+            self._gdn_rows_with_state.add(row)
+        self._gdn_has_state = True
+        return full
+
+    def update_recurrent_state(self, recurrent_state: torch.Tensor, layer_idx: int = 0, state_idx: int = 0):
+        if layer_idx not in self._gdn_slot:
+            raise ValueError(f"layer {layer_idx} holds no GDN state")
+        pool = self._pool_rec[self._gdn_slot[layer_idx]]
+        if not self._record_past:
+            pool[:self._gdn_width].copy_(recurrent_state)
+            view = pool[:self._gdn_width]
+        else:
+            pool[self._gdn_prefill_row:self._gdn_prefill_row + 1].copy_(recurrent_state)
+            self._gdn_rows_with_state.add(self._gdn_prefill_row)
+            view = pool[self._gdn_prefill_row:self._gdn_prefill_row + 1]
+        self._gdn_has_state = True
+        return view
+
+    def is_recording_past(self, layer_idx: int = 0, state_idx: int = 0) -> bool:
+        return self._record_past
+
+    def has_previous_state(self, layer_idx: int = 0, state_idx: int = 0) -> bool:
+        # Python-level read, captured as a constant by graph capture: by the
+        # time a decode graph is captured every row has been prefilled, and
+        # the flag only ever turns back on.
+        return self._gdn_has_state
+
+    # ------------------------------------------------------------------
+    # Row lifecycle: keep the pools aligned with the KV rows
+    # ------------------------------------------------------------------
+
+    @property
+    def layers(self) -> list:
+        layers = [None] * self.num_layers
+        for layer_idx, slot in enumerate(self._layer_to_slot):
+            if slot is not None:
+                layers[layer_idx] = _PagedLayer(self._key_views[slot], self._value_views[slot])
+        for layer_idx in self._gdn_layer_idx:
+            layers[layer_idx] = self._gdn_layer_obj[layer_idx]
+        return layers
+
+    @property
+    def memory_bytes(self) -> int:
+        total = super().memory_bytes
+        for pool in self._pool_conv + self._pool_rec:
+            total += pool.nbytes
+        return total
+
+    def compact(self, active_indices: torch.Tensor) -> None:
+        """Compact the KV rows and move the GDN pool rows with them."""
+        super().compact(active_indices)
+        keep = active_indices.to(device=self.device, dtype=torch.long)
+        count = keep.numel()
+        for pool in self._pool_conv + self._pool_rec:
+            if count:
+                pool[:count].copy_(pool.index_select(0, keep).clone())
+            if count < pool.shape[0]:
+                pool[count:].zero_()
+        self._gdn_rows_with_state = {new for new, old in enumerate(keep.tolist()) if old in self._gdn_rows_with_state}
+        self._gdn_width = min(self._gdn_width, count)
+        self._rebuild_gdn_views()
+
+    def reset(self) -> None:
+        super().reset()
+        for pool in self._pool_conv + self._pool_rec:
+            pool.zero_()
+        self._gdn_rows_with_state = set()
+        self._gdn_has_state = False
+        self._record_past = False
+        self._gdn_prefill_row = None
+        self._rebuild_gdn_views()
+
+    # Prefix reuse would skip prompt tokens whose GDN state is not stored in
+    # any block, and trimming would drop KV tokens the GDN state still
+    # summarizes: both are state/KV misalignment, so fail closed.
+    def prepare_prefix(self, hashes, target_row: int) -> int:
+        raise ValueError("paged prefix reuse does not support hybrid models: blocks carry no GDN state")
+
+    def register_prefix(self, hashes, target_row: int, count: int) -> None:
+        raise ValueError("paged prefix reuse does not support hybrid models: blocks carry no GDN state")
+
+    def trim_left(self, count: int) -> None:
+        raise ValueError("cache trimming does not support hybrid models: GDN state cannot drop prefix tokens")
+
+
 def _paged_qwen3_forward(
     self,
     hidden_states: torch.Tensor,
@@ -838,17 +1180,93 @@ def _paged_qwen3_forward(
     return attn_output, None
 
 
+def _apply_partial_rotary(query_states: torch.Tensor, key_states: torch.Tensor, cos: torch.Tensor,
+                          sin: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """RoPE that rotates only the first ``cos.shape[-1]`` head dims.
+
+    Mirrors transformers' apply_rotary_pos_emb for models with
+    partial_rotary_factor < 1: the remainder of the head passes through
+    unrotated. The full-width table takes the allocation-free fast path.
+    """
+    cos = cos.unsqueeze(1)
+    sin = sin.unsqueeze(1)
+    rotary_dim = cos.shape[-1]
+    head_dim = query_states.shape[-1]
+    if rotary_dim < head_dim:
+        query_states, q_pass = query_states[..., :rotary_dim], query_states[..., rotary_dim:]
+        key_states, k_pass = key_states[..., :rotary_dim], key_states[..., rotary_dim:]
+    else:
+        q_pass = k_pass = None
+    half = rotary_dim // 2
+    q1, q2 = query_states[..., :half], query_states[..., half:]
+    k1, k2 = key_states[..., :half], key_states[..., half:]
+    c1, c2 = cos[..., :half], cos[..., half:]
+    s1, s2 = sin[..., :half], sin[..., half:]
+    query_out = torch.empty_like(query_states)
+    key_out = torch.empty_like(key_states)
+    query_out[..., :half] = q1 * c1 - q2 * s1
+    query_out[..., half:] = q2 * c2 + q1 * s2
+    key_out[..., :half] = k1 * c1 - k2 * s1
+    key_out[..., half:] = k2 * c2 + k1 * s2
+    if q_pass is None:
+        return query_out, key_out
+    return torch.cat([query_out, q_pass], dim=-1), torch.cat([key_out, k_pass], dim=-1)
+
+
+def _paged_qwen3_5_forward(
+    self,
+    hidden_states: torch.Tensor,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    attention_mask: Optional[torch.Tensor] = None,
+    past_key_values=None,
+    **kwargs,
+):
+    """Paged forward for Qwen3_5Attention: q_proj carries a sigmoid attention
+    gate alongside the query, and the model rotates only a partial head width
+    (its RoPE tables are narrower than head_dim), so both are replayed here."""
+    original_forward = self._paged_original_forward
+    if not isinstance(past_key_values, PagedAttentionCache):
+        return original_forward(
+            hidden_states=hidden_states,
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            **kwargs,
+        )
+
+    input_shape = hidden_states.shape[:-1]
+    hidden_shape = (*input_shape, -1, self.head_dim)
+
+    query_states, gate = torch.chunk(self.q_proj(hidden_states).view(*input_shape, -1, self.head_dim * 2), 2, dim=-1)
+    gate = gate.reshape(*input_shape, -1)
+    query_states = self.q_norm(query_states.view(hidden_shape)).transpose(1, 2)
+    key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+    value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+    cos, sin = position_embeddings
+    query_states, key_states = _apply_partial_rotary(query_states, key_states, cos, sin)
+
+    past_key_values.write(self.layer_idx, key_states, value_states)
+    attn_output = past_key_values.attention(self.layer_idx, query_states, self.scaling)
+    # attention() returns [rows, query, heads * head_dim] head-major, the layout
+    # the gate and o_proj expect.
+    attn_output = attn_output.reshape(*input_shape, -1)
+    attn_output = attn_output * torch.sigmoid(gate)
+    attn_output = self.o_proj(attn_output)
+    return attn_output, None
+
+
 def install_paged_attention(module) -> list:
-    """Patch Qwen3 attention modules to use paged attention when handed a paged cache."""
+    """Patch Qwen3/Qwen3.5 attention modules to use paged attention when handed a paged cache."""
+    forwards = {"Qwen3Attention": _paged_qwen3_forward, "Qwen3_5Attention": _paged_qwen3_5_forward}
     patched = []
     for submodule in module.modules():
-        if type(submodule).__name__ != "Qwen3Attention":
-            continue
-        if getattr(submodule, "_paged_original_forward", None) is not None:
+        forward = forwards.get(type(submodule).__name__)
+        if forward is None or getattr(submodule, "_paged_original_forward", None) is not None:
             continue
         submodule._paged_original_forward = submodule.forward
-        submodule.forward = MethodType(_paged_qwen3_forward, submodule)
+        submodule.forward = MethodType(forward, submodule)
         patched.append(submodule)
     if not patched:
-        raise ValueError("paged cache requires a Qwen3Attention model")
+        raise ValueError("paged cache requires Qwen3Attention or Qwen3_5Attention modules")
     return patched

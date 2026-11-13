@@ -681,17 +681,9 @@ class HybridEngineRollout(RolloutEngine):
 
         cache_start = self._profile_start(profile)
         if self.use_paged_cache:
-            from deepspeed.runtime.rollout.paged_cache import PagedAttentionCache
-            cache = PagedAttentionCache(
-                module.config,
-                batch_size=max_batch_size,
-                max_cache_len=max_cache_len,
-                device=device,
-                dtype=model_dtype,
-                block_size=self.paged_block_size,
-                use_flashinfer_prefill=self.use_flashinfer_prefill,
-                use_flashinfer_decode=self.use_flashinfer_decode,
-            )
+            cache = self._create_continuous_paged_cache(module, max_batch_size, max_cache_len, device, model_dtype,
+                                                        self.paged_block_size, self.use_flashinfer_prefill,
+                                                        self.use_flashinfer_decode)
         else:
             # Layers are sized by the first prefill because AutoTP shards KV heads per rank.
             cache = DeepSpeedStaticCache(module.config, max_cache_len=max_cache_len)
@@ -886,6 +878,9 @@ class HybridEngineRollout(RolloutEngine):
                     model_positions = row_positions[decodable_rows]
                     cache.set_active_rows(decodable_rows)
                     model_attention_mask = {"full_attention": None, "sliding_attention": None}
+                    if getattr(cache, "has_gdn_layers", False):
+                        # The model indexes its per-layer mask dict by layer type.
+                        model_attention_mask["linear_attention"] = None
                     model_position_ids = model_positions.unsqueeze(1)
                     model_cache_position = model_positions
                 else:
@@ -1322,6 +1317,29 @@ class HybridEngineRollout(RolloutEngine):
                 return width
         raise ValueError(f"captured batch ladder {ladder} does not cover {required} rows")
 
+    @staticmethod
+    def _create_continuous_paged_cache(module, max_batch_size, max_cache_len, device, model_dtype, block_size,
+                                       use_flashinfer_prefill, use_flashinfer_decode):
+        """Paged cache sized for the model.
+
+        Hybrid models get the asymmetric cache (paged KV for the
+        full-attention layers plus per-row GDN state pools); pure-attention
+        models keep the plain paged cache."""
+        from deepspeed.runtime.rollout.paged_cache import HybridPagedAttentionCache, PagedAttentionCache
+        text_config = getattr(module.config, "text_config", module.config)
+        layer_types = getattr(text_config, "layer_types", None) or []
+        cache_cls = HybridPagedAttentionCache if "linear_attention" in layer_types else PagedAttentionCache
+        return cache_cls(
+            module.config,
+            batch_size=max_batch_size,
+            max_cache_len=max_cache_len,
+            device=device,
+            dtype=model_dtype,
+            block_size=block_size,
+            use_flashinfer_prefill=use_flashinfer_prefill,
+            use_flashinfer_decode=use_flashinfer_decode,
+        )
+
     def _get_continuous_graph_state(self, module, max_batch_size, prompt_len, max_cache_len, device, model_dtype,
                                     cache_type):
         ladder = self._graph_capture_ladder(max_batch_size, self.graph_capture_batch_sizes)
@@ -1331,17 +1349,9 @@ class HybridEngineRollout(RolloutEngine):
         state = self._continuous_graph_state
         if state is None or state.signature != signature:
             if self.use_paged_cache:
-                from deepspeed.runtime.rollout.paged_cache import PagedAttentionCache
-                cache = PagedAttentionCache(
-                    module.config,
-                    batch_size=max_batch_size,
-                    max_cache_len=max_cache_len,
-                    device=device,
-                    dtype=model_dtype,
-                    block_size=self.paged_block_size,
-                    use_flashinfer_prefill=self.use_flashinfer_prefill,
-                    use_flashinfer_decode=self.use_flashinfer_decode,
-                )
+                cache = self._create_continuous_paged_cache(module, max_batch_size, max_cache_len, device, model_dtype,
+                                                            self.paged_block_size, self.use_flashinfer_prefill,
+                                                            self.use_flashinfer_decode)
                 cache.enable_graph_safe()
             else:
                 # Capture sizes the layers from the model's local KV tensors.
@@ -1450,7 +1460,11 @@ class HybridEngineRollout(RolloutEngine):
         from deepspeed.runtime.rollout.paged_cache import PagedAttentionCache
         if isinstance(cache, PagedAttentionCache):
             cache.set_graph_mode(bucket.width)
-            return {"full_attention": None, "sliding_attention": None}
+            mask = {"full_attention": None, "sliding_attention": None}
+            if getattr(cache, "has_gdn_layers", False):
+                # The model indexes its per-layer mask dict by layer type.
+                mask["linear_attention"] = None
+            return mask
         if getattr(cache, "has_gdn_layers", False):
             # Hybrid static decode passes a dict too: the GDN layers take the
             # position-free None entry, the full-attention layers the dense
@@ -1642,16 +1656,28 @@ class HybridEngineRollout(RolloutEngine):
         return max_cache_len
 
     def _validate_hybrid_continuous_options(self):
-        """Hybrid models keep per-row GDN state in the static cache's state
-        pools; only the static-cache continuous path scatters and compacts
-        those rows, so paged and chunked-prefill runs fail up front with a
-        clear message instead of crashing mid-decode."""
+        """Hybrid models keep per-row GDN state in state pools (the static
+        cache's layer slots, the paged cache's row pools); the paged and
+        chunked-prefill paths that cannot keep that state aligned with the
+        KV fail up front with a clear message instead of crashing
+        mid-decode."""
         config = getattr(self.engine.module, "config", None)
         text_config = getattr(config, "text_config", config)
         if "linear_attention" not in (getattr(text_config, "layer_types", None) or []):
             return
         if self.use_paged_cache:
-            raise ValueError("paged cache does not yet support hybrid models with linear-attention layers")
+            # GDN state lives in per-row pools, not KV blocks: paged hybrid
+            # runs must prefill through the paged path (states write straight
+            # into the pools) and must not invalidate the state/KV alignment.
+            if not self.enable_paged_prefill:
+                raise ValueError("paged cache with hybrid models requires enable_paged_prefill=True: "
+                                 "GDN state is built during the paged prefill")
+            if self.enable_prefix_reuse:
+                raise ValueError("prefix reuse does not support hybrid models yet: paged blocks carry "
+                                 "no GDN state checkpoints, so a reused prefix would decode from stale state")
+            if self.enable_cache_trimming:
+                raise ValueError("cache trimming does not support hybrid models yet: GDN state cannot "
+                                 "drop the trimmed prefix tokens")
         if self.enable_chunked_prefill:
             raise ValueError("chunked prefill does not yet support hybrid models with linear-attention layers")
 
@@ -1666,12 +1692,12 @@ class HybridEngineRollout(RolloutEngine):
             raise ValueError("prefill_chunk_size must be positive when chunked prefill is enabled")
         if self.enable_chunked_prefill and self.align_decode_fronts:
             raise ValueError("chunked prefill does not support aligned decode fronts")
+        self._validate_hybrid_continuous_options()
         if self.use_paged_cache:
             if self.align_decode_fronts:
                 raise ValueError("paged cache does not support aligned decode fronts yet")
             if self.enable_cache_trimming:
                 raise ValueError("paged cache only supports block-aligned trimming")
-        self._validate_hybrid_continuous_options()
 
         prompt_len = requests[0].prompt_ids.shape[1]
         device = requests[0].prompt_ids.device
@@ -1913,6 +1939,11 @@ class HybridEngineRollout(RolloutEngine):
             raise TypeError("paged prefill requires a PagedAttentionCache")
         cache.set_eager_mode()
         paged_attention = {"full_attention": None, "sliding_attention": None}
+        if getattr(cache, "has_gdn_layers", False):
+            # The model indexes its per-layer mask dict by layer type; the GDN
+            # layers take the position-free entry (prompts are left-stripped,
+            # so there is no padding to mask).
+            paged_attention["linear_attention"] = None
         tokens = {}
         logprobs = {} if sampling is not None and sampling.temperature > 0.0 else None
         for request_id, target_slot in zip(admitted_ids, target_slots):
@@ -1933,6 +1964,12 @@ class HybridEngineRollout(RolloutEngine):
                 cache.prefix_reuse_tokens = getattr(cache, "prefix_reuse_tokens", 0) + start
             elif not getattr(cache, "_graph_safe", False):
                 cache.clear_row(target_slot)
+            if getattr(cache, "has_gdn_layers", False):
+                # The row's KV blocks are rewritten from column zero, so its
+                # GDN state starts empty too; the chunks rebuild it while
+                # recording is on (chunk-1 conv reads see no previous state).
+                cache.begin_prefill_row(target_slot)
+                cache.set_recording(True)
             end = start
             while end < prompt_len:
                 start = end
@@ -1955,6 +1992,8 @@ class HybridEngineRollout(RolloutEngine):
                 self._profile_end(profile, "prefill_forward_ms", forward_start, count="num_prefill_forwards")
             if prefix_enabled:
                 cache.register_prefix(prompt_hashes, target_slot, len(prompt_hashes))
+            if getattr(cache, "has_gdn_layers", False):
+                cache.set_recording(False)
             first_token, first_logprob = self._draw_token(output.logits[:, -1, :], sampling)
             attention_mask[target_slot].zero_()
             attention_mask[target_slot, :prompt_len] = 1
