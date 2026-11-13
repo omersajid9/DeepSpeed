@@ -1385,8 +1385,8 @@ class HybridEngineRollout(RolloutEngine):
                 # forward before the attention can read them, so stale columns are never
                 # read and the cache does not need to be cleared between rollouts.
                 from deepspeed.utils.static_cache import DeepSpeedStaticCache
-                staging_cache = self._create_static_cache(DeepSpeedStaticCache, module.config, max_batch_size,
-                                                          prompt_len, device, model_dtype)
+                staging_cache = self._create_staging_cache(DeepSpeedStaticCache, module.config, max_batch_size,
+                                                           prompt_len, device, model_dtype)
             static_input = torch.zeros((max_batch_size, 1), dtype=torch.long, device=device)
             static_attention = torch.zeros((max_batch_size, max_cache_len), dtype=torch.long, device=device)
             static_causal_attention = torch.zeros((max_batch_size, 1, 1, max_cache_len),
@@ -1741,8 +1741,9 @@ class HybridEngineRollout(RolloutEngine):
             if self.enable_cache_trimming:
                 raise ValueError("cache trimming does not support hybrid models yet: GDN state cannot "
                                  "drop the trimmed prefix tokens")
-        if self.enable_chunked_prefill:
-            raise ValueError("chunked prefill does not yet support hybrid models with linear-attention layers")
+        # Chunked prefill is supported: staged prompts keep their GDN state in
+        # the staging cache's own pools and publish moves the row into the
+        # decode cache (static pooled slot or paged pool) with the KV.
 
     def _validate_continuous_inputs(self, requests, sampling, max_batch_size):
         if not requests:
@@ -2095,8 +2096,8 @@ class HybridEngineRollout(RolloutEngine):
                 batched_slots.append(target_slot)
                 continue
             prompt_attention = torch.ones_like(prompt_ids)
-            staging_cache = self._create_static_cache(static_cache_type, module.config, prompt_ids.shape[0],
-                                                      prompt_len, device, model_dtype)
+            staging_cache = self._create_staging_cache(static_cache_type, module.config, prompt_ids.shape[0],
+                                                       prompt_len, device, model_dtype)
             prefill_chunks[request_id] = _PrefillChunk(slot=target_slot,
                                                        cache=staging_cache,
                                                        prompt_ids=prompt_ids,
@@ -2114,6 +2115,11 @@ class HybridEngineRollout(RolloutEngine):
         end = min(chunk.prompt_len, chunk.offset + width)
         validity = torch.zeros_like(chunk.prompt_attention)
         validity[:, :end] = chunk.prompt_attention[:, :end]
+        # GDN pools serve the active prefix: a staged prompt owns row 0 of its
+        # own staging cache.
+        set_width = getattr(chunk.cache, "set_active_width", None)
+        if set_width is not None:
+            set_width(chunk.prompt_ids.shape[0])
         forward_start = self._profile_start(profile)
         output = self._call_model(
             module,
@@ -2142,6 +2148,8 @@ class HybridEngineRollout(RolloutEngine):
         never of how long the prompt spent staging. Returns the column the row's first
         generated token goes into.
         """
+        from deepspeed.utils.static_cache import DSStaticGDNSlot
+
         prompt_end = chunk.prompt_len
         if self.use_paged_cache:
             for layer_idx in range(self._cache_layer_count(chunk.cache)):
@@ -2151,8 +2159,15 @@ class HybridEngineRollout(RolloutEngine):
             attention_mask[chunk.slot, :prompt_end] = 1
         else:
             for layer_idx in range(self._cache_layer_count(chunk.cache)):
-                staged_keys, staged_values = self._cache_layer_tensors(chunk.cache, layer_idx)
+                source_layer = chunk.cache.layers[layer_idx]
                 target_layer = cache.layers[layer_idx]
+                if isinstance(target_layer, DSStaticGDNSlot):
+                    # A staged prompt's GDN state lives in the staging cache;
+                    # publish moves the row so KV and recurrence stay aligned.
+                    target_layer.adopt_gdn_pool(source_layer, attention_mask.shape[0])
+                    target_layer.copy_state_from(source_layer, 0, chunk.slot)
+                    continue
+                staged_keys, staged_values = self._cache_layer_tensors(chunk.cache, layer_idx)
                 if not target_layer.is_initialized:
                     # The decode cache sizes its layers lazily from the first KV it sees; a batch whose
                     # admitted rows are all staged never runs a one-shot prefill, so initialize here.
@@ -2302,6 +2317,11 @@ class HybridEngineRollout(RolloutEngine):
             bucket.input_ids[row_index].copy_(chunk.prompt_ids[0, window:end])
             bucket.position_ids[row_index].copy_(chunk.position_ids[0, window:end])
         self._fill_staged_attention(bucket, wave, window)
+        # GDN pools serve the active prefix: a wave's rows are the staging
+        # cache's rows 0..len(wave).
+        set_width = getattr(state.staging_cache, "set_active_width", None)
+        if set_width is not None:
+            set_width(len(wave))
         # The bucket is filled before it is captured: capture warms up on the buffers, and
         # those warmups write the same KV the following replay writes.
         self._capture_bucket_if_needed(module, state.staging_cache, bucket, state.static_cache_position,
@@ -2360,12 +2380,20 @@ class HybridEngineRollout(RolloutEngine):
         the row's response starts at the padded prompt width and the cache capacity stays a
         function of the prompt and the response budget, never of how many chunks it took.
         """
+        from deepspeed.utils.static_cache import DSStaticGDNSlot
+
         prompt_len = chunk.prompt_len
         valid_len = int(chunk.prompt_attention[0].sum())
         if self.use_paged_cache:
             # Paged rows are compact: strip the staged row's left padding and
             # park the first response token right behind the real prompt.
             for layer_idx in range(self._cache_layer_count(state.staging_cache)):
+                source_layer = state.staging_cache.layers[layer_idx]
+                if getattr(cache, "has_gdn_layers", False) and layer_idx in getattr(cache, "_gdn_slot", {}):
+                    # Hybrid paged rows keep their GDN state in the cache's own
+                    # pools; move the staged row across with the KV.
+                    cache.copy_gdn_state_from(layer_idx, source_layer, chunk.row, chunk.slot)
+                    continue
                 staged_keys, staged_values = self._cache_layer_tensors(state.staging_cache, layer_idx)
                 cache.copy_from_dense(layer_idx, staged_keys[chunk.row], staged_values[chunk.row], chunk.slot,
                                       chunk.prompt_attention[0].bool())
@@ -2373,8 +2401,13 @@ class HybridEngineRollout(RolloutEngine):
             attention_mask[chunk.slot, :valid_len] = 1
         else:
             for layer_idx in range(self._cache_layer_count(state.staging_cache)):
-                staged_keys, staged_values = self._cache_layer_tensors(state.staging_cache, layer_idx)
+                source_layer = state.staging_cache.layers[layer_idx]
                 target_layer = cache.layers[layer_idx]
+                if isinstance(target_layer, DSStaticGDNSlot):
+                    target_layer.adopt_gdn_pool(source_layer, attention_mask.shape[0])
+                    target_layer.copy_state_from(source_layer, chunk.row, chunk.slot)
+                    continue
+                staged_keys, staged_values = self._cache_layer_tensors(state.staging_cache, layer_idx)
                 if not target_layer.is_initialized:
                     # The capture cache sizes its layers lazily; when every bucket falls back to
                     # eager windows no captured warmup has allocated them yet.
@@ -2427,8 +2460,12 @@ class HybridEngineRollout(RolloutEngine):
         if max_cache_len is None:
             max_cache_len = prompt_len
         position_ids = self._prefill_position_ids(prompt_attention)
-        prefill_cache = self._create_static_cache(static_cache_type, module.config, prompt_ids.shape[0], max_cache_len,
-                                                  device, model_dtype)
+        prefill_cache = self._create_staging_cache(static_cache_type, module.config, prompt_ids.shape[0],
+                                                   max_cache_len, device, model_dtype)
+        set_width = getattr(prefill_cache, "set_active_width", None)
+        if set_width is not None:
+            # GDN pools serve the active prefix; this cache holds one prompt row.
+            set_width(prompt_ids.shape[0])
         output = None
         for start in range(0, prompt_len, chunk_size):
             end = min(prompt_len, start + chunk_size)
@@ -2691,6 +2728,25 @@ class HybridEngineRollout(RolloutEngine):
         elif "max_batch_size" in parameters:
             common_kwargs["max_batch_size"] = batch_size
         return static_cache_type(**common_kwargs)
+
+    @classmethod
+    def _create_staging_cache(cls, static_cache_type, config, batch_size, max_cache_len, device, dtype):
+        """Staging cache for chunked prefill.
+
+        A staged prompt runs its chunk forwards without a one-shot prefill, so a
+        hybrid model's GDN slots have no HF slot to adopt: the pools are sized
+        from the config, and the chunk forwards update the active prefix in
+        place (``set_active_width``). Dense models get the plain staging cache.
+        """
+        cache = cls._create_static_cache(static_cache_type, config, batch_size, max_cache_len, device, dtype)
+        text_config = getattr(config, "text_config", config)
+        if "linear_attention" in (getattr(text_config, "layer_types", None) or []) and hasattr(
+                cache, "adopt_gdn_pools"):
+            # Native caches (HF's StaticCache) serve GDN state on their own.
+            from deepspeed.utils.static_cache import hybrid_gdn_state_shapes
+            conv_shape, rec_shape = hybrid_gdn_state_shapes(text_config, batch_size, device, dtype)
+            cache.adopt_gdn_pools(conv_shape, rec_shape, device, dtype)
+        return cache
 
     @staticmethod
     def _cache_layer_count(cache):

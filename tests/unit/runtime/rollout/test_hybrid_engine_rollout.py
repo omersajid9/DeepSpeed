@@ -138,10 +138,10 @@ def _hybrid_engine():
 
 
 def test_continuous_generation_rejects_hybrid_models_without_state_pool_support():
-    # GDN state lives in the static cache's state pools and the paged
-    # cache's row pools. The paged path must prefill through the paged
-    # path to build the states, and must not invalidate the state/KV
-    # alignment; chunked prefill stays unsupported.
+    # GDN state lives in the static cache's state pools, the paged cache's row
+    # pools and the chunked-prefill staging pools. The paged path must prefill
+    # through the paged path to build the states, and neither chunked prefill
+    # nor the paged path may invalidate the state/KV alignment.
     rollout = HybridEngineRollout(_hybrid_engine(), _make_tokenizer())
     request = RolloutRequest(
         prompt_ids=torch.tensor([[0, 1, 2]]),
@@ -178,13 +178,20 @@ def test_continuous_generation_rejects_hybrid_models_without_state_pool_support(
         rollout._validate_continuous_graph_options(3, sampling)
     rollout.enable_cache_trimming = False
 
+    # Chunked prefill is supported: staged prompts keep their GDN state in the
+    # staging cache's pools and publish it together with the KV, so both the
+    # static and the paged hybrid paths accept it.
     rollout.use_paged_cache = False
     rollout.enable_chunked_prefill = True
     rollout.prefill_chunk_size = 512
-    with pytest.raises(ValueError, match="chunked prefill does not yet support hybrid"):
-        rollout._validate_continuous_inputs((request, ), sampling, 1)
-    with pytest.raises(ValueError, match="chunked prefill does not yet support hybrid"):
-        rollout._validate_continuous_graph_options(3, sampling)
+    rollout._validate_continuous_inputs((request, ), sampling, 1)
+    rollout._validate_continuous_graph_options(3, sampling)
+
+    rollout.use_paged_cache = True
+    rollout.enable_paged_prefill = True
+    rollout._validate_continuous_inputs((request, ), sampling, 1)
+    rollout._validate_continuous_graph_options(3, sampling)
+    rollout.use_paged_cache = False
 
 
 @pytest.mark.parametrize(
@@ -2149,6 +2156,88 @@ def _tiny_llama(model_class=None):
                          num_key_value_heads=2,
                          max_position_embeddings=64)
     return (model_class or LlamaForCausalLM)(config).eval()
+
+
+def _tiny_qwen3_5():
+    """A tiny random-weight Qwen3.5 hybrid model (one full-attention layer)."""
+    from transformers import Qwen3_5ForCausalLM, Qwen3_5TextConfig
+
+    torch.manual_seed(0)
+    config = Qwen3_5TextConfig(hidden_size=64,
+                               intermediate_size=128,
+                               num_attention_heads=4,
+                               num_key_value_heads=2,
+                               head_dim=64,
+                               num_hidden_layers=2,
+                               layer_types=["full_attention", "linear_attention"],
+                               partial_rotary_factor=0.25,
+                               rope_theta=10000.0,
+                               vocab_size=128,
+                               linear_num_value_heads=4,
+                               linear_num_key_heads=2,
+                               linear_key_head_dim=32,
+                               linear_value_head_dim=32,
+                               linear_conv_kernel_dim=4,
+                               max_position_embeddings=128)
+    model = Qwen3_5ForCausalLM(config).to(torch.bfloat16)
+    model._supports_cache_class = True
+    return model.eval()
+
+
+def _gdn_snapshot(rollout):
+    """Pooled GDN state and prompt KV of every row, after a run."""
+    cache = rollout._continuous_graph_state.cache
+    snapshot = {}
+    for layer_idx, layer in enumerate(cache.layers):
+        if hasattr(layer, "conv_states"):
+            snapshot[("conv", layer_idx)] = layer.conv_states[0].clone()
+            if layer.recurrent_states[0] is not None:
+                snapshot[("rec", layer_idx)] = layer.recurrent_states[0].clone()
+        else:
+            snapshot[("k", layer_idx)] = layer.keys.clone()
+            snapshot[("v", layer_idx)] = layer.values.clone()
+    return snapshot
+
+
+@patch("deepspeed.runtime.rollout.hybrid_engine_rollout.get_accelerator")
+def test_chunked_prefill_publishes_hybrid_gdn_state(mock_get_accelerator):
+    """A staged hybrid prompt must publish its GDN state together with its KV.
+
+    Chunked prefill keeps a prompt in a staging cache until it completes, so
+    the row's conv/recurrent state has to move into the decode cache's pool at
+    publish; otherwise the response continues from an empty recurrence. The
+    chunked run must therefore land on the same cache state (and the same
+    tokens) as the one-shot prefill.
+    """
+    # Replays must re-run the forward for real: a chunk's GDN state advance is
+    # the work of the replay, and a capture-only mock would drop it.
+    _, fake_capture = _replaying_graph_accelerator(mock_get_accelerator, [])
+    model = _tiny_qwen3_5()
+    prompt = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]])
+    request = RolloutRequest(prompt, torch.ones_like(prompt))
+    sampling = SamplingConfig(max_new_tokens=3, temperature=0, continuous_batch_size=1)
+    engine = SimpleNamespace(module=model)
+    tokenizer = SimpleNamespace(pad_token_id=0, eos_token_id=None)
+
+    with patch.object(HybridEngineRollout, "_capture_continuous_graph", side_effect=fake_capture):
+        plain = HybridEngineRollout(engine, tokenizer, cfg=HybridEngineRolloutConfig(use_graph_capture=True))
+        with torch.no_grad():
+            plain_tokens = plain.generate(request, sampling).input_ids.tolist()
+
+        chunked = HybridEngineRollout(engine,
+                                      tokenizer,
+                                      cfg=HybridEngineRolloutConfig(use_graph_capture=True,
+                                                                    enable_chunked_prefill=True,
+                                                                    prefill_chunk_size=3))
+        with torch.no_grad():
+            chunked_tokens = chunked.generate(request, sampling).input_ids.tolist()
+
+    assert chunked.get_last_continuous_stats()["chunked_prefill_chunks"] > 0, "the prompt must have staged"
+    whole, staged = _gdn_snapshot(plain), _gdn_snapshot(chunked)
+    assert set(whole) == set(staged)
+    for key, expected in whole.items():
+        torch.testing.assert_close(staged[key].float(), expected.float(), atol=5e-2, rtol=5e-2, msg=str(key))
+    assert chunked_tokens == plain_tokens
 
 
 def test_chunked_prefill_cache_matches_single_forward_prefill_on_a_real_model():
