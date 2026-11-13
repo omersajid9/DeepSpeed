@@ -1476,7 +1476,11 @@ class HybridEngineRollout(RolloutEngine):
         """Capture one bucket's forward, falling back to eager forwards if capture fails.
 
         The capture runs the model for real during its warmup, with the buffers the next
-        replay will use, so it must be called only once the caller has filled them.
+        replay will use, so it must be called only once the caller has filled them. The
+        forwards also advance a hybrid model's GDN state in place (the KV writers rewrite
+        the same columns, the conv/recurrent state does not), so the live state is
+        snapshotted across the capture and the first replay starts from the state prefill
+        produced.
         """
         try:
             from deepspeed.runtime.rollout.paged_cache import PagedAttentionCache
@@ -1495,17 +1499,49 @@ class HybridEngineRollout(RolloutEngine):
             attention_mask = self._bucket_attention_mask(cache, bucket)
             if is_paged:
                 self._paged_decode_step(cache, fi_positions)
-            bucket.graph, bucket.logits = self._capture_continuous_graph(module, cache, bucket.input_ids,
-                                                                         attention_mask, write_position,
-                                                                         cache_position, bucket.position_ids,
-                                                                         self._last_logits_kwargs(module))
-            self._continuous_graph_state.captures += 1
+            gdn_snapshot = self._snapshot_gdn_state(cache)
+            try:
+                bucket.graph, bucket.logits = self._capture_continuous_graph(module, cache, bucket.input_ids,
+                                                                             attention_mask, write_position,
+                                                                             cache_position, bucket.position_ids,
+                                                                             self._last_logits_kwargs(module))
+                self._continuous_graph_state.captures += 1
+            finally:
+                self._restore_gdn_state(gdn_snapshot)
         except Exception as error:  # a graph is an optimization: a failed capture must not fail the rollout
             bucket.graph = None
             bucket.disabled = True
             logger.warning(
                 "Rollout graph capture failed for batch width %s (%s); this bucket will run eagerly "
                 "for the rest of the rollout.", bucket.width, error)
+
+    @staticmethod
+    def _snapshot_gdn_state(cache) -> list:
+        """Clone the live GDN conv/recurrent state a capture is about to advance.
+
+        Warmup and capture forwards run the model for real. For dense/paged KV that is
+        harmless (they rewrite the same columns with the same values), but a hybrid
+        model's fused decode advances conv/recurrent state in place, so without a
+        snapshot the first replay would start from a state that already consumed the
+        decode token. Pure-attention caches expose no GDN state and cost nothing.
+        """
+        snapshots = []
+        # A cache without a per-layer view has no GDN state to protect.
+        for layer in getattr(cache, "layers", None) or []:
+            conv_states = getattr(layer, "conv_states", None)
+            recurrent_states = getattr(layer, "recurrent_states", None)
+            if not isinstance(conv_states, dict):
+                continue
+            recurrent = recurrent_states.get(0) if isinstance(recurrent_states, dict) else None
+            for state in (conv_states.get(0), recurrent):
+                if state is not None:
+                    snapshots.append((state, state.clone()))
+        return snapshots
+
+    @staticmethod
+    def _restore_gdn_state(snapshots) -> None:
+        for state, saved in snapshots:
+            state.copy_(saved)
 
     def _run_bucket(self, module, cache, bucket, cache_position, write_position, fi_positions=None):
         """Replay a bucket's captured forward, or run the same buffers eagerly without a graph."""
@@ -2974,16 +3010,10 @@ class HybridEngineRollout(RolloutEngine):
         # Snapshot the GDN states right after prefill: the warmup forwards
         # advance conv/recurrent states by extra steps, so they must be
         # restored before capture or every replay starts from corrupted state.
-        gdn_snapshot = []
-        for ds_layer in ds_cache.layers:
-            if type(ds_layer).__name__ == "DSStaticGDNSlot":
-                cs, rs = ds_layer.conv_states[0], ds_layer.recurrent_states[0]
-                gdn_snapshot.append((cs, rs, cs.clone(), rs.clone()))
+        gdn_snapshot = self._snapshot_gdn_state(ds_cache)
 
         def restore_gdn_states():
-            for cs, rs, cs0, rs0 in gdn_snapshot:
-                cs.copy_(cs0)
-                rs.copy_(rs0)
+            self._restore_gdn_state(gdn_snapshot)
 
         # Remove forward hooks (they synchronize — illegal during graph capture)
         saved_pre = dict(module._forward_pre_hooks)

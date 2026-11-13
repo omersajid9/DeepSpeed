@@ -27,6 +27,7 @@ from deepspeed.runtime.rollout.hybrid_engine_rollout import (
     GlobalWorkRemaining,
     HybridEngineRollout,
     HybridEngineRolloutConfig,
+    _DecodeBucket,
     _GlobalEosStoppingCriteria,
 )
 from deepspeed.utils.static_cache import DeepSpeedStaticCache
@@ -2267,6 +2268,107 @@ def test_staged_chunk_windows_match_a_single_forward_with_replayed_graphs(mock_g
     assert captures[0].runs > 1 and captures[1].runs > 1
     assert chunked_output.input_ids.tolist() == plain_output.input_ids.tolist()
     assert chunked_output.attention_mask.tolist() == plain_output.attention_mask.tolist()
+
+
+class _AdvancingGDNCache:
+    """Hybrid-shaped cache whose GDN state the decode forward advances in place."""
+
+    has_gdn_layers = True
+
+    def __init__(self, width=2):
+        self.conv = torch.zeros(width, 3, 4)
+        self.recurrent = torch.zeros(width, 5, 3, 4)
+        self._layers = [
+            SimpleNamespace(is_initialized=True, conv_states={0: self.conv}, recurrent_states={0: self.recurrent}),
+        ]
+
+    @property
+    def layers(self):
+        return self._layers
+
+    def set_write_position(self, pos):
+        pass
+
+    def set_active_width(self, width):
+        pass
+
+
+class _AdvancingDecodeModel:
+    """Decode forward that advances GDN state the way the fused decode kernels do."""
+
+    def __init__(self, fail_on_call=None):
+        self.calls = 0
+        self.fail_on_call = fail_on_call
+        # Capture saves and clears the model's hook registries around the warmups.
+        self._forward_pre_hooks = {}
+        self._forward_hooks = {}
+
+    def forward(self, *args, **kwargs):
+        return self(*args, **kwargs)
+
+    def __call__(self, input_ids, attention_mask=None, past_key_values=None, **kwargs):
+        self.calls += 1
+        for layer in past_key_values.layers:
+            layer.conv_states[0].add_(1.0)
+            layer.recurrent_states[0].add_(1.0)
+        if self.calls == self.fail_on_call:
+            raise RuntimeError("capture failed")
+        return SimpleNamespace(logits=torch.zeros(input_ids.shape[0], 1, 7))
+
+
+def _gdn_capture_rollout():
+    rollout = HybridEngineRollout(SimpleNamespace(module=SimpleNamespace()),
+                                  SimpleNamespace(pad_token_id=0, eos_token_id=None),
+                                  cfg=HybridEngineRolloutConfig(use_graph_capture=True))
+    rollout._continuous_graph_state = SimpleNamespace(captures=0)
+    return rollout
+
+
+def _gdn_bucket(width=2):
+    return _DecodeBucket(width=width,
+                         input_ids=torch.zeros(width, 1, dtype=torch.long),
+                         causal_attention=torch.zeros(width, 1, 1, 8),
+                         position_ids=torch.zeros(width, 1, dtype=torch.long),
+                         write_positions=torch.full((width, ), 5, dtype=torch.long))
+
+
+@patch("deepspeed.runtime.rollout.hybrid_engine_rollout.get_accelerator")
+def test_graph_capture_restores_gdn_state_advanced_by_its_warmups(mock_get_accelerator):
+    """Capture runs real forwards; the live GDN state must survive them unchanged.
+
+    Warmup and capture run the model against the live cache, so a hybrid decode advances
+    conv/recurrent state four times. The following replay must instead start from the
+    state prefill produced; without the snapshot the first captured step decodes from a
+    state that already consumed its own token.
+    """
+    _mock_graph_accelerator(mock_get_accelerator)
+    rollout = _gdn_capture_rollout()
+    cache = _AdvancingGDNCache()
+    model = _AdvancingDecodeModel()
+    bucket = _gdn_bucket()
+
+    rollout._capture_bucket(model, cache, bucket, torch.tensor([7]), bucket.write_positions)
+
+    assert bucket.graph is not None
+    assert model.calls == 4  # three warmup forwards plus the captured forward
+    assert torch.equal(cache.conv, torch.zeros_like(cache.conv))
+    assert torch.equal(cache.recurrent, torch.zeros_like(cache.recurrent))
+
+
+@patch("deepspeed.runtime.rollout.hybrid_engine_rollout.get_accelerator")
+def test_failed_graph_capture_still_restores_gdn_state(mock_get_accelerator):
+    """A capture that dies mid-warmup must not leave the state advanced either."""
+    _mock_graph_accelerator(mock_get_accelerator)
+    rollout = _gdn_capture_rollout()
+    cache = _AdvancingGDNCache()
+    model = _AdvancingDecodeModel(fail_on_call=4)
+    bucket = _gdn_bucket()
+
+    rollout._capture_bucket(model, cache, bucket, torch.tensor([7]), bucket.write_positions)
+
+    assert bucket.graph is None and bucket.disabled
+    assert torch.equal(cache.conv, torch.zeros_like(cache.conv))
+    assert torch.equal(cache.recurrent, torch.zeros_like(cache.recurrent))
 
 
 @patch("deepspeed.runtime.rollout.hybrid_engine_rollout.get_accelerator")
