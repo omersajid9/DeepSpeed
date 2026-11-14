@@ -1217,9 +1217,11 @@ def _fused_norm_layer_forward(self,
     pre-attention RMSNorm and the post-attention residual-add + RMSNorm pair
     each run as one kernel launch instead of HF's unfused elementwise chains.
     fused_add_norm updates the residual stream in-place and produces the
-    normalized MLP input in a single launch. Attention and MLP are called
-    unchanged, so attention-level patches (decode_attn / grouped_linear)
-    still apply."""
+    normalized MLP input in a single launch. With the residual-tail fold
+    installed (see install_fused_norm), the post-MLP add runs through the
+    successor layer's fused input norm instead of a separate add. Attention
+    and MLP are called unchanged, so attention-level patches (decode_attn /
+    grouped_linear) still apply."""
     if (hidden_states.shape[1] > 1 or hidden_states.dtype is not torch.bfloat16 or not hidden_states.is_contiguous()
             or getattr(self, "_ki_norm_op", None) is None or torch.is_grad_enabled()):
         # Prefill, a non-graph path, or any grad-enabled
@@ -1232,13 +1234,23 @@ def _fused_norm_layer_forward(self,
 
     op = self._ki_norm_op
     residual = hidden_states
-    # Zero-centered RMSNorm (Qwen3.5 style: rms(x) * (1 + weight)) as one
-    # launch; the +1 is applied in-kernel and the live weight is read each
-    # replay, so post-training updates are reflected.
-    if hasattr(op, "fused_rmsnorm"):
-        hidden_states = op.fused_rmsnorm(hidden_states, self.input_layernorm.weight, self.input_layernorm.eps)
+    pending_tail = getattr(self, "_ki_pending_tail", None)
+    if pending_tail is not None:
+        # The predecessor stashed its MLP output instead of doing the
+        # post-MLP residual add: one fused launch adds it to the stream
+        # in-place (the raw stream the loop and the post-attention add both
+        # need) and produces this layer's normalized attention input.
+        hidden_states = op.fused_add_norm(hidden_states, pending_tail, self.input_layernorm.weight,
+                                          self.input_layernorm.eps, True)
     else:
-        hidden_states = self.input_layernorm(hidden_states)
+        # Zero-centered RMSNorm (Qwen3.5 style: rms(x) * (1 + weight)) as
+        # one launch; the +1 is applied in-kernel and the live weight is
+        # read each replay, so post-training updates are reflected.
+        if hasattr(op, "fused_rmsnorm"):
+            hidden_states = op.fused_rmsnorm(hidden_states, self.input_layernorm.weight,
+                                             self.input_layernorm.eps)
+        else:
+            hidden_states = self.input_layernorm(hidden_states)
 
     if self.block_type == "linear_attention":
         hidden_states = self.linear_attn(
@@ -1260,25 +1272,35 @@ def _fused_norm_layer_forward(self,
     # fused_add_norm mutates its first argument in-place into the new
     # residual stream and returns the normalized input to the MLP — keep
     # both handles, the final add must go through the residual stream.
-    # The 1+w scale is recomputed from the live Parameter on every call:
-    # HF's norm multiplies by 1+weight, the kernel by its weight argument
-    # directly. During capture the add becomes part of the graph, so replay
-    # reads the parameter's memory and reflects post-training values.
+    # The kernel applies the zero-centered 1+w scale in-register and reads
+    # the live Parameter each replay, so post-training updates are
+    # reflected without a host-side 1+w materialization.
     new_residual = hidden_states
-    postattn_scale = torch.add(1.0, self.post_attention_layernorm.weight).contiguous()
-    mlp_input = op.fused_add_norm(new_residual, residual, postattn_scale, self.post_attention_layernorm.eps)
+    mlp_input = op.fused_add_norm(new_residual, residual, self.post_attention_layernorm.weight,
+                                  self.post_attention_layernorm.eps, True)
     hidden_states = self.mlp(mlp_input)
-    hidden_states = hidden_states + new_residual
+    tail = getattr(self, "_ki_tail_norm", None)
+    if tail is not None:
+        # Residual-tail fold: hand the MLP output to the successor's head
+        # instead of paying a separate residual add here; the successor's
+        # fused add+norm then produces the updated stream and its
+        # normalized attention input in one launch.
+        tail._ki_pending_tail = hidden_states
+        return new_residual
+    return hidden_states + new_residual
 
-    return hidden_states
 
-
-def install_fused_norm(model: torch.nn.Module, kernel_op) -> int:
+def install_fused_norm(model: torch.nn.Module, kernel_op, fuse_tail: bool = False) -> int:
     """Patch decoder layers to use fused_add_norm at b=1 decode.
 
     Detection is structural (block_type + mlp + both layernorms), so it
-    covers full-attention and linear-attention layers alike. Returns the
-    patched count."""
+    covers full-attention and linear-attention layers alike. With
+    ``fuse_tail`` the post-MLP residual add is folded into the next layer's
+    fused input norm: each layer stashes its MLP output for its successor
+    instead of doing a separate add, and the successor's head runs the add
+    + input norm in one launch. Layers are paired in execution order via
+    their ordered parent (the decoder's ``layers`` list); the final layer
+    keeps the plain add. Returns the patched count."""
     if kernel_op is None or not hasattr(kernel_op, "fused_add_norm"):
         return 0
     patched = 0
@@ -1293,4 +1315,11 @@ def install_fused_norm(model: torch.nn.Module, kernel_op) -> int:
         module._ki_norm_op = kernel_op
         module.forward = _fused_norm_layer_forward.__get__(module, type(module))
         patched += 1
+    if fuse_tail:
+        # Pair consecutive patched siblings (execution order = the parent's
+        # child order, i.e. the decoder's layer list).
+        for parent in model.modules():
+            siblings = [c for c in parent.children() if getattr(c, "_ki_norm_op", None) is not None]
+            for a, b in zip(siblings, siblings[1:]):
+                a._ki_tail_norm = b
     return patched

@@ -189,6 +189,10 @@ class HybridEngineRolloutConfig:
     # use_segki and a CUDA build with decode_attn_paged; unsupported shapes
     # fall back to the native paged forward.
     use_segki_paged_decode: bool = False
+    # Fold each layer's post-MLP residual add into the next layer's fused
+    # input norm (ablation lever: off by default, the plain add + fused
+    # rmsnorm pair is the baseline).
+    use_fused_residual_tail: bool = False
     enable_compiled_sampler: bool = False
 
 
@@ -350,6 +354,7 @@ class HybridEngineRollout(RolloutEngine):
         self.use_flashinfer_prefill = getattr(cfg, 'use_flashinfer_prefill', False) if cfg else False
         self.use_flashinfer_decode = getattr(cfg, 'use_flashinfer_decode', False) if cfg else False
         self.use_segki_paged_decode = getattr(cfg, 'use_segki_paged_decode', False) if cfg else False
+        self.use_fused_residual_tail = getattr(cfg, 'use_fused_residual_tail', False) if cfg else False
         self.enable_compiled_sampler = getattr(cfg, 'enable_compiled_sampler', False) if cfg else False
         if self.enable_compiled_sampler:
             configure_compiled_sampler(True)
@@ -2950,7 +2955,7 @@ class HybridEngineRollout(RolloutEngine):
             patched = install_decode_attention(
                 module, write_pos, attn_op, cos_table=cos_t, sin_table=sin_t, kv_start=kv_start,
                 rope_pos=rope_pos) if hasattr(attn_op, "decode_attn") else 0
-            install_fused_norm(module, attn_op)
+            install_fused_norm(module, attn_op, fuse_tail=self.use_fused_residual_tail)
             install_lm_head(module, attn_op)
             return patched
         except Exception:

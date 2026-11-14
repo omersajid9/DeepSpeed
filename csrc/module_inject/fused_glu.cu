@@ -1092,7 +1092,8 @@ __global__ void fused_add_norm_kernel(__nv_bfloat16* __restrict__ hidden,
                                       const __nv_bfloat16* __restrict__ weight,
                                       __nv_bfloat16* __restrict__ out,
                                       float eps,
-                                      int dim)
+                                      int dim,
+                                      int zero_centered)
 {
     extern __shared__ float s_data[];
     __shared__ float s_reduce[32];
@@ -1128,9 +1129,16 @@ __global__ void fused_add_norm_kernel(__nv_bfloat16* __restrict__ hidden,
     }
     __syncthreads();
     float rms = s_reduce[0];
-
-    for (int i = tid; i < dim; i += n_threads)
-        orow[i] = __float2bfloat16_rn(s_data[i] * rms * __bfloat162float(weight[i]));
+    // zero_centered: the weight is a zero-centered norm parameter, the
+    // effective scale is 1 + weight — applied in-register so callers pass
+    // the live parameter and no host-side 1+w materialization is needed.
+    if (zero_centered) {
+        for (int i = tid; i < dim; i += n_threads)
+            orow[i] = __float2bfloat16_rn(s_data[i] * rms * (1.0f + __bfloat162float(weight[i])));
+    } else {
+        for (int i = tid; i < dim; i += n_threads)
+            orow[i] = __float2bfloat16_rn(s_data[i] * rms * __bfloat162float(weight[i]));
+    }
 }
 
 __device__ __forceinline__ float silu_f(float v) { return v / (1.0f + expf(-v)); }
@@ -1178,7 +1186,8 @@ __global__ void gated_norm_kernel(const __nv_bfloat16* __restrict__ x,
                                       silu_f(__bfloat162float(zr[i])));
 }
 
-at::Tensor fused_add_norm(at::Tensor hidden, at::Tensor residual, at::Tensor weight, double eps)
+at::Tensor fused_add_norm(at::Tensor hidden, at::Tensor residual, at::Tensor weight, double eps,
+                          bool zero_centered)
 {
     TORCH_CHECK(hidden.is_cuda() && hidden.scalar_type() == at::ScalarType::BFloat16,
                 "hidden/residual/weight must be CUDA bf16");
@@ -1200,7 +1209,8 @@ at::Tensor fused_add_norm(at::Tensor hidden, at::Tensor residual, at::Tensor wei
         reinterpret_cast<const __nv_bfloat16*>(weight.data_ptr<at::BFloat16>()),
         reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()),
         (float)eps,
-        dim);
+        dim,
+        zero_centered ? 1 : 0);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }
@@ -2308,7 +2318,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("gdn_gates", &gdn_gates, "fused GDN beta/g gating (CUDA)");
     m.def("fused_add_norm",
           &fused_add_norm,
-          "fused residual add + RMSNorm, in-place residual update (CUDA)");
+          "fused residual add + RMSNorm, in-place residual update (CUDA)",
+          py::arg("hidden"),
+          py::arg("residual"),
+          py::arg("weight"),
+          py::arg("eps"),
+          py::arg("zero_centered") = false);
     m.def("fused_rmsnorm", &fused_rmsnorm, "fused zero-centered RMSNorm (CUDA)");
     m.def(
         "gated_norm",

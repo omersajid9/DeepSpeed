@@ -276,6 +276,12 @@ class TestKernelReferenceConsistency:
             torch.testing.assert_close(out.float(), ref_out.float(), atol=5e-2, rtol=5e-2)
             # hidden is updated in place to the pre-norm sum, every row
             torch.testing.assert_close(h_kernel.float(), (h.float() + r.float()), atol=5e-2, rtol=5e-2)
+            # zero-centered mode: the kernel applies the 1+w scale in-register
+            h_kernel = h.clone()
+            out_zc = _op().fused_add_norm(h_kernel, r, w, 1e-5, True)
+            ref_zc = ref_add_norm(h, r, w, eps=1e-5, zero_centered=True)
+            torch.testing.assert_close(out_zc.float(), ref_zc.float(), atol=5e-2, rtol=5e-2)
+            torch.testing.assert_close(h_kernel.float(), (h.float() + r.float()), atol=5e-2, rtol=5e-2)
 
     def test_fused_rmsnorm(self):
         for rows in (1, 4):  # the kernel is one-block-per-row
@@ -339,8 +345,7 @@ class _MiniGeluGated(torch.nn.Module):
 
 class _MiniRMSNorm(torch.nn.Module):
     """Qwen3.5-style RMSNorm: 1-centered, zero-initialized weight applied as
-    (1 + weight) — the convention the fused-norm wrapper pre-shifts into
-    the kernel's weight argument."""
+    (1 + weight)."""
 
     def __init__(self, hidden, eps=1e-5):
         super().__init__()
@@ -411,14 +416,20 @@ class _MiniDecoderLayer(torch.nn.Module):
 class _CPUFusedAddNormOp:
     """CPU stand-in for the fused_add_norm kernel contract: the first
     argument is updated in place to hidden+residual (the new residual
-    stream), and the result applies the weight argument directly — the
-    kernel performs no 1.0 shift, so the caller passes 1+weight."""
+    stream); the result scales by 1+weight when ``zero_centered`` else by
+    weight directly (mirrors the kernel's in-register 1+w shift)."""
 
-    def fused_add_norm(self, hidden, residual, weight, eps):
+    def fused_add_norm(self, hidden, residual, weight, eps, zero_centered=False):
         hidden.add_(residual)
         combined = hidden.float()
         rms = torch.rsqrt(combined.pow(2).mean(dim=-1, keepdim=True) + eps)
-        return (combined * rms * weight.float()).to(hidden.dtype)
+        scale = (1.0 + weight.float()) if zero_centered else weight.float()
+        return (combined * rms * scale).to(hidden.dtype)
+
+    def fused_rmsnorm(self, x, weight, eps):
+        xf = x.float()
+        rms = torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + eps)
+        return (xf * rms * (1.0 + weight.float())).to(x.dtype)
 
 
 class _MiniQKNorm(torch.nn.Module):
@@ -610,6 +621,63 @@ class TestInjectionInvariants:
         # output (an install-time scale snapshot would replay out_before)
         assert not torch.equal(out_after, out_before), \
             "fused-norm output ignored the post-step weight update"
+
+    def test_fused_norm_tail_wiring(self):
+        """fuse_tail pairs consecutive sibling layers in execution order —
+        each layer folds its post-MLP residual add into the next layer's
+        fused input norm; the last layer keeps the plain add. Without the
+        flag no pairing happens at all (the ablation baseline)."""
+        from deepspeed.module_inject.segment_ki import install_fused_norm
+
+        def make_parent(n):
+            parent = torch.nn.Module()
+            parent.layers = torch.nn.ModuleList([_MiniDecoderLayer() for _ in range(n)])
+            return parent
+
+        parent = make_parent(3)
+        layers = list(parent.layers)
+        assert install_fused_norm(parent, _CPUFusedAddNormOp(), fuse_tail=True) == 3
+        assert getattr(layers[0], "_ki_tail_norm", None) is layers[1]
+        assert getattr(layers[1], "_ki_tail_norm", None) is layers[2]
+        assert not hasattr(layers[2], "_ki_tail_norm")
+
+        parent = make_parent(2)
+        layers = list(parent.layers)
+        assert install_fused_norm(parent, _CPUFusedAddNormOp()) == 2
+        assert not hasattr(layers[0], "_ki_tail_norm")
+
+    def test_fused_norm_tail_fold_numerics(self):
+        """The folded two-layer decode step must equal the unfused sequence
+        (A: norm, attn, stream+=attn, norm, mlp, stream+=mlp; B: norm, attn).
+        The fold moves A's final add into B's input-norm launch — a dropped
+        or double-applied add, or a missing 1+w scale, shifts B's attention
+        input and the outputs below."""
+        from deepspeed.module_inject.segment_ki import install_fused_norm
+        torch.manual_seed(0)
+        parent = torch.nn.Module()
+        la, lb = _MiniDecoderLayer(), _MiniDecoderLayer()
+        parent.layers = torch.nn.ModuleList([la, lb])
+        install_fused_norm(parent, _CPUFusedAddNormOp(), fuse_tail=True)
+
+        def unfused(x):
+            # straight-line semantics, independent of the patches
+            s = x
+            for layer in (la, lb):
+                h = layer.input_layernorm(s)
+                at, _ = layer.self_attn(hidden_states=h,
+                                        attention_mask=None,
+                                        position_ids=None,
+                                        past_key_values=None,
+                                        position_embeddings=None)
+                s = s + at
+                s = s + layer.mlp(layer.post_attention_layernorm(s))
+            return s
+
+        with torch.no_grad():
+            x = torch.randn(4, 1, 32, dtype=torch.bfloat16)
+            got = lb(la(x, None), None)
+            exp = unfused(x)
+        torch.testing.assert_close(got.float(), exp.float(), atol=5e-2, rtol=5e-2)
 
     def test_decode_attn_norms_track_live_parameters(self):
         """The fused decode-attention forward must hand the kernel the live
