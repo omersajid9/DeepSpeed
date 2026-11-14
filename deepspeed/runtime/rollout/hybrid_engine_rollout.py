@@ -1059,10 +1059,13 @@ class HybridEngineRollout(RolloutEngine):
         static_write_positions = state.static_write_positions
         static_kv_starts = state.static_kv_starts
         staging_cache = state.staging_cache
-        if not self.use_paged_cache or self.use_segki_paged_decode:
+        if not self.use_paged_cache or self.use_segki_paged_decode or self.use_flashinfer_decode:
             # The static-cache path always runs the decode kernels; a paged
             # cache takes the block-table variant of the same kernel when it is
-            # enabled (the dense kernel cannot read a block table). Bind to
+            # enabled (the dense kernel cannot read a block table). When
+            # flashinfer owns the paged attention core, the cache-independent
+            # fusions (fused add+norm, lm-head) still apply, while the
+            # attention-level patch defers to the flashinfer path. Bind to
             # this state's write-position storage — bucket caches hold slices
             # of it, and the forward's identity gate is re-bound to each
             # bucket's slice at capture/replay below; the paged path uses the

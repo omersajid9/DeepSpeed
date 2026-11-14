@@ -963,6 +963,13 @@ def _decode_attn_forward(self,
     write_pos tensor the cache update writes through, keeping the whole
     step CUDA-graph replayable."""
     if getattr(past_key_values, "is_paged_cache", False):
+        if getattr(past_key_values, "use_flashinfer_decode", False):
+            # flashinfer paged decode owns the attention core: it runs the
+            # split-KV prefill-paged kernel + merge-states through the cache
+            # shim, which the fused paged kernel would bypass. Defer to the
+            # native paged forward; GDN fusion is unaffected.
+            return self._ki_orig_attn_forward(hidden_states, position_embeddings, attention_mask, past_key_values,
+                                              **kwargs)
         # Paged caches address K/V through a block table, so they take the
         # paged variant of the same fused kernel.
         return _paged_decode_attn_forward(self, hidden_states, position_embeddings, attention_mask, past_key_values,
