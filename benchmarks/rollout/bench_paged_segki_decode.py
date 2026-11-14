@@ -102,7 +102,7 @@ def _load_model(model_name, dtype):
 
 
 def _make_request(prompt_len, batch_size, vocab_size, device):
-    generator = torch.Generator().manual_seed(0)
+    generator = torch.Generator(device=device).manual_seed(0)
     prompt_ids = torch.randint(1, vocab_size, (batch_size, prompt_len), generator=generator, device=device)
     prompt_mask = torch.ones_like(prompt_ids)
     return RolloutRequest(prompt_ids, prompt_mask)
@@ -173,7 +173,15 @@ def main():
     device = torch.device(get_accelerator().current_device_name())
 
     model = _load_model(args.model, dtype).to(device)
-    vocab_size = int(getattr(model.config, "vocab_size", getattr(model.config, "text_config", None).vocab_size))
+    # getattr's default is evaluated eagerly, so probe in two steps: the top-level
+    # config carries vocab_size for text-only models; the multimodal wrapper
+    # nests it under text_config.
+    vocab_size = getattr(model.config, "vocab_size", None)
+    if vocab_size is None:
+        vocab_size = getattr(getattr(model.config, "text_config", None), "vocab_size", None)
+    if vocab_size is None:
+        raise SystemExit(f"cannot find vocab_size on {type(model.config).__name__}")
+    vocab_size = int(vocab_size)
     request = _make_request(args.prompt_len, args.batch_size, vocab_size, device)
     sampling = SamplingConfig(max_new_tokens=args.max_new_tokens,
                               temperature=0.0,

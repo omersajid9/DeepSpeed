@@ -18,7 +18,7 @@ layers of checks:
    reaches the native forward instead.
 """
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -63,9 +63,12 @@ def _paged_pool(batch, num_kv_heads, head_dim, length, block_size, seed=0, devic
     blocks_per_row = _blocks_for(length, block_size)
     pool_k = torch.randn(batch * blocks_per_row, block_size, num_kv_heads, head_dim, dtype=dtype, device=device)
     pool_v = torch.randn_like(pool_k)
-    table = torch.arange(batch * blocks_per_row, dtype=torch.int32).view(batch, blocks_per_row)
+    # The block table is read by the GPU kernel, so it must live on the pool's
+    # device (the reference materializes it with plain indexing and works
+    # either way).
+    table = torch.arange(batch * blocks_per_row, dtype=torch.int32, device=device).view(batch, blocks_per_row)
     for row in range(batch):
-        table[row] = table[row][torch.randperm(blocks_per_row)]
+        table[row] = table[row][torch.randperm(blocks_per_row, device=device)]
     return pool_k.view(-1, num_kv_heads, head_dim), pool_v.view(-1, num_kv_heads, head_dim), table
 
 
@@ -419,6 +422,11 @@ def test_fused_kernel_stores_through_the_real_cache_page_table():
     positions = torch.tensor([63, 70], dtype=torch.long, device=DEV)
     cache.set_write_position(positions)
     cache.set_active_rows([0, 1])
+    # The kernel resolves K/V through the block table, so the rows need blocks
+    # covering their write positions (the cache protocol does this on every
+    # write; a fresh cache's table is all -1).
+    for row in range(2):
+        cache._ensure_blocks(row, int(positions[row]) + 1)
 
     hidden = torch.randn(2, 1, hidden_size, dtype=torch.bfloat16, device=DEV)
     q_w = torch.randn(num_q_heads * head_dim * 2, hidden_size, dtype=torch.float32, device=DEV).bfloat16()
@@ -455,15 +463,18 @@ def test_fused_kernel_stores_through_the_real_cache_page_table():
     cache.note_step_written()
 
     _, _, k_ref, v_ref = ref_prologue(hidden[:, 0, :].float(), q_w.float(), k_w.float(), v_w.float(),
-                                      torch.zeros(head_dim), torch.zeros(head_dim), cos_t[positions], sin_t[positions],
-                                      head_dim, 1e-6)
+                                      torch.zeros(head_dim, device=DEV), torch.zeros(head_dim, device=DEV),
+                                      cos_t[positions], sin_t[positions], head_dim, 1e-6)
     for row in range(2):
         keys, values = cache.materialize(0, row, int(positions[row]) + 1)
         torch.testing.assert_close(keys[:, -1].float(), k_ref[row].float(), atol=5e-2, rtol=5e-2)
         torch.testing.assert_close(values[:, -1].float(), v_ref[row].float(), atol=5e-2, rtol=5e-2)
         assert int(cache.row_len[row]) == int(positions[row]) + 1
-    # the kernel writes through the page table, so K and V must land in the same slot
-    assert int(cache.block_ids[0, 0]) >= 0 and int(cache.block_ids[1, 1]) >= 0
+    # the kernel writes through the page table, so the blocks covering each
+    # row's write position must be allocated
+    for row in range(2):
+        last_block = int(positions[row]) // cache.block_size
+        assert int(cache.block_ids[row, last_block]) >= 0
 
 
 class _ReferenceDenseOp:
@@ -533,6 +544,30 @@ def _mock_graph_accelerator(mock_get_accelerator):
     return accelerator
 
 
+@contextmanager
+def _torch_gdn_backends():
+    """Pin the GDN layer's conv/delta-rule backends to their torch references.
+
+    This test rolls the tiny hybrid model out on CPU tensors, but the
+    modeling module's GDN backends prefer the installed causal-conv1d / fla
+    CUDA kernels when they are importable. The module-level names resolve
+    through the kernel-wrapper to the pure-torch implementations shipped in
+    the same file, which run on any device and match the kernels the test is
+    not about."""
+    import transformers.models.qwen3_5.modeling_qwen3_5 as modeling
+
+    names = ("causal_conv1d_fn", "causal_conv1d_update", "torch_chunk_gated_delta_rule",
+             "torch_recurrent_gated_delta_rule")
+    refs = {}
+    for name in names:
+        fn = getattr(modeling, name)
+        while hasattr(fn, "__wrapped__"):
+            fn = fn.__wrapped__
+        refs[name] = fn
+    with patch.multiple(modeling, **refs):
+        yield
+
+
 @patch("deepspeed.runtime.rollout.hybrid_engine_rollout.get_accelerator")
 def test_fused_decode_skips_prompt_padding_in_continuous_batching(mock_get_accelerator):
     """Left-padded prompts must not leak pad columns into the fused decode.
@@ -556,21 +591,22 @@ def test_fused_decode_skips_prompt_padding_in_continuous_batching(mock_get_accel
     engine = SimpleNamespace(module=model)
     tokenizer = SimpleNamespace(pad_token_id=0, eos_token_id=None)
 
-    plain = HybridEngineRollout(engine, tokenizer, cfg=HybridEngineRolloutConfig(use_graph_capture=True))
-    with torch.no_grad():
-        masked = plain.generate(request, sampling).input_ids.tolist()
+    with _torch_gdn_backends():
+        plain = HybridEngineRollout(engine, tokenizer, cfg=HybridEngineRolloutConfig(use_graph_capture=True))
+        with torch.no_grad():
+            masked = plain.generate(request, sampling).input_ids.tolist()
 
-    def run_with(op):
-        with patch("deepspeed.ops.module_inject.get_fused_glu_op", return_value=op), \
-                patch.object(HybridEngineRollout, "_apply_segki", return_value=None):
-            rollout = HybridEngineRollout(engine,
-                                          tokenizer,
-                                          cfg=HybridEngineRolloutConfig(use_graph_capture=True, use_segki=True))
-            with torch.no_grad():
-                return rollout.generate(request, sampling).input_ids.tolist()
+        def run_with(op):
+            with patch("deepspeed.ops.module_inject.get_fused_glu_op", return_value=op), \
+                    patch.object(HybridEngineRollout, "_apply_segki", return_value=None):
+                rollout = HybridEngineRollout(engine,
+                                              tokenizer,
+                                              cfg=HybridEngineRolloutConfig(use_graph_capture=True, use_segki=True))
+                with torch.no_grad():
+                    return rollout.generate(request, sampling).input_ids.tolist()
 
-    windowed_op = _ReferenceDenseOp()
-    windowed = run_with(windowed_op)
+        windowed_op = _ReferenceDenseOp()
+        windowed = run_with(windowed_op)
 
     assert windowed_op.calls, "the fused decode kernel must have run"
     # Row 0 starts after three pad columns and ropes at its logical position
@@ -650,6 +686,9 @@ class _PoolStub:
         self._value_views = [torch.zeros(num_slots, num_kv_heads, head_dim, dtype=dtype)]
         self._write_position = None
         self._record_past = False
+        # The stub models a compact cache whose active rows are the leading
+        # slots, the invariant the fused kernel's batch-index addressing needs.
+        self.active_rows_are_prefix = True
         self.note_calls = 0
 
     def _kv_slot(self, layer_idx):

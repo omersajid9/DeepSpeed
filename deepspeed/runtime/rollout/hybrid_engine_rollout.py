@@ -1825,6 +1825,9 @@ class HybridEngineRollout(RolloutEngine):
             admitted_ids = tuple(request.request_id for request in update.admitted)
             if len(target_slots) != len(admitted_ids):
                 raise ValueError("paged prefill needs one target slot per admitted request")
+            if kv_starts is not None:
+                for target_slot in target_slots:
+                    kv_starts[target_slot] = 0  # paged rows are compact
             return self._paged_prefill(module,
                                        cache,
                                        request_by_id,
@@ -2927,7 +2930,14 @@ class HybridEngineRollout(RolloutEngine):
             # are indexed on-device at replay time, so the addresses stay
             # fixed for the captured graph.
             cos_t = sin_t = None
-            rotary = getattr(getattr(module, "model", module), "rotary_emb", None)
+            # The rotary module sits at different depths per wrapper (dense:
+            # model.model, multimodal: model.language_model), so search by leaf
+            # name instead of assuming one path.
+            rotary = None
+            for name, mod in module.named_modules():
+                if name.rsplit(".", 1)[-1] == "rotary_emb":
+                    rotary = mod
+                    break
             if rotary is not None:
                 with torch.no_grad():
                     positions = torch.arange(max_len, device=device)[None, :]
