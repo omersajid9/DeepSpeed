@@ -1323,3 +1323,49 @@ def install_fused_norm(model: torch.nn.Module, kernel_op, fuse_tail: bool = Fals
             for a, b in zip(siblings, siblings[1:]):
                 a._ki_tail_norm = b
     return patched
+
+
+# ─── Fused zero-centered RMSNorm for the remaining norm modules ───
+
+
+def _fused_norm_module_forward(self, x):
+    """Forward replacement for a zero-centered RMSNorm module (per-head
+    q/k norms, final layer norm): one fused_rmsnorm launch instead of HF's
+    unfused mean/rsqrt/add/mul/cast chain. Prefill (seq_len > 1), a
+    dtype/contiguity mismatch, or a grad-enabled forward falls back to the
+    original forward — the kernel's win is decode-only, same contract as
+    fused_add_norm."""
+    op = getattr(self, "_ki_norm_op", None)
+    if (op is None or x.shape[1] > 1 or x.dtype is not torch.bfloat16 or not x.is_contiguous()
+            or torch.is_grad_enabled()):
+        return self._ki_orig_norm_forward(x)
+    return op.fused_rmsnorm(x, self.weight, self.eps)
+
+
+def install_norm_modules(model: torch.nn.Module, kernel_op) -> int:
+    """Route the zero-centered RMSNorm modules that live outside the
+    patched layer forward — the per-head q/k norms and the final norm
+    before lm_head — through fused_rmsnorm at decode.
+
+    Detection is leaf-name (q_norm/k_norm/norm) + weight + eps: the GDN
+    output norm is RMSNormGated (variance_epsilon, no eps) and runs its
+    own fused gated_norm path, so it is excluded. Returns the patched
+    count."""
+    if kernel_op is None or not hasattr(kernel_op, "fused_rmsnorm"):
+        return 0
+    patched = 0
+    for name, module in model.named_modules():
+        if name.rsplit(".", 1)[-1] not in ("q_norm", "k_norm", "norm"):
+            continue
+        if not (hasattr(module, "weight") and hasattr(module, "eps")):
+            continue
+        # idempotent: the decode-kernel install re-runs per cache path/bucket,
+        # and re-saving an already-patched forward as the "original" would
+        # turn the prefill fallback into infinite recursion.
+        if getattr(module, "_ki_orig_norm_forward", None) is not None:
+            continue
+        module._ki_norm_op = kernel_op
+        module._ki_orig_norm_forward = module.forward
+        module.forward = _fused_norm_module_forward.__get__(module, type(module))
+        patched += 1
+    return patched

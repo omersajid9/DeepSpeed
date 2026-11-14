@@ -2931,7 +2931,8 @@ class HybridEngineRollout(RolloutEngine):
         if not self.use_segki:
             return 0
         try:
-            from deepspeed.module_inject.segment_ki import install_decode_attention, install_fused_norm, install_lm_head
+            from deepspeed.module_inject.segment_ki import (install_decode_attention, install_fused_norm,
+                                                            install_lm_head, install_norm_modules)
             from deepspeed.ops.module_inject import get_fused_glu_op
             attn_op = get_fused_glu_op()
             # Full-length RoPE tables for the fused q-side path; positions
@@ -2956,6 +2957,7 @@ class HybridEngineRollout(RolloutEngine):
                 module, write_pos, attn_op, cos_table=cos_t, sin_table=sin_t, kv_start=kv_start,
                 rope_pos=rope_pos) if hasattr(attn_op, "decode_attn") else 0
             install_fused_norm(module, attn_op, fuse_tail=self.use_fused_residual_tail)
+            install_norm_modules(module, attn_op)
             install_lm_head(module, attn_op)
             return patched
         except Exception:
