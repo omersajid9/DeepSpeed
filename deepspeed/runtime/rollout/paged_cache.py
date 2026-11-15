@@ -909,20 +909,14 @@ class HybridPagedAttentionCache(PagedAttentionCache):
         self._gdn_layer_idx = gdn_idx
         self._gdn_slot = {layer_idx: i for i, layer_idx in enumerate(gdn_idx)}
 
-        num_v_heads = int(getattr(text_config, "linear_num_value_heads"))
-        num_k_heads = int(getattr(text_config, "linear_num_key_heads"))
-        head_k = int(getattr(text_config, "linear_key_head_dim"))
-        head_v = int(getattr(text_config, "linear_value_head_dim"))
+        from deepspeed.utils.static_cache import hybrid_gdn_state_shapes
+
         self._gdn_kernel = int(getattr(text_config, "linear_conv_kernel_dim"))
-        conv_dim = 2 * num_k_heads * head_k + num_v_heads * head_v
         # The cached conv state holds the last kernel-sized window; the
         # per-token decode kernel reads its final kernel-1 entries from it.
-        self._pool_conv = [
-            torch.zeros((batch_size, conv_dim, self._gdn_kernel), dtype=dtype, device=self.device) for _ in gdn_idx
-        ]
-        self._pool_rec = [
-            torch.zeros((batch_size, num_v_heads, head_k, head_v), dtype=dtype, device=self.device) for _ in gdn_idx
-        ]
+        conv_shape, rec_shape = hybrid_gdn_state_shapes(text_config, batch_size, self.device, dtype)
+        self._pool_conv = [torch.zeros(conv_shape, dtype=dtype, device=self.device) for _ in gdn_idx]
+        self._pool_rec = [torch.zeros(rec_shape, dtype=dtype, device=self.device) for _ in gdn_idx]
         for pool in self._pool_conv + self._pool_rec:
             # Decode kernels update these in place under graph capture; the
             # addresses must stay fixed for the captured graph's lifetime.
@@ -1083,6 +1077,25 @@ class HybridPagedAttentionCache(PagedAttentionCache):
             view = pool[self._gdn_prefill_row:self._gdn_prefill_row + 1]
         self._gdn_has_state = True
         return view
+
+    def copy_gdn_state_from(self, layer_idx: int, source_layer, source_row: int, target_row: int) -> None:
+        """Move one row of conv/recurrent state out of a pooled staging slot.
+
+        Chunked-prefill staging keeps a row's GDN state in its own pooled slot;
+        publishing the prompt moves that row into this cache's pool, so the
+        row's KV and its recurrence stay aligned.
+        """
+        if layer_idx not in self._gdn_slot:
+            raise ValueError(f"layer {layer_idx} holds no GDN state")
+        slot = self._gdn_slot[layer_idx]
+        # The source is either a pooled staging slot or an HF prefill slot;
+        # both serve their state through the cache protocol's dicts.
+        self._pool_conv[slot][target_row].copy_(source_layer.conv_states[0][source_row])
+        recurrent = source_layer.recurrent_states[0]
+        if recurrent is not None:
+            self._pool_rec[slot][target_row].copy_(recurrent[source_row])
+        self._gdn_rows_with_state.add(target_row)
+        self._gdn_has_state = True
 
     def is_recording_past(self, layer_idx: int = 0, state_idx: int = 0) -> bool:
         return self._record_past

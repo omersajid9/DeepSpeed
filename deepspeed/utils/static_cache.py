@@ -211,6 +211,25 @@ class DeepSpeedStaticLayer:
                 self._write_position = self._write_position.index_select(0, beam_idx.to(self._write_position.device))
 
 
+def hybrid_gdn_state_shapes(text_config, batch_size: int, device, dtype):
+    """Conv/recurrent pool shapes for a hybrid config's linear-attention layers.
+
+    Mirrors the HF GDN cache: the conv state keeps the last ``kernel`` columns
+    of the concatenated q|k|v projection, the recurrent state is the per-value-
+    head key/value matrix. Shared by the paged hybrid cache and the chunked-
+    prefill staging caches so both size their pools identically.
+    """
+    num_v_heads = int(getattr(text_config, "linear_num_value_heads"))
+    num_k_heads = int(getattr(text_config, "linear_num_key_heads"))
+    head_k = int(getattr(text_config, "linear_key_head_dim"))
+    head_v = int(getattr(text_config, "linear_value_head_dim"))
+    kernel = int(getattr(text_config, "linear_conv_kernel_dim"))
+    conv_dim = 2 * num_k_heads * head_k + num_v_heads * head_v
+    conv_shape = (batch_size, conv_dim, kernel)
+    rec_shape = (batch_size, num_v_heads, head_k, head_v)
+    return conv_shape, rec_shape
+
+
 class DSStaticGDNSlot:
     """Cache slot for hybrid models' linear-attention layers.
 
@@ -254,6 +273,25 @@ class DSStaticGDNSlot:
             raise AttributeError(f"DSStaticGDNSlot not bound: {name}")
         return getattr(slot, name)
 
+    def _allocate_pool(self, conv_shape, rec_shape, max_batch_size: int, device, dtype) -> None:
+        """Allocate the zeroed full-batch conv/recurrent pools (idempotent)."""
+        if self._owns_pool:
+            return
+        self._pool_conv = torch.zeros((max_batch_size, *conv_shape), dtype=dtype, device=device)
+        self._pool_rec = (torch.zeros(
+            (max_batch_size, *rec_shape), dtype=dtype, device=device) if rec_shape is not None else None)
+        torch._dynamo.mark_static_address(self._pool_conv)
+        if self._pool_rec is not None:
+            torch._dynamo.mark_static_address(self._pool_rec)
+        self._owns_pool = True
+        self._pool_batch_size = max_batch_size
+        self._active_width = 0
+        self.has_previous_state = {0: False}
+        # Pooled state is always the live decode state: the model's GDN layers
+        # must take the fused per-token update path, never the record-the-past
+        # chunked-prefill branch, so the layer-level flag stays False.
+        self.record_past = False
+
     def adopt_gdn_pool(self, hf_slot, max_batch_size: int) -> None:
         """Allocate the full-batch conv/recurrent state pool this row owns.
 
@@ -267,22 +305,8 @@ class DSStaticGDNSlot:
         if conv_state is None:
             raise ValueError("cannot pool a GDN layer whose prefill cache holds no conv state")
         rec_state = hf_slot.recurrent_states[0]
-        device, dtype = conv_state.device, conv_state.dtype
-        self._pool_conv = torch.zeros((max_batch_size, *conv_state.shape[1:]), dtype=dtype, device=device)
-        self._pool_rec = (torch.zeros(
-            (max_batch_size,
-             *rec_state.shape[1:]), dtype=rec_state.dtype, device=rec_state.device) if rec_state is not None else None)
-        torch._dynamo.mark_static_address(self._pool_conv)
-        if self._pool_rec is not None:
-            torch._dynamo.mark_static_address(self._pool_rec)
-        self._owns_pool = True
-        self._pool_batch_size = max_batch_size
-        self._active_width = 0
-        self.has_previous_state = {0: False}
-        # Pooled state is always the live decode state: the model's GDN layers
-        # must take the fused per-token update path, never the record-the-past
-        # chunked-prefill branch, so the layer-level flag stays False.
-        self.record_past = False
+        self._allocate_pool(conv_state.shape[1:], None if rec_state is None else rec_state.shape[1:], max_batch_size,
+                            conv_state.device, conv_state.dtype)
 
     def copy_state_from(self, hf_slot, source_row: int, target_row: int) -> None:
         """Move one row's prefilled conv/recurrent state into the pool."""
@@ -512,6 +536,20 @@ class DeepSpeedStaticCache:
                 continue
             layer._trim_left(count)
 
+    def adopt_gdn_pools(self, conv_shape, rec_shape, device, dtype) -> None:
+        """Give every linear-attention slot a pooled state of ``batch`` rows.
+
+        The chunked-prefill staging cache runs chunk forwards for prompts that
+        never saw a one-shot prefill, so its GDN slots have no HF slot to adopt;
+        shapes come from the config (``hybrid_gdn_state_shapes``) instead.
+        Idempotent, and a no-op for caches without linear-attention layers.
+        """
+        batch_size = conv_shape[0]
+        for layer in self._layers:
+            if isinstance(layer, DSStaticGDNSlot):
+                layer._allocate_pool(conv_shape[1:], None if rec_shape is None else rec_shape[1:], batch_size, device,
+                                     dtype)
+
     def set_active_width(self, width: int) -> None:
         """Select the GDN pool rows the next decode forward reads and writes.
 
@@ -591,10 +629,20 @@ class DeepSpeedStaticCache:
     def update_conv_state(self, conv_state, layer_idx: int = 0, **kwargs):
         layer = self._layers[layer_idx]
         if isinstance(layer, DSStaticGDNSlot) and layer._owns_pool:
+            # Mirrors HF's protocol: return state-plus-window for the conv (a
+            # fresh row returns the window alone), and store the last kernel
+            # columns — left-padded when the window is shorter than the kernel,
+            # which is the normal case for a chunked-prefill staging row.
             states = layer._pool_conv
-            states[:layer.active_width()].copy_(conv_state[..., -states.shape[-1]:])
+            width = layer.active_width()
+            kernel = states.shape[-1]
+            full = torch.cat([states[:width], conv_state], dim=-1) if layer.has_previous_state[0] else conv_state
+            tail = full[..., -kernel:]
+            if tail.shape[-1] < kernel:
+                tail = torch.nn.functional.pad(tail, (kernel - tail.shape[-1], 0))
+            states[:width].copy_(tail)
             layer.has_previous_state[0] = True
-            return states[:layer.active_width()]
+            return full
         return layer.update_conv_state(conv_state, state_idx=0, **kwargs)
 
     def get_conv_state(self, layer_idx: int, state_idx: int = 0):
