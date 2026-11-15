@@ -24,6 +24,7 @@ Generation paths:
 
 import hashlib
 import itertools
+import os
 import time
 from copy import copy
 from dataclasses import dataclass, field
@@ -172,6 +173,11 @@ class HybridEngineRolloutConfig:
     # construction. Fuses comm-free projection+activation segments into
     # single GEMM+custom-kernel calls (MLP gate|up and GDN input projections).
     use_segki: bool = False
+    # GDN input projection: cache the stacked [qkv|z|b|a] weight per layer
+    # and run one GEMM instead of four GEMMs + a concat (the Ampere
+    # grouped-WMMA threshold is 1, so small-batch decode otherwise rides
+    # the aten composite). Changes numerics — off by default.
+    gdn_proj_concat: bool = False
     align_decode_fronts: bool = False
     enable_cache_trimming: bool = False
     continuous_cache_capacity: Optional[int] = None
@@ -377,6 +383,8 @@ class HybridEngineRollout(RolloutEngine):
             )
 
         self.use_segki = cfg is not None and getattr(cfg, 'use_segki', False)
+        if self.use_segki and getattr(cfg, 'gdn_proj_concat', False):
+            os.environ["DS_SEGKI_GDN_CONCAT"] = "1"
         if self.use_segki:
             self._segki_report = self._apply_segki()
         else:
