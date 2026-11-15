@@ -170,6 +170,8 @@ class PagedAttentionCache:
         self._fi_decode_indptr_host = None
         self._fi_decode_last_page_len_host = None
         self._fi_decode_q = None
+        self._attn_prep_op = None
+        self._attn_prep_gate = None
         self._fi_step_planned = False
 
     @property
@@ -485,7 +487,10 @@ class PagedAttentionCache:
         num_rows, num_heads, _, head_dim = query_states.shape
         if self._graph_mode:
             wrapper = self._flashinfer_decode_wrapper
-            self._fi_decode_q[:num_rows].copy_(query_states.squeeze(2))
+            # The fused prep kernel writes q straight into _fi_decode_q; only
+            # stage it when the query lives elsewhere.
+            if query_states.squeeze(2).data_ptr() != self._fi_decode_q.data_ptr():
+                self._fi_decode_q[:num_rows].copy_(query_states.squeeze(2))
             query = self._fi_decode_q
             output = self._graph_outputs[slot].view(self.max_batch_size, num_heads, head_dim)
         else:
@@ -629,6 +634,71 @@ class PagedAttentionCache:
             raise RuntimeError("paged cache write position was not set")
         rows = self._active_rows
         self.row_len[rows] = (self._write_positions[rows] + 1).to(torch.int32)
+
+    def enable_attn_prep(self, op) -> None:
+        """Route the full-attention layer prep (q|gate split, per-head q/k
+        norm, partial RoPE, paged K/V write, gate sigmoid) through the fused
+        CUDA kernel. Requires the FlashInfer decode path: the kernel writes
+        K/V into the same pool the FlashInfer wrapper reads."""
+        if not self.use_flashinfer_decode:
+            raise RuntimeError("fused attention prep requires use_flashinfer_decode")
+        if op is None or not hasattr(op, "fused_attn_prep"):
+            raise RuntimeError("fused attention prep requires the fused_attn_prep CUDA op")
+        self._attn_prep_op = op
+
+    def attn_prep(self, layer_idx: int, q_raw: torch.Tensor, k_raw: torch.Tensor,
+                  v_raw: torch.Tensor, q_w: torch.Tensor, k_w: torch.Tensor,
+                  cos: torch.Tensor, sin: torch.Tensor, eps_q: float, eps_k: float,
+                  num_rows: int):
+        """Run the fused prep kernel for this layer's decode step.
+
+        Returns ``(q_out, gate_sig)`` — q_out is ``[num_rows, nq, 1, hd]``
+        ready for :meth:`attention`, gate_sig is ``[num_rows, 1, nq * hd]`` —
+        or ``None`` when the step cannot take the fast path, in which case
+        the caller replays the unfused forward.  In graph mode the q output
+        lands in the padded buffer the FlashInfer replay already reads, so
+        no query copy is needed."""
+        op = self._attn_prep_op
+        if op is None or not self.active_rows_are_prefix or self._write_positions is None:
+            return None
+        try:
+            slot = self._kv_slot(layer_idx)
+        except ValueError:
+            return None
+        if (q_raw.size(0) != num_rows or cos.dim() != 3 or cos.shape[1] != 1 or
+                sin.shape != cos.shape or
+                not (q_raw.is_contiguous() and k_raw.is_contiguous() and v_raw.is_contiguous()
+                     and cos.is_contiguous() and sin.is_contiguous())):
+            return None
+        r = cos.size(-1)
+        # The attention forward hands us [rows, 1, ...] projections; the
+        # kernel indexes rows, so drop the (unit) sequence dim.
+        q_raw = q_raw.reshape(num_rows, -1)
+        k_raw = k_raw.reshape(num_rows, -1)
+        v_raw = v_raw.reshape(num_rows, -1)
+        if self._graph_mode:
+            if self._attn_prep_gate is None:
+                self._attn_prep_gate = torch.empty(
+                    (self.max_batch_size, self.num_q_heads * self.head_dim),
+                    dtype=self.dtype, device=self.device)
+            q_out = self._fi_decode_q.view(self.max_batch_size, self.num_q_heads, 1, self.head_dim)
+            gate_out = self._attn_prep_gate
+        else:
+            q_out = torch.empty((num_rows, self.num_q_heads, 1, self.head_dim),
+                                dtype=self.dtype, device=self.device)
+            gate_out = torch.empty((num_rows, self.num_q_heads * self.head_dim),
+                                   dtype=self.dtype, device=self.device)
+        op.fused_attn_prep(
+            q_raw, k_raw, v_raw, q_w, k_w,
+            cos.view(num_rows, r), sin.view(num_rows, r),
+            self._write_positions, self.block_ids,
+            self._key_views[slot], self._value_views[slot],
+            q_out, gate_out,
+            self.block_size, self.max_blocks_per_row,
+            self.num_q_heads, self.num_kv_heads, self.head_dim, r,
+            eps_q, eps_k)
+        self.note_step_written()
+        return q_out[:num_rows], gate_out[:num_rows].view(num_rows, 1, -1)
 
     def write(self, layer_idx: int, key_states: torch.Tensor, value_states: torch.Tensor) -> None:
         """Write post-RoPE K/V for the active rows at their current positions."""
@@ -1303,11 +1373,31 @@ def _paged_qwen3_5_forward(
     input_shape = hidden_states.shape[:-1]
     hidden_shape = (*input_shape, -1, self.head_dim)
 
-    query_states, gate = torch.chunk(self.q_proj(hidden_states).view(*input_shape, -1, self.head_dim * 2), 2, dim=-1)
+    q_raw = self.q_proj(hidden_states)
+    k_raw = self.k_proj(hidden_states)
+    v_raw = self.v_proj(hidden_states)
+    # One-launch prep (split + q/k norm + partial RoPE + paged K/V write +
+    # gate sigmoid) when the cache carries the fused kernel; otherwise the
+    # unfused sequence below replays.
+    if (hidden_states.shape[1] == 1 and hidden_states.dtype is torch.bfloat16 and
+            q_raw.is_contiguous() and k_raw.is_contiguous() and v_raw.is_contiguous()):
+        done = past_key_values.attn_prep(
+            self.layer_idx, q_raw, k_raw, v_raw,
+            self.q_norm.weight, self.k_norm.weight,
+            position_embeddings[0], position_embeddings[1],
+            self.q_norm.eps, self.k_norm.eps, input_shape[0])
+        if done is not None:
+            q_states, gate_sig = done
+            attn_output = past_key_values.attention(self.layer_idx, q_states, self.scaling)
+            attn_output = attn_output.reshape(*input_shape, -1) * gate_sig
+            attn_output = self.o_proj(attn_output)
+            return attn_output, None
+
+    query_states, gate = torch.chunk(q_raw.view(*input_shape, -1, self.head_dim * 2), 2, dim=-1)
     gate = gate.reshape(*input_shape, -1)
     query_states = self.q_norm(query_states.view(hidden_shape)).transpose(1, 2)
-    key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-    value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    key_states = self.k_norm(k_raw.view(hidden_shape)).transpose(1, 2)
+    value_states = v_raw.view(hidden_shape).transpose(1, 2)
 
     cos, sin = position_embeddings
     query_states, key_states = _apply_partial_rotary(query_states, key_states, cos, sin)

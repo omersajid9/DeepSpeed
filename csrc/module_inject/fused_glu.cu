@@ -1283,6 +1283,210 @@ at::Tensor fused_rmsnorm(at::Tensor x, at::Tensor weight, double eps)
     return out;
 }
 
+// ─── Fused full-attention prep (decode, one token per row) ───
+// One launch replaces the per-layer eager prep chain of the paged forward:
+// the q|gate split copies, the zero-centered per-head RMSNorm on q and k,
+// the partial RoPE (rotates the leading `r` head dims, passes the rest
+// through), the paged K/V pool scatter, and the gate sigmoid.  Layouts
+// mirror PagedAttentionCache: q_raw is [rows, nq * 2 * hd] (query half |
+// gate half per head), k/v_raw are [rows, nk * hd], cos/sin are [rows, r],
+// the pool views are flat [slots, nk, hd] with
+// slot = block * block_size + offset looked up through the int32 block
+// table, and positions are int64 per row.
+// Grid: (rows, nq + 2 * nk), one warp per (row, head): warps < nq cover a q
+// head and its gate, the next nk a k head (norm + RoPE + pool write), the
+// last nk a v head (pool write).  Cos/sin may be bf16 (the model dtype) or
+// fp32; both are promoted to fp32 in-register, matching the eager path's
+// TensorIterator promotion.
+template <class CST>
+__global__ void fused_attn_prep_kernel(const __nv_bfloat16* __restrict__ q_raw,
+                                       const __nv_bfloat16* __restrict__ k_raw,
+                                       const __nv_bfloat16* __restrict__ v_raw,
+                                       const __nv_bfloat16* __restrict__ q_w,
+                                       const __nv_bfloat16* __restrict__ k_w,
+                                       const CST* __restrict__ cos,
+                                       const CST* __restrict__ sin,
+                                       const long* __restrict__ positions,
+                                       const int* __restrict__ block_ids,
+                                       __nv_bfloat16* __restrict__ key_pool,
+                                       __nv_bfloat16* __restrict__ value_pool,
+                                       __nv_bfloat16* __restrict__ q_out,
+                                       __nv_bfloat16* __restrict__ gate_out,
+                                       int nq, int nk, int hd, int r,
+                                       int block_size, int max_blocks,
+                                       float eps_q, float eps_k)
+{
+    extern __shared__ float s[];  // [hd] normalized row (bf16-rounded, as float)
+    const int row = blockIdx.x;
+    const int w = blockIdx.y;
+    const int tid = threadIdx.x;
+    const bool is_q = (w < nq);
+    const bool is_k = (w >= nq && w < nq + nk);
+    const int h = is_q ? w : (is_k ? w - nq : w - nq - nk);
+    const int half = r >> 1;
+
+    if (is_q) {
+        const __nv_bfloat16* xq = q_raw + ((long)row * nq + h) * (2 * hd);
+        const __nv_bfloat16* xg = xq + hd;
+        __nv_bfloat16 xb[8], gb[8];
+        *reinterpret_cast<float4*>(xb) = *reinterpret_cast<const float4*>(xq + tid * 8);
+        *reinterpret_cast<float4*>(gb) = *reinterpret_cast<const float4*>(xg + tid * 8);
+        float ss = 0.f;
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            float v = __bfloat162float(xb[j]);
+            s[tid * 8 + j] = v;
+            ss += v * v;
+        }
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1)
+            ss += __shfl_xor_sync(0xffffffff, ss, o);
+        float rms = rsqrtf(ss / (float)hd + eps_q);
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            int d = tid * 8 + j;
+            float n = s[d] * rms * (1.0f + __bfloat162float(q_w[d]));
+            s[d] = __bfloat162float(__float2bfloat16_rn(n));  // matches the norm-only path's rounding
+        }
+        __syncwarp();
+        const CST* cr = cos + (long)row * r;
+        const CST* sr = sin + (long)row * r;
+        float c[8], sn[8];
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            int d = tid * 8 + j;
+            c[j] = (d < r) ? (float)cr[d] : 0.f;
+            sn[j] = (d < r) ? (float)sr[d] : 0.f;
+        }
+        __nv_bfloat16* qo = q_out + ((long)row * nq + h) * hd;
+        __nv_bfloat16* go = gate_out + ((long)row * nq + h) * hd;
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            int d = tid * 8 + j;
+            float o;
+            if (d < half)
+                o = __fsub_rn(__fmul_rn(s[d], c[j]), __fmul_rn(s[d + half], sn[j]));
+            else if (d < r)
+                o = __fadd_rn(__fmul_rn(s[d], c[j]), __fmul_rn(s[d - half], sn[j]));
+            else
+                o = s[d];
+            qo[d] = __float2bfloat16_rn(o);
+            go[d] = __float2bfloat16_rn(1.0f / (1.0f + expf(-__bfloat162float(gb[j]))));
+        }
+        return;
+    }
+
+    const __nv_bfloat16* xk = (is_k ? k_raw : v_raw) + ((long)row * nk + h) * hd;
+    __nv_bfloat16 xb[8];
+    *reinterpret_cast<float4*>(xb) = *reinterpret_cast<const float4*>(xk + tid * 8);
+    long pos = positions[row];
+    int slot = block_ids[(long)row * max_blocks + pos / block_size] * block_size +
+               (int)(pos % block_size);
+    __nv_bfloat16* pool = (is_k ? key_pool : value_pool) + ((long)slot * nk + h) * hd;
+    if (!is_k) {
+        *reinterpret_cast<float4*>(pool + tid * 8) = *reinterpret_cast<const float4*>(xk + tid * 8);
+        return;
+    }
+    float ss = 0.f;
+    #pragma unroll
+    for (int j = 0; j < 8; j++) {
+        float v = __bfloat162float(xb[j]);
+        s[tid * 8 + j] = v;
+        ss += v * v;
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1)
+        ss += __shfl_xor_sync(0xffffffff, ss, o);
+    float rms = rsqrtf(ss / (float)hd + eps_k);
+    #pragma unroll
+    for (int j = 0; j < 8; j++) {
+        int d = tid * 8 + j;
+        float n = s[d] * rms * (1.0f + __bfloat162float(k_w[d]));
+        s[d] = __bfloat162float(__float2bfloat16_rn(n));
+    }
+    __syncwarp();
+    const CST* cr = cos + (long)row * r;
+    const CST* sr = sin + (long)row * r;
+    #pragma unroll
+    for (int j = 0; j < 8; j++) {
+        int d = tid * 8 + j;
+        float o;
+        if (d < half)
+            o = __fsub_rn(__fmul_rn(s[d], (float)cr[d]), __fmul_rn(s[d + half], (float)sr[d]));
+        else if (d < r)
+            o = __fadd_rn(__fmul_rn(s[d], (float)cr[d]), __fmul_rn(s[d - half], (float)sr[d]));
+        else
+            o = s[d];
+        pool[d] = __float2bfloat16_rn(o);
+    }
+}
+
+void fused_attn_prep(at::Tensor q_raw, at::Tensor k_raw, at::Tensor v_raw,
+                     at::Tensor q_w, at::Tensor k_w,
+                     at::Tensor cos, at::Tensor sin,
+                     at::Tensor positions, at::Tensor block_ids,
+                     at::Tensor key_pool, at::Tensor value_pool,
+                     at::Tensor q_out, at::Tensor gate_out,
+                     int64_t block_size, int64_t max_blocks,
+                     int64_t nq, int64_t nk, int64_t hd, int64_t rotary_dim,
+                     double eps_q, double eps_k)
+{
+    TORCH_CHECK(q_raw.is_cuda() && q_raw.scalar_type() == at::ScalarType::BFloat16,
+                "q_raw must be CUDA bf16");
+    TORCH_CHECK(q_raw.size(1) == nq * 2 * hd && k_raw.size(1) == nk * hd &&
+                    v_raw.size(1) == nk * hd,
+                "raw projection shapes must match nq/nk/hd");
+    TORCH_CHECK(q_raw.size(0) == k_raw.size(0) && q_raw.size(0) == v_raw.size(0) &&
+                    q_raw.size(0) == q_out.size(0) && q_raw.size(0) == gate_out.size(0),
+                "row count mismatch");
+    for (auto& t : {k_raw, v_raw, q_w, k_w, key_pool, value_pool, q_out, gate_out})
+        TORCH_CHECK(t.is_cuda() && t.scalar_type() == at::ScalarType::BFloat16,
+                    "pool/weight/output tensors must be CUDA bf16");
+    TORCH_CHECK(cos.is_cuda() && sin.is_cuda() && cos.scalar_type() == sin.scalar_type() &&
+                    (cos.scalar_type() == at::ScalarType::Float ||
+                     cos.scalar_type() == at::ScalarType::BFloat16),
+                "cos/sin must be CUDA fp32 or bf16 with the same dtype, [rows, rotary_dim]");
+    TORCH_CHECK(positions.is_cuda() && positions.scalar_type() == at::ScalarType::Long &&
+                    positions.is_contiguous(),
+                "positions must be contiguous CUDA int64 [rows]");
+    TORCH_CHECK(block_ids.is_cuda() && block_ids.scalar_type() == at::ScalarType::Int &&
+                    block_ids.size(1) == max_blocks,
+                "block_ids must be CUDA int32 [rows, max_blocks]");
+    for (auto& t : {q_raw, k_raw, v_raw, q_w, k_w, cos, sin, q_out, gate_out})
+        TORCH_CHECK(t.is_contiguous(), "inputs/outputs must be contiguous");
+    TORCH_CHECK(hd % 8 == 0 && q_w.numel() == hd && k_w.numel() == hd,
+                "head dim must be a multiple of 8 and norm weights must be [hd]");
+    int r = (int)rotary_dim;
+    TORCH_CHECK(r % 2 == 0 && r <= hd && cos.size(1) == r, "rotary dim must be even and <= hd");
+    TORCH_CHECK(q_out.numel() == q_raw.size(0) * nq * hd &&
+                    gate_out.numel() == q_raw.size(0) * nq * hd,
+                "output shapes must be [rows, nq, (1, ) hd]");
+    int rows = (int)q_raw.size(0);
+    auto stream = at::cuda::getCurrentCUDAStream();
+    auto launch = [&]<class CST>(const CST* c, const CST* s) {
+        fused_attn_prep_kernel<CST><<<dim3(rows, nq + 2 * nk), 32, (size_t)hd * sizeof(float), stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(q_raw.data_ptr<at::BFloat16>()),
+            reinterpret_cast<const __nv_bfloat16*>(k_raw.data_ptr<at::BFloat16>()),
+            reinterpret_cast<const __nv_bfloat16*>(v_raw.data_ptr<at::BFloat16>()),
+            reinterpret_cast<const __nv_bfloat16*>(q_w.data_ptr<at::BFloat16>()),
+            reinterpret_cast<const __nv_bfloat16*>(k_w.data_ptr<at::BFloat16>()),
+            c, s,
+            positions.data_ptr<long>(),
+            block_ids.data_ptr<int>(),
+            reinterpret_cast<__nv_bfloat16*>(key_pool.data_ptr<at::BFloat16>()),
+            reinterpret_cast<__nv_bfloat16*>(value_pool.data_ptr<at::BFloat16>()),
+            reinterpret_cast<__nv_bfloat16*>(q_out.data_ptr<at::BFloat16>()),
+            reinterpret_cast<__nv_bfloat16*>(gate_out.data_ptr<at::BFloat16>()),
+            (int)nq, (int)nk, (int)hd, r,
+            (int)block_size, (int)max_blocks, (float)eps_q, (float)eps_k);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    };
+    if (cos.scalar_type() == at::ScalarType::BFloat16)
+        launch(cos.data_ptr<at::BFloat16>(), sin.data_ptr<at::BFloat16>());
+    else
+        launch(cos.data_ptr<float>(), sin.data_ptr<float>());
+}
+
 // ─── Triple-weight QKV GEMV (b=1 decode) ───
 // Reads q_proj/k_proj/v_proj weights directly — no concat, no weight copies
 // (gradient-safe). One warp per output row across all three
@@ -2325,6 +2529,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("eps"),
           py::arg("zero_centered") = false);
     m.def("fused_rmsnorm", &fused_rmsnorm, "fused zero-centered RMSNorm (CUDA)");
+    m.def("fused_attn_prep", &fused_attn_prep,
+          "fused full-attention prep (CUDA): q|gate split + per-head zero-centered RMSNorm "
+          "+ partial RoPE + paged K/V pool write + gate sigmoid, one launch");
     m.def(
         "gated_norm",
         [](at::Tensor x, at::Tensor z, at::Tensor w, at::Tensor out, double eps) {

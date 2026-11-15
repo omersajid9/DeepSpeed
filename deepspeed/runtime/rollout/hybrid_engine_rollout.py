@@ -193,6 +193,7 @@ class HybridEngineRolloutConfig:
     # input norm (ablation lever: off by default, the plain add + fused
     # rmsnorm pair is the baseline).
     use_fused_residual_tail: bool = False
+    use_fused_attn_prep: bool = False
     enable_compiled_sampler: bool = False
 
 
@@ -355,6 +356,7 @@ class HybridEngineRollout(RolloutEngine):
         self.use_flashinfer_decode = getattr(cfg, 'use_flashinfer_decode', False) if cfg else False
         self.use_segki_paged_decode = getattr(cfg, 'use_segki_paged_decode', False) if cfg else False
         self.use_fused_residual_tail = getattr(cfg, 'use_fused_residual_tail', False) if cfg else False
+        self.use_fused_attn_prep = getattr(cfg, 'use_fused_attn_prep', False) if cfg else False
         self.enable_compiled_sampler = getattr(cfg, 'enable_compiled_sampler', False) if cfg else False
         if self.enable_compiled_sampler:
             configure_compiled_sampler(True)
@@ -697,7 +699,7 @@ class HybridEngineRollout(RolloutEngine):
         if self.use_paged_cache:
             cache = self._create_continuous_paged_cache(module, max_batch_size, max_cache_len, device, model_dtype,
                                                         self.paged_block_size, self.use_flashinfer_prefill,
-                                                        self.use_flashinfer_decode)
+                                                        self.use_flashinfer_decode, self.use_fused_attn_prep)
         else:
             # Layers are sized by the first prefill because AutoTP shards KV heads per rank.
             cache = DeepSpeedStaticCache(module.config, max_cache_len=max_cache_len)
@@ -1347,7 +1349,7 @@ class HybridEngineRollout(RolloutEngine):
 
     @staticmethod
     def _create_continuous_paged_cache(module, max_batch_size, max_cache_len, device, model_dtype, block_size,
-                                       use_flashinfer_prefill, use_flashinfer_decode):
+                                       use_flashinfer_prefill, use_flashinfer_decode, use_fused_attn_prep=False):
         """Paged cache sized for the model.
 
         Hybrid models get the asymmetric cache (paged KV for the
@@ -1357,7 +1359,7 @@ class HybridEngineRollout(RolloutEngine):
         text_config = getattr(module.config, "text_config", module.config)
         layer_types = getattr(text_config, "layer_types", None) or []
         cache_cls = HybridPagedAttentionCache if "linear_attention" in layer_types else PagedAttentionCache
-        return cache_cls(
+        cache = cache_cls(
             module.config,
             batch_size=max_batch_size,
             max_cache_len=max_cache_len,
@@ -1367,6 +1369,13 @@ class HybridEngineRollout(RolloutEngine):
             use_flashinfer_prefill=use_flashinfer_prefill,
             use_flashinfer_decode=use_flashinfer_decode,
         )
+        if use_fused_attn_prep and use_flashinfer_decode:
+            try:
+                from deepspeed.ops.module_inject import get_fused_glu_op
+                cache.enable_attn_prep(get_fused_glu_op())
+            except Exception as e:
+                logger.warning("fused attention prep disabled: %s", e)
+        return cache
 
     def _get_continuous_graph_state(self, module, max_batch_size, prompt_len, max_cache_len, device, model_dtype,
                                     cache_type):
@@ -1379,7 +1388,7 @@ class HybridEngineRollout(RolloutEngine):
             if self.use_paged_cache:
                 cache = self._create_continuous_paged_cache(module, max_batch_size, max_cache_len, device, model_dtype,
                                                             self.paged_block_size, self.use_flashinfer_prefill,
-                                                            self.use_flashinfer_decode)
+                                                            self.use_flashinfer_decode, self.use_fused_attn_prep)
                 cache.enable_graph_safe()
             else:
                 # Capture sizes the layers from the model's local KV tensors.
