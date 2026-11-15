@@ -450,6 +450,12 @@ class PagedAttentionCache:
             )
         else:
             rows = sorted(positions_by_row)
+            # The fused attention-prep kernel writes K/V straight into the pool
+            # and skips write()'s lazy block allocation; reserve each row's
+            # next page before the table is read (a no-op once the page
+            # exists).
+            for row in rows:
+                self._ensure_blocks(row, int(positions_by_row[row]) + 1)
             table_host = self.block_ids[torch.tensor(rows, dtype=torch.long, device=self.device)].cpu()
             totals = [int(positions_by_row[row]) + 1 for row in rows]
             pages_by_row = [(total + block_size - 1) // block_size for total in totals]

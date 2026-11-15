@@ -2300,28 +2300,45 @@ std::vector<at::Tensor> grouped_linear(at::Tensor x,
 }
 
 namespace {
-// Head-repeat for the GDN scan's v-head layout: out[b,s,hv,d] = in[b,s,hv/ratio,d].
-// One launch covers BOTH q and k (idx space 2*total), replacing two eager
-// repeat_interleave copies per layer.
+// Head-repeat for the GDN scan's v-head layout: out[b,s,hv,d] = in[b,s,hv/ratio,d],
+// plus a strided copy of v (already hv heads) so the scan sees dense inputs.
+// One launch covers q, k AND v (idx space 3*total), replacing two eager
+// repeat_interleave copies and the value repack per layer.  Inputs may be
+// row-strided (decode q/k/v are head slices of the wider fused qkv row), so
+// the source index uses the caller's element strides; only the innermost dim
+// must be unit-strided.
 __global__ void repeat_qk_kernel(const __nv_bfloat16* __restrict__ q,
                                  const __nv_bfloat16* __restrict__ k,
+                                 const __nv_bfloat16* __restrict__ v,
                                  __nv_bfloat16* __restrict__ q_out,
                                  __nv_bfloat16* __restrict__ k_out,
-                                 long long src_rows,
+                                 __nv_bfloat16* __restrict__ v_out,
+                                 long long q_s0, long long q_s1, long long q_s2,
+                                 long long k_s0, long long k_s1, long long k_s2,
+                                 long long v_s0, long long v_s1, long long v_s2,
+                                 int B, int S,
                                  int dk,
                                  int hv,
                                  int ratio,
                                  long long total)
 {
     long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    const bool is_k = idx >= total;
-    const long long i = is_k ? idx - total : idx;
+    const bool is_v = idx >= 2 * total;
+    const bool is_k = (idx >= total) && !is_v;
+    const long long i = is_v ? idx - 2 * total : (is_k ? idx - total : idx);
     if (i >= total) return;
     const int d = (int)(i % dk);
     long long t = i / dk;
     const int h = (int)(t % hv);
-    t /= hv;  // flat [B*S] row
-    const long long src = (t * src_rows + h / ratio) * dk + d;
+    const int s = (int)(t / hv) % S;
+    const long long b = t / (long long)(S * hv);
+    if (is_v) {
+        v_out[i] = v[b * v_s0 + (long long)s * v_s1 + (long long)h * v_s2 + d];
+        return;
+    }
+    const long long src = is_k
+            ? (b * k_s0 + (long long)s * k_s1 + (long long)(h / ratio) * k_s2 + d)
+            : (b * q_s0 + (long long)s * q_s1 + (long long)(h / ratio) * q_s2 + d);
     if (is_k)
         k_out[i] = k[src];
     else
@@ -2329,29 +2346,41 @@ __global__ void repeat_qk_kernel(const __nv_bfloat16* __restrict__ q,
 }
 }  // namespace
 
-std::vector<at::Tensor> repeat_qk(at::Tensor q, at::Tensor k, int64_t ratio)
+std::vector<at::Tensor> repeat_qk(at::Tensor q, at::Tensor k, at::Tensor v, int64_t ratio)
 {
     const auto sz = q.sizes();
-    TORCH_CHECK(q.is_contiguous() && k.is_contiguous(), "repeat_qk needs contiguous q/k");
+    TORCH_CHECK(q.dim() == 4 && k.sizes() == sz, "repeat_qk needs equal 4-D q/k");
     const long long B = sz[0], S = sz[1], Hk = sz[2];
     const int dk = (int)sz[3];
     const int hv = (int)(Hk * ratio);
+    TORCH_CHECK(v.dim() == 4 && v.size(0) == B && v.size(1) == S && v.size(2) == hv &&
+                    v.size(3) == dk,
+                "repeat_qk needs v with the repeated head count");
+    TORCH_CHECK(q.stride(3) == 1 && k.stride(3) == 1 && v.stride(3) == 1,
+                "repeat_qk needs a unit innermost stride");
+    TORCH_CHECK(ratio >= 1 && (int)sz[2] % (int)ratio == 0, "repeat_qk ratio must divide the head count");
     auto q_out = at::empty({B, S, (long long)hv, (long long)dk}, q.options());
     auto k_out = at::empty_like(q_out);
+    auto v_out = at::empty_like(q_out);
     const long long total = B * S * hv * dk;
     auto stream = at::cuda::getCurrentCUDAStream();
-    const int blocks = (int)((2 * total + 255) / 256);
+    const int blocks = (int)((3 * total + 255) / 256);
     repeat_qk_kernel<<<blocks, 256, 0, stream.stream()>>>((const __nv_bfloat16*)q.data_ptr(),
                                                           (const __nv_bfloat16*)k.data_ptr(),
+                                                          (const __nv_bfloat16*)v.data_ptr(),
                                                           (__nv_bfloat16*)q_out.data_ptr(),
                                                           (__nv_bfloat16*)k_out.data_ptr(),
-                                                          Hk,
+                                                          (__nv_bfloat16*)v_out.data_ptr(),
+                                                          q.stride(0), q.stride(1), q.stride(2),
+                                                          k.stride(0), k.stride(1), k.stride(2),
+                                                          v.stride(0), v.stride(1), v.stride(2),
+                                                          (int)B, (int)S,
                                                           dk,
                                                           hv,
                                                           (int)ratio,
                                                           total);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-    return {q_out, k_out};
+    return {q_out, k_out, v_out};
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
@@ -2408,7 +2437,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("x"),
           py::arg("weights"),
           py::arg("glu_epilogue") = false);
-    m.def("repeat_qk", &repeat_qk, "fused q/k head-repeat for the scan (one launch)");
+    m.def("repeat_qk", &repeat_qk,
+          "fused q/k head-repeat + strided v pack for the scan (one launch)");
     m.def("silu_mul", &silu_mul, "native GLU epilogue: silu(g)*u from a [M,2N] buffer");
     m.def("clear_glu_cat_cache",
           &clear_glu_cat_cache,
