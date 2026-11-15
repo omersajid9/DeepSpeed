@@ -232,11 +232,12 @@ def gated_norm(x, z, weight, eps=1e-5):
     return (xf * weight.float() * torch.nn.functional.silu(z.float())).to(x.dtype)
 
 
-def fused_add_norm(hidden, residual, weight, eps=1e-5):
-    """Residual add + RMSNorm: rms_norm(hidden + residual) * weight."""
+def fused_add_norm(hidden, residual, weight, eps=1e-5, zero_centered=False):
+    """Residual add + RMSNorm: rms(hidden + residual) * weight (or 1 + weight)."""
     combined = hidden.float() + residual.float()
     rms = torch.rsqrt(combined.pow(2).mean(dim=-1, keepdim=True) + eps)
-    return (combined * rms * weight.float()).to(hidden.dtype)
+    scale = (1.0 + weight.float()) if zero_centered else weight.float()
+    return (combined * rms * scale).to(hidden.dtype)
 
 
 def fused_rmsnorm(x, weight, eps=1e-5):
