@@ -367,13 +367,18 @@ def _fused_gdn_forward(self, hidden_states, *args, **kwargs):
     qkv_end = key_dim * 2 + value_dim
     z_end = qkv_end + value_dim
     b_end = z_end + num_v_heads
-    # One explicit repack of the qkv slice into the [b, conv_dim, s] layout
-    # conv1d consumes; handing FLA a non-contiguous view triggers a slower
-    # multi-op internal path (measured as ~40 extra launches per layer).
-    # varlen keeps the transposed view: the conv package only accepts
-    # seq_idx with the native memory format.
+    # Decode: the conv update indexes through x's strides, so the
+    # wide-batch-stride qkv view goes in directly (measured bit-exact at
+    # 1.00x on a strided source) and the repack copy is skipped. Prefill
+    # keeps the explicit repack: the chunked conv fn has a slower
+    # multi-op internal path on non-contiguous views (measured as ~40
+    # extra launches per layer). varlen keeps the transposed view: the
+    # conv package only accepts seq_idx with the native memory format.
     qkv_view = fused[..., :qkv_end].transpose(1, 2)
-    mixed_qkv = qkv_view if kwargs.get("seq_idx") is not None else qkv_view.contiguous()
+    if kwargs.get("seq_idx") is not None or seq_len == 1:
+        mixed_qkv = qkv_view
+    else:
+        mixed_qkv = qkv_view.contiguous()
     z = fused[..., qkv_end:z_end].reshape(batch_size, seq_len, -1, self.head_v_dim)
     b = fused[..., z_end:b_end]
     a = fused[..., b_end:]
