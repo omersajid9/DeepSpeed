@@ -88,7 +88,9 @@ reallocation are out of the loop. Each drawn token's log-probability is recorded
 in ``RolloutBatch.response_logprobs`` (positions the attention mask retires are
 zero), which is what PPO/OPD importance ratios need. Greedy rollouts keep their
 own paths (graph capture or chunked prefill); models without cache-class support
-and rollouts using ``use_shared_prefill`` keep the ``model.generate()`` fallback.
+and rollouts using ``use_shared_prefill`` keep the ``model.generate()`` fallback,
+which asks HuggingFace for a ``StaticCache`` wherever the model supports one so
+that path also writes K/V in place instead of reallocating it every step.
 
 Sampling keeps the captured forward. With ``use_graph_capture`` the decode step is one graph
 replay of the model plus one device draw on the replayed logits, so a sampling rollout no
