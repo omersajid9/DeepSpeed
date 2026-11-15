@@ -3,19 +3,23 @@
 # DeepSpeed Team
 """Rollout engine backed by DeepSpeed's hybrid engine.
 
-Two generation paths:
-  1. **model.generate()** (default): delegates to HuggingFace generate.
-     Supports sampling (temperature, top_p) and greedy.
-  2. **graph capture + DeepSpeedStaticCache**: greedy and sampling
-     (temperature, top_k, top_p). Pre-allocates a StaticCache, captures the
-     decode forward pass into a graph, and replays it for each decode
-     step.  Eliminates kernel launch overhead.
-  3. **continuous batching (experimental)**: an opt-in bounded path
-     selected through ``SamplingConfig.continuous_batch_size``; greedy or
-     sampled like the graph path, with or without graph capture.
+Generation paths:
+  1. **device-side sampling**: a static cache plus one device-side draw per step
+     (``deepspeed.runtime.rollout.sampling``).  Used for rollouts that sample and
+     record per-token log-probabilities.
+  2. **graph capture + DeepSpeedStaticCache**: only for greedy (temperature=0).
+     Pre-allocates a StaticCache, captures the decode forward pass into a
+     graph, and replays it for each decode step.  Eliminates kernel launch
+     overhead.
+  3. **chunked prefill**: opt-in staging of long prompts so the prefill advances
+     in bounded windows instead of one large forward (greedy paths).
+  4. **continuous batching (experimental)**: an opt-in bounded greedy path
+     selected through ``SamplingConfig.continuous_batch_size``. With graph
      capture it dispatches each step to the smallest captured batch width from a
      ladder - separately for the decode step and for the chunked-prefill window -
      so a rollout never replays a wider graph than the rows it is running.
+  5. **model.generate()** (fallback): delegates to HuggingFace generate for
+     models or option combinations the paths above do not cover.
 """
 
 import itertools
@@ -31,6 +35,7 @@ import deepspeed.comm as dist
 from deepspeed.accelerator import get_accelerator
 from deepspeed.runtime.rollout.base import RolloutBatch, RolloutEngine, RolloutRequest, SamplingConfig
 from deepspeed.runtime.rollout.continuous_batching import ContinuousBatchRequest, ContinuousBatchScheduler
+from deepspeed.runtime.rollout.sampling import configure_compiled_sampler, sample
 from deepspeed.utils import logger
 
 
@@ -165,6 +170,7 @@ class HybridEngineRolloutConfig:
     enable_chunked_prefill: bool = False
     prefill_chunk_size: int = 512
     graph_capture_batch_sizes: Optional[Tuple[int, ...]] = None
+    enable_compiled_sampler: bool = False
 
 
 @dataclass
@@ -314,6 +320,9 @@ class HybridEngineRollout(RolloutEngine):
         self.enable_chunked_prefill = getattr(cfg, 'enable_chunked_prefill', False) if cfg else False
         self.prefill_chunk_size = getattr(cfg, 'prefill_chunk_size', 0) if cfg else 0
         self.graph_capture_batch_sizes = getattr(cfg, 'graph_capture_batch_sizes', None) if cfg else None
+        self.enable_compiled_sampler = getattr(cfg, 'enable_compiled_sampler', False) if cfg else False
+        if self.enable_compiled_sampler:
+            configure_compiled_sampler(True)
         self._last_profile = None
         self._continuous_graph_state = None
         self._last_continuous_stats = None
@@ -418,6 +427,7 @@ class HybridEngineRollout(RolloutEngine):
             forward_profile_handles = forward_profiler.register(module)
 
         shared_prefill_handles = []
+        response_logprobs = None
         try:
             if self.use_shared_prefill and n > 1:
                 if self.use_graph_capture:
@@ -436,12 +446,16 @@ class HybridEngineRollout(RolloutEngine):
             layer_types = getattr(getattr(_cfg, "text_config", _cfg), "layer_types", None) or []
             needs_pad_fallback = module._ki_prompt_padded and ("linear_attention" in layer_types or self.use_segki)
             if use_graph_capture and not needs_pad_fallback:
-                output_ids = self._generate_graph(prompt_ids, prompt_attn, max_new_tokens, pad_token_id, module,
-                                                  device, sampling)
+                output_ids, response_logprobs = self._generate_graph(prompt_ids, prompt_attn, max_new_tokens,
+                                                                     pad_token_id, module, device, sampling)
             elif (self.enable_chunked_prefill and is_greedy and prompt_len > self.prefill_chunk_size
                   and getattr(module, "_supports_cache_class", None) is not False):
                 output_ids = self._generate_from_staged_prefill(prompt_ids, prompt_attn, max_new_tokens, pad_token_id,
                                                                 module, device)
+            elif (not is_greedy and not self.use_shared_prefill
+                  and getattr(module, "_supports_cache_class", None) is not False):
+                output_ids, response_logprobs = self._generate_sampling(prompt_ids, prompt_attn, max_new_tokens,
+                                                                        module, device, sampling)
             else:
                 temperature = max(sampling.temperature, 1e-8)
                 do_sample = not is_greedy
@@ -451,10 +465,6 @@ class HybridEngineRollout(RolloutEngine):
                     stopping_criteria = [
                         _GlobalEosStoppingCriteria(prompt_len, self.tokenizer.eos_token_id, zero3_sync)
                     ]
-                if self.enable_chunked_prefill and not is_greedy and not self._chunked_prefill_warned:
-                    logger.warning("Rollout chunked prefill currently covers greedy generation only; "
-                                   "sampling rollouts prefill the prompt in a single forward.")
-                    self._chunked_prefill_warned = True
                 generate_kwargs = {
                     "attention_mask": prompt_attn,
                     "max_new_tokens": max_new_tokens,
@@ -496,6 +506,10 @@ class HybridEngineRollout(RolloutEngine):
             eos_token_id=self.tokenizer.eos_token_id,
             pad_token_id=pad_token_id,
         )
+        if response_logprobs is not None:
+            # Keep the log-probabilities consistent with the mask: positions the pad-after-EOS
+            # pass retires report zero rather than the probability of a token that no longer exists.
+            response_logprobs = response_logprobs.masked_fill(response_attn == 0, 0.0)
 
         # Build attention mask: pad positions (both left padding from prompt
         # and right padding from EOS / shorter sequences) are 0.
@@ -510,6 +524,7 @@ class HybridEngineRollout(RolloutEngine):
             input_ids=output_ids,
             attention_mask=attention_mask,
             response_start_idx=torch.full((total, ), response_start, dtype=torch.long, device=device),
+            response_logprobs=response_logprobs,
         )
 
         if self.enable_profiling:
@@ -556,11 +571,13 @@ class HybridEngineRollout(RolloutEngine):
     def _generate_continuous(self, request, sampling, max_batch_size):
         """Generate independent greedy requests in an experimental continuous batch.
 
-        Continuous batching currently requires one prompt row per request and
-        greedy decoding. Completed rows retire immediately and pending prompts
-        prefill into the released rows before the next decode step.
+        Continuous batching requires one prompt row per request and one sample per prompt.
+        Completed rows retire immediately and pending prompts prefill into the released rows
+        before the next decode step. Greedy rows take the argmax of each step's logits;
+        sampling rows draw them on the device. Long prompts are staged (chunked prefill)
+        for both decoding modes, so a staged prompt's first response token is drawn with the
+        same sampler as the decode steps.
         """
-        select_next_tokens = self._token_selector(sampling)
         original_request = request
         requests = tuple(
             RolloutRequest(request.prompt_ids[index:index + 1], request.prompt_attention_mask[index:index + 1])
@@ -573,6 +590,7 @@ class HybridEngineRollout(RolloutEngine):
             logger.warning_once("HybridEngineRollout: graph capture is not supported on the current accelerator; "
                                 "falling back to eager continuous batching.")
             use_graph_capture = False
+        is_greedy = sampling.temperature <= 0.0
         if use_graph_capture:
             return self._generate_continuous_graph(original_request, requests, sampling, max_batch_size)
 
@@ -609,7 +627,6 @@ class HybridEngineRollout(RolloutEngine):
 
         device = requests[0].prompt_ids.device
         model_dtype = next(module.parameters()).dtype
-        select_next_tokens = self._token_selector(sampling)
         repetition_penalty = self._repetition_penalty(module)
 
         scheduler_start = self._profile_start(profile)
@@ -640,11 +657,15 @@ class HybridEngineRollout(RolloutEngine):
             "decode_steps": 0,
         }
         next_tokens = {}
+        next_logprobs = {}
+        response_logprobs = {request_id: [] for request_id in request_by_id} if not is_greedy else None
         logical_positions = dict(prompt_lengths)
         cache_position = prompt_len
         span_starts = [0] * max_batch_size
         prefill_chunks = {}
         chunk_stats = {"chunks": 0, "peak_staging_bytes": 0}
+        # Long prompts are staged for every decoding mode; the completing chunk draws the
+        # first response token with the same sampler as the decode steps.
         chunk_size = self.prefill_chunk_size if self.enable_chunked_prefill else 0
 
         self._profile_end(profile, "cache_management_overhead_ms", cache_start)
@@ -727,7 +748,7 @@ class HybridEngineRollout(RolloutEngine):
             self._profile_end(profile, "cache_management_overhead_ms", cache_start)
             if self.align_decode_fronts and survivor_count and cache_position >= max_cache_len:
                 raise self._continuous_cache_exhaustion_error(max_cache_len)
-            admitted_tokens = self._continuous_prefill(
+            admitted_tokens, admitted_logprobs = self._continuous_prefill(
                 module,
                 StaticCache,
                 cache,
@@ -739,17 +760,28 @@ class HybridEngineRollout(RolloutEngine):
                 prompt_lengths,
                 model_dtype,
                 device,
-                sampling,
                 self.align_decode_fronts,
                 profile,
                 prefill_chunks=prefill_chunks,
                 chunk_size=chunk_size,
+                sampling=sampling,
             )
+            if admitted_logprobs is not None:
+                next_logprobs.update(admitted_logprobs)
             published_ids = set()
             if prefill_chunks:
-                published = self._run_chunked_prefill(module, prefill_chunks, chunk_size, device, cache,
-                                                      attention_mask, write_positions, chunk_stats, profile)
+                published, published_logprobs = self._run_chunked_prefill(module,
+                                                                          prefill_chunks,
+                                                                          chunk_size,
+                                                                          device,
+                                                                          cache,
+                                                                          attention_mask,
+                                                                          write_positions,
+                                                                          chunk_stats,
+                                                                          profile,
+                                                                          sampling=sampling)
                 admitted_tokens.update(published)
+                next_logprobs.update(published_logprobs)
                 # A prompt that completed in this step starts decoding next step, exactly
                 # like a freshly admitted row: this step's token is the first response token.
                 published_ids = set(published)
@@ -809,16 +841,18 @@ class HybridEngineRollout(RolloutEngine):
                     position_ids=position_ids,
                 )
                 self._profile_end(profile, "decode_forward_ms", decode_start, count="num_decode_forwards")
-                decoded = self._continuous_next_tokens(
+                decoded, decoded_logprobs = self._continuous_next_tokens(
                     output.logits[decodable_rows, -1, :],
                     decodable_ids,
                     request_by_id,
                     responses,
                     module,
-                    select_next_tokens,
+                    sampling,
                 )
                 stats["decode_steps"] += 1
                 decoded_tokens = dict(zip(decodable_ids, decoded.split(1, dim=0)))
+                if decoded_logprobs is not None:
+                    next_logprobs.update(dict(zip(decodable_ids, decoded_logprobs.split(1, dim=0))))
                 if not self.align_decode_fronts:
                     row_positions[decodable_rows] += 1
                 for request_id in decodable_ids:
@@ -832,6 +866,8 @@ class HybridEngineRollout(RolloutEngine):
                     # Still staging its prompt in chunks: nothing to append or retire yet.
                     continue
                 responses[request_id].append(token)
+                if response_logprobs is not None:
+                    response_logprobs[request_id].append(next_logprobs.pop(request_id))
                 if self._is_eos(token):
                     finished_ids.append(request_id)
 
@@ -845,7 +881,7 @@ class HybridEngineRollout(RolloutEngine):
         stats["cache_memory_bytes"] = self._cache_bytes(cache) + attention_mask.nbytes + write_positions.nbytes
         generation_end = self._profile_start(profile)
         post_processing_start = generation_end
-        output = self._build_continuous_batch(original_request, responses)
+        output = self._build_continuous_batch(original_request, responses, response_logprobs)
         post_processing_end = self._profile_end(profile, None, post_processing_start)
         if profile_accelerator is not None:
             profile_accelerator.synchronize()
@@ -909,9 +945,9 @@ class HybridEngineRollout(RolloutEngine):
         if max_positions is not None and max_cache_len > max_positions:
             raise ValueError("continuous batching cache exceeds the model maximum position embeddings")
         model_dtype = next(module.parameters()).dtype
-        select_next_tokens = self._token_selector(sampling)
         repetition_penalty = self._repetition_penalty(module)
         scheduler = ContinuousBatchScheduler(max_batch_size, sampling.max_new_tokens)
+        is_greedy = sampling.temperature <= 0.0
         prompt_lengths = {request_id: prompt_len for request_id in range(len(requests))}
         request_by_id = {}
         responses = {}
@@ -982,8 +1018,12 @@ class HybridEngineRollout(RolloutEngine):
         slot_by_request = {}
         write_positions = {}
         next_tokens = {}
+        next_logprobs = {}
+        response_logprobs = {request_id: [] for request_id in request_by_id} if not is_greedy else None
         prefill_chunks = {}
         chunk_stats = {"chunks": 0, "peak_staging_bytes": 0}
+        # Long prompts are staged for every decoding mode; the completing chunk draws the
+        # first response token with the same sampler as the decode steps.
         chunk_size = self.prefill_chunk_size if self.enable_chunked_prefill else 0
         update = scheduler.schedule()
         while update.active:
@@ -1010,7 +1050,7 @@ class HybridEngineRollout(RolloutEngine):
 
             cache_start = self._profile_start(profile)
             if admitted_ids:
-                admitted_tokens = self._continuous_prefill(
+                admitted_tokens, admitted_logprobs = self._continuous_prefill(
                     module,
                     StaticCache,
                     cache,
@@ -1022,27 +1062,31 @@ class HybridEngineRollout(RolloutEngine):
                     prompt_lengths,
                     model_dtype,
                     device,
-                    sampling,
                     profile=profile,
                     target_slots=tuple(admitted_slots),
                     prefill_chunks=prefill_chunks,
                     chunk_size=chunk_size,
                     stage_prompts=self._stage_staged_prompt,
+                    sampling=sampling,
                 )
                 next_tokens.update(admitted_tokens)
+                if admitted_logprobs is not None:
+                    next_logprobs.update(admitted_logprobs)
             published_ids = set()
             if prefill_chunks:
-                chunked_tokens = self._run_staged_prefill(module,
-                                                          prefill_chunks,
-                                                          chunk_size,
-                                                          prompt_len,
-                                                          cache,
-                                                          static_attention,
-                                                          static_write_positions,
-                                                          chunk_stats,
-                                                          profile,
-                                                          request_write_positions=write_positions)
+                chunked_tokens, chunked_logprobs = self._run_staged_prefill(module,
+                                                                            prefill_chunks,
+                                                                            chunk_size,
+                                                                            prompt_len,
+                                                                            cache,
+                                                                            static_attention,
+                                                                            static_write_positions,
+                                                                            chunk_stats,
+                                                                            profile,
+                                                                            request_write_positions=write_positions,
+                                                                            sampling=sampling)
                 next_tokens.update(chunked_tokens)
+                next_logprobs.update(chunked_logprobs)
                 # A prompt that completed in this step starts decoding next step, exactly
                 # like a freshly admitted row: this step's token is the first response token
                 # and must not be overwritten by a decode of the same row.
@@ -1079,17 +1123,19 @@ class HybridEngineRollout(RolloutEngine):
                 decode_logits = torch.cat(
                     [decode_logits_all[slot_by_request[request_id], -1, :].unsqueeze(0) for request_id in decode_ids],
                     dim=0)
-                decoded = self._continuous_next_tokens(
+                decoded, decoded_logprobs = self._continuous_next_tokens(
                     decode_logits,
                     decode_ids,
                     request_by_id,
                     responses,
                     module,
-                    select_next_tokens,
+                    sampling,
                 )
                 for request_id, token in zip(decode_ids, decoded.split(1, dim=0)):
                     decoded_tokens[request_id] = token
                     write_positions[request_id] += 1
+                if decoded_logprobs is not None:
+                    next_logprobs.update(dict(zip(decode_ids, decoded_logprobs.split(1, dim=0))))
                 stats["decode_steps"] += 1
                 stats["decode_bucket_steps"] += 1
                 stats["decode_padded_rows"] += bucket.width - len(decode_ids)
@@ -1104,6 +1150,8 @@ class HybridEngineRollout(RolloutEngine):
                     # but has nothing to append or retire in this step.
                     continue
                 responses[request_id].append(token)
+                if response_logprobs is not None:
+                    response_logprobs[request_id].append(next_logprobs.pop(request_id))
                 if self._is_eos(token):
                     finished_ids.append(request_id)
 
@@ -1114,7 +1162,7 @@ class HybridEngineRollout(RolloutEngine):
                 stats["peak_cache_length"] = max(stats["peak_cache_length"], max(write_positions.values()))
 
         generation_end = self._profile_start(profile)
-        output = self._build_continuous_batch(original_request, responses)
+        output = self._build_continuous_batch(original_request, responses, response_logprobs)
         post_processing_end = self._profile_end(profile, None, generation_end)
         if profile_accelerator is not None:
             profile_accelerator.synchronize()
@@ -1495,15 +1543,21 @@ class HybridEngineRollout(RolloutEngine):
                             prompt_lengths,
                             model_dtype,
                             device,
-                            sampling,
                             align_decode_fronts=False,
                             profile=None,
                             target_slots=None,
                             prefill_chunks=None,
                             chunk_size=0,
-                            stage_prompts=None):
+                            stage_prompts=None,
+                            sampling=None):
+        """Prefill newly admitted prompts and return their first response tokens.
+
+        Returns ``(tokens, logprobs)`` keyed by request id; ``logprobs`` is ``None`` for a
+        greedy rollout, and the first response token of a sampling rollout is drawn from the
+        prefill distribution rather than argmaxed.
+        """
         if not update.admitted:
-            return {}
+            return {}, None
 
         if not align_decode_fronts:
             admitted_ids = tuple(request.request_id for request in update.admitted)
@@ -1516,15 +1570,21 @@ class HybridEngineRollout(RolloutEngine):
                 admitted_ids, target_slots = stager(module, admitted_ids, target_slots, request_by_id, prefill_chunks,
                                                     chunk_size, static_cache_type, model_dtype, device)
                 if not admitted_ids:
-                    return {}
+                    return {}, None
             prompt_ids = torch.cat([request_by_id[request_id].prompt_ids for request_id in admitted_ids], dim=0)
             prompt_attention = torch.cat(
                 [request_by_id[request_id].prompt_attention_mask for request_id in admitted_ids], dim=0)
             prompt_len = prompt_ids.shape[1]
             prefill_start = self._profile_start(profile)
-            prefill_tokens, prefill_cache = self._continuous_prefill_cache(module, static_cache_type, prompt_ids,
-                                                                           prompt_attention, model_dtype, device,
-                                                                           sampling)
+            prefill_tokens, prefill_logprobs, prefill_cache = self._continuous_prefill_cache(
+                module,
+                static_cache_type,
+                prompt_ids,
+                prompt_attention,
+                model_dtype,
+                device,
+                sampling=sampling,
+            )
             self._profile_end(profile, "prefill_forward_ms", prefill_start, count="num_prefill_forwards")
             cache_copy_start = self._profile_start(profile)
             if chunk_size > 0:
@@ -1549,9 +1609,13 @@ class HybridEngineRollout(RolloutEngine):
                 attention_mask[target_row, cache_start:cache_start + prompt_len].copy_(prompt_attention[source_row])
                 write_positions[target_row] = cache_start + prompt_len
             self._profile_end(profile, "cache_management_overhead_ms", cache_copy_start)
-            return dict(zip(admitted_ids, prefill_tokens.split(1, dim=0)))
+            tokens = dict(zip(admitted_ids, prefill_tokens.split(1, dim=0)))
+            if prefill_logprobs is None:
+                return tokens, None
+            return tokens, dict(zip(admitted_ids, prefill_logprobs.split(1, dim=0)))
 
         admitted_tokens = {}
+        admitted_logprobs = {} if sampling is not None and sampling.temperature > 0.0 else None
         for admitted, target_row in zip(update.admitted, update.admitted_slots):
             request_id = admitted.request_id
             request = request_by_id[request_id]
@@ -1560,12 +1624,20 @@ class HybridEngineRollout(RolloutEngine):
             prompt_ids = request.prompt_ids[:, valid]
             prompt_attention = torch.ones_like(prompt_ids)
             prefill_start = self._profile_start(profile)
-            prefill_tokens, prefill_cache = self._continuous_prefill_cache(module, static_cache_type, prompt_ids,
-                                                                           prompt_attention, model_dtype, device,
-                                                                           sampling)
+            prefill_tokens, prefill_logprobs, prefill_cache = self._continuous_prefill_cache(
+                module,
+                static_cache_type,
+                prompt_ids,
+                prompt_attention,
+                model_dtype,
+                device,
+                sampling=sampling,
+            )
             self._profile_end(profile, "prefill_forward_ms", prefill_start, count="num_prefill_forwards")
             cache_copy_start = self._profile_start(profile)
             admitted_tokens[request_id] = prefill_tokens
+            if admitted_logprobs is not None:
+                admitted_logprobs[request_id] = prefill_logprobs
             cache_start = cache_position - prompt_len
             if cache_start < 0:
                 raise ValueError("continuous batching prompt does not fit behind the decode front")
@@ -1578,7 +1650,7 @@ class HybridEngineRollout(RolloutEngine):
             attention_mask[target_row, cache_start:cache_position].fill_(1)
             write_positions[target_row] = cache_position
             self._profile_end(profile, "cache_management_overhead_ms", cache_copy_start)
-        return admitted_tokens
+        return admitted_tokens, admitted_logprobs
 
     @staticmethod
     def _continuous_cache_layer(cache, layer_idx, prefill_keys, prefill_values, max_batch_size):
@@ -1618,7 +1690,7 @@ class HybridEngineRollout(RolloutEngine):
                                                        position_ids=self._prefill_position_ids(prompt_attention))
         return tuple(batched_ids), tuple(batched_slots)
 
-    def _advance_prefill_chunk(self, module, chunk, width, device, profile=None):
+    def _advance_prefill_chunk(self, module, chunk, width, device, profile=None, sampling=None):
         """Prefill the next chunk of a staged prompt.
 
         Returns the first response token once the prompt is complete, else ``None``. The
@@ -1642,9 +1714,10 @@ class HybridEngineRollout(RolloutEngine):
         self._profile_end(profile, "prefill_forward_ms", forward_start, count="num_prefill_forwards")
         chunk.offset = end
         if end < chunk.prompt_len:
-            return None
-        # The chunk that completes the prompt also predicts the first response token.
-        return output.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            return None, None
+        # The completing chunk predicts the first response token; sampling rollouts must
+        # draw it from the same distribution as the rest of the response.
+        return self._draw_token(output.logits[:, -1, :], sampling)
 
     def _publish_prefill_chunk(self, chunk, cache, attention_mask, write_positions):
         """Move a completed staged prompt into its row of the decode cache.
@@ -1680,21 +1753,28 @@ class HybridEngineRollout(RolloutEngine):
                              write_positions,
                              chunk_stats,
                              profile=None,
-                             request_write_positions=None):
+                             request_write_positions=None,
+                             sampling=None):
         """Advance the staged prompts by at most ``chunk_size`` tokens in total.
 
         The budget is spent in admission order, so the number of extra forwards in a step
         is bounded no matter how many prompts are waiting. Returns the first response
-        token of every prompt that completed in this step, keyed by request id.
+        token and its logprob (when sampling) of every prompt that completed in this step.
         """
         budget = chunk_size
         completed = {}
+        completed_logprobs = {}
         for request_id in list(prefill_chunks):
             if budget <= 0:
                 break
             chunk = prefill_chunks[request_id]
             width = min(chunk.remaining, budget)
-            first_token = self._advance_prefill_chunk(module, chunk, width, device, profile)
+            first_token, first_logprob = self._advance_prefill_chunk(module,
+                                                                     chunk,
+                                                                     width,
+                                                                     device,
+                                                                     profile,
+                                                                     sampling=sampling)
             budget -= width
             chunk_stats["chunks"] += 1
             chunk_stats["peak_staging_bytes"] = max(chunk_stats["peak_staging_bytes"], chunk.staging_bytes())
@@ -1704,8 +1784,10 @@ class HybridEngineRollout(RolloutEngine):
             if request_write_positions is not None:
                 request_write_positions[request_id] = prompt_end
             completed[request_id] = first_token
+            if first_logprob is not None:
+                completed_logprobs[request_id] = first_logprob
             del prefill_chunks[request_id]
-        return completed
+        return completed, completed_logprobs
 
     # ------------------------------------------------------------------
     # Captured chunked prefill (continuous graph path)
@@ -1762,7 +1844,8 @@ class HybridEngineRollout(RolloutEngine):
                             write_positions,
                             chunk_stats,
                             profile=None,
-                            request_write_positions=None):
+                            request_write_positions=None,
+                            sampling=None):
         """Advance the running wave by one chunk window and publish the prompts that finish.
 
         Every row of a wave shares one window, so the whole wave is one forward at
@@ -1800,23 +1883,26 @@ class HybridEngineRollout(RolloutEngine):
         self._profile_end(profile, "prefill_forward_ms", forward_start, count="num_prefill_forwards")
         completion = end >= prompt_len
         completed = {}
+        completed_logprobs = {}
         for row_index, (request_id, chunk) in enumerate(wave):
             chunk.start = end
             if not completion:
                 continue
             # The chunk that completes the prompt also predicts the first response token.
-            first_token = logits[row_index:row_index + 1, -1, :].argmax(dim=-1, keepdim=True)
+            first_token, first_logprob = self._draw_token(logits[row_index:row_index + 1, -1, :], sampling)
             self._publish_staged_prompt(chunk, state, cache, attention_mask, write_positions)
             if request_write_positions is not None:
                 request_write_positions[request_id] = prompt_len
             completed[request_id] = first_token
+            if first_logprob is not None:
+                completed_logprobs[request_id] = first_logprob
             del prefill_chunks[request_id]
         chunk_stats["chunks"] += len(wave)
         chunk_stats["graph_steps"] = chunk_stats.get("graph_steps", 0) + 1
         chunk_stats["padded_rows"] = chunk_stats.get("padded_rows", 0) + width - len(wave)
         widths = chunk_stats.setdefault("bucket_widths", {})
         widths[width] = widths.get(width, 0) + 1
-        return completed
+        return completed, completed_logprobs
 
     def _fill_staged_attention(self, bucket, wave, window):
         """Write the chunk's additive mask and its write positions in place.
@@ -1986,10 +2072,26 @@ class HybridEngineRollout(RolloutEngine):
             "continuous_batch_size": max_batch_size,
         }
 
-    def _continuous_prefill_cache(self, module, static_cache_type, prompt_ids, prompt_attention, model_dtype, device,
-                                  sampling):
+    def _continuous_prefill_cache(self,
+                                  module,
+                                  static_cache_type,
+                                  prompt_ids,
+                                  prompt_attention,
+                                  model_dtype,
+                                  device,
+                                  sampling=None):
+        """Prefill a prompt batch; return ``(first tokens, their logprobs, cache)``.
+
+        Greedy rollouts argmax the prompt's last logits, sampling rollouts draw them, so the
+        first response token comes from the same distribution as the rest of the response.
+        """
         position_ids = self._prefill_position_ids(prompt_attention)
-        if getattr(module, "_supports_cache_class", None) is None:
+        # Models that do not declare cache-class support get their prefill from a one-token
+        # generate(); that shortcut cannot expose the prefill distribution, so sampling
+        # rollouts take the cache path (transformers versions that omit the attribute are the
+        # ones that support cache classes; older ones fail here instead of silently argmaxing).
+        declares_legacy_cache = getattr(module, "_supports_cache_class", None) is None
+        if declares_legacy_cache and (sampling is None or sampling.temperature <= 0.0):
             pad_token_id = self.tokenizer.pad_token_id
             if pad_token_id is None:
                 pad_token_id = self.tokenizer.eos_token_id
@@ -2003,7 +2105,7 @@ class HybridEngineRollout(RolloutEngine):
                 return_dict_in_generate=True,
                 **self._hf_sampling_kwargs(sampling),
             )
-            return prefill_output.sequences[:, -1:], prefill_output.past_key_values
+            return prefill_output.sequences[:, -1:], None, prefill_output.past_key_values
 
         prompt_len = prompt_ids.shape[1]
         prefill_cache = self._create_static_cache(static_cache_type, module.config, prompt_ids.shape[0], prompt_len,
@@ -2020,21 +2122,83 @@ class HybridEngineRollout(RolloutEngine):
         )
         logits = self._apply_repetition_penalty(prefill_output.logits[:, -1, :], prompt_ids,
                                                 self._repetition_penalty(module))
-        return self._token_selector(sampling)(logits), prefill_cache
+        tokens, logprobs = self._draw_token(logits, sampling)
+        return tokens, logprobs, prefill_cache
 
-    @classmethod
-    def _continuous_next_tokens(cls, logits, request_ids, request_by_id, responses, module, select_next_tokens):
-        repetition_penalty = cls._repetition_penalty(module)
-        if repetition_penalty != 1.0:
-            logits = torch.cat([
-                cls._apply_repetition_penalty(
-                    logits[row:row + 1],
-                    torch.cat((request_by_id[request_id].prompt_ids, *responses[request_id]), dim=1),
-                    repetition_penalty,
-                ) for row, request_id in enumerate(request_ids)
-            ],
-                               dim=0)
-        return select_next_tokens(logits)
+    @staticmethod
+    def _draw_token(logits, sampling=None):
+        """Pick one token per row of ``logits`` [B, V]: greedy argmax, or a device draw.
+
+        Returns ``(tokens [B, 1], logprobs [B] or None)``, so callers that sample can record
+        the log-probability of the token they drew.
+        """
+        if sampling is None or sampling.temperature <= 0.0:
+            return logits.argmax(dim=-1, keepdim=True), None
+        tokens, logprobs = sample(logits, temperature=sampling.temperature, top_k=sampling.top_k, top_p=sampling.top_p)
+        return tokens.unsqueeze(-1), logprobs
+
+    @staticmethod
+    def _repetition_penalty(module):
+        repetition_penalty = getattr(getattr(module, "generation_config", None), "repetition_penalty", 1.0)
+        return 1.0 if repetition_penalty is None else repetition_penalty
+
+    @staticmethod
+    def _apply_repetition_penalty(logits, input_ids, repetition_penalty):
+        """Penalize the tokens of ``input_ids`` in last-position ``logits``, without changing ``logits``.
+
+        generate() applies the penalty in float32, before the sampling warpers, so it shapes the sampled distribution.
+        """
+        if repetition_penalty == 1.0:
+            return logits
+        logits = logits.float()
+        scores = logits.gather(1, input_ids)
+        scores = torch.where(scores < 0, scores * repetition_penalty, scores / repetition_penalty)
+        return logits.scatter(1, input_ids, scores)
+
+    @staticmethod
+    def _repetition_penalized_logits(logits, request_ids, request_by_id, responses, module):
+        """Copy of ``logits`` with HuggingFace's repetition penalty applied from each row's history."""
+        repetition_penalty = getattr(getattr(module, "generation_config", None), "repetition_penalty", 1.0)
+        if repetition_penalty is None:
+            repetition_penalty = 1.0
+        if repetition_penalty == 1.0:
+            return logits
+
+        # generate() applies the penalty in float32; in a half-precision cache the penalty would
+        # otherwise round scores onto each other and change the argmax.
+        penalized = logits.float()
+        for row, request_id in enumerate(request_ids):
+            input_ids = torch.cat((request_by_id[request_id].prompt_ids, *responses[request_id]), dim=1)
+            row_logits = penalized[row:row + 1]
+            scores = row_logits.gather(1, input_ids)
+            scores = torch.where(scores < 0, scores * repetition_penalty, scores / repetition_penalty)
+            row_logits.scatter_(1, input_ids, scores)
+        return penalized
+
+    @staticmethod
+    def _hf_sampling_kwargs(sampling):
+        """Hugging Face ``generate()`` arguments for ``sampling``; ``temperature <= 0`` is greedy."""
+        if sampling is None or sampling.temperature <= 0.0:
+            return {"do_sample": False, "temperature": 1.0, "top_p": 1.0}
+        return {
+            "do_sample": True,
+            "temperature": sampling.temperature,
+            "top_p": sampling.top_p,
+            "top_k": max(sampling.top_k, 0),
+        }
+
+    @staticmethod
+    def _continuous_next_tokens(logits, request_ids, request_by_id, responses, module, sampling=None):
+        """One token per active row: a device draw when sampling, otherwise the greedy argmax.
+
+        Returns ``(tokens [R, 1], logprobs [R] or None)``.
+        """
+        logits = HybridEngineRollout._repetition_penalized_logits(logits, request_ids, request_by_id, responses,
+                                                                  module)
+        if sampling is None or sampling.temperature <= 0.0:
+            return logits.argmax(dim=-1, keepdim=True), None
+        tokens, logprobs = sample(logits, temperature=sampling.temperature, top_k=sampling.top_k, top_p=sampling.top_p)
+        return tokens.unsqueeze(-1), logprobs
 
     @staticmethod
     def _prefill_position_ids(attention_mask):
@@ -2099,7 +2263,7 @@ class HybridEngineRollout(RolloutEngine):
             return layer.keys, layer.values
         return cache.key_cache[layer_idx], cache.value_cache[layer_idx]
 
-    def _build_continuous_batch(self, request, responses):
+    def _build_continuous_batch(self, request, responses, response_logprobs=None):
         response_ids = [torch.cat(responses[index], dim=1) for index in range(request.prompt_ids.shape[0])]
         max_response_len = max(response.shape[1] for response in response_ids)
         pad_token_id = self.tokenizer.pad_token_id
@@ -2132,6 +2296,15 @@ class HybridEngineRollout(RolloutEngine):
         input_ids = torch.cat(input_rows, dim=0)
         attention_mask = torch.cat(attention_rows, dim=0)
         response_start = request.prompt_ids.shape[1]
+        logprob_rows = []
+        if response_logprobs is not None:
+            for index, response in enumerate(response_ids):
+                row = torch.cat(response_logprobs[index], dim=0)
+                padding = max_response_len - row.shape[0]
+                if padding:
+                    # Padding positions are masked in attention_mask; report zero there.
+                    row = torch.cat((row, torch.zeros(padding, dtype=row.dtype, device=row.device)), dim=0)
+                logprob_rows.append(row.unsqueeze(0))
         return RolloutBatch(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -2139,6 +2312,7 @@ class HybridEngineRollout(RolloutEngine):
                                           response_start,
                                           dtype=torch.long,
                                           device=input_ids.device),
+            response_logprobs=torch.cat(logprob_rows, dim=0) if logprob_rows else None,
         )
 
     def _zero3_work_remaining(self):
@@ -2224,71 +2398,8 @@ class HybridEngineRollout(RolloutEngine):
         return output_ids, response_attn.long()
 
     # ------------------------------------------------------------------
-    # Graph capture decode loop (greedy only)
+    # Graph capture decode loop
     # ------------------------------------------------------------------
-
-    @staticmethod
-    def _token_selector(sampling):
-        """Return a function that picks the next tokens ``[B, 1]`` from last-position logits ``[B, V]``.
-
-        Tokens are picked after each forward or graph replay, outside any
-        captured graph. Sampling applies Hugging Face's temperature, top-k and
-        top-p warpers in the order ``generate()`` applies them, so every path
-        draws from the same distribution as ``generate()``.
-        """
-        if sampling.temperature <= 0.0:
-            return lambda logits: logits.argmax(dim=-1, keepdim=True)
-
-        from transformers.generation.logits_process import (TemperatureLogitsWarper, TopKLogitsWarper,
-                                                            TopPLogitsWarper)
-
-        warpers = []
-        if sampling.temperature != 1.0:
-            warpers.append(TemperatureLogitsWarper(sampling.temperature))
-        if sampling.top_k > 0:
-            warpers.append(TopKLogitsWarper(top_k=sampling.top_k))
-        if sampling.top_p < 1.0:
-            warpers.append(TopPLogitsWarper(top_p=sampling.top_p))
-
-        def sample(logits):
-            # generate() also warps and samples in float32.
-            scores = logits.float()
-            for warper in warpers:
-                # The warpers read only the scores, not the generated ids.
-                scores = warper(None, scores)
-            return torch.multinomial(torch.softmax(scores, dim=-1), num_samples=1)
-
-        return sample
-
-    @staticmethod
-    def _hf_sampling_kwargs(sampling):
-        """Hugging Face ``generate()`` arguments for ``sampling``; ``temperature <= 0`` is greedy."""
-        if sampling.temperature <= 0.0:
-            return {"do_sample": False, "temperature": 1.0, "top_p": 1.0}
-        return {
-            "do_sample": True,
-            "temperature": sampling.temperature,
-            "top_p": sampling.top_p,
-            "top_k": max(sampling.top_k, 0),
-        }
-
-    @staticmethod
-    def _repetition_penalty(module):
-        repetition_penalty = getattr(getattr(module, "generation_config", None), "repetition_penalty", 1.0)
-        return 1.0 if repetition_penalty is None else repetition_penalty
-
-    @staticmethod
-    def _apply_repetition_penalty(logits, input_ids, repetition_penalty):
-        """Penalize the tokens of ``input_ids`` in last-position ``logits``, without changing ``logits``.
-
-        generate() applies the penalty in float32, before the sampling warpers, so it shapes the sampled distribution.
-        """
-        if repetition_penalty == 1.0:
-            return logits
-        logits = logits.float()
-        scores = logits.gather(1, input_ids)
-        scores = torch.where(scores < 0, scores * repetition_penalty, scores / repetition_penalty)
-        return logits.scatter(1, input_ids, scores)
 
     def _generate_from_staged_prefill(self, prompt_ids, prompt_attn, max_new_tokens, pad_token_id, module, device):
         """Stage a long prompt in chunks, then let HuggingFace generate from the filled cache.
@@ -2327,7 +2438,12 @@ class HybridEngineRollout(RolloutEngine):
         return torch.cat([prompt_ids, continuation], dim=1)
 
     def _generate_graph(self, prompt_ids, prompt_attn, max_new_tokens, pad_token_id, module, device, sampling):
-        """Decode with DeepSpeedStaticCache + graph capture, greedy or sampled per ``sampling``."""
+        """Decode with DeepSpeedStaticCache + graph capture.
+
+        Greedy rollouts take the argmax of the replayed logits; sampling rollouts draw them on
+        the device (``runtime/rollout/sampling.py``). The captured forward is the same for both,
+        so only the token selection differs, and sampling no longer gives up the graph.
+        """
         from transformers import StaticCache
         from deepspeed.utils.static_cache import DeepSpeedStaticCache
 
@@ -2339,8 +2455,15 @@ class HybridEngineRollout(RolloutEngine):
         max_len = prompt_len + max_new_tokens
         eos_token_id = self.tokenizer.eos_token_id
         model_dtype = next(module.parameters()).dtype
-        select_next_tokens = self._token_selector(sampling)
+        is_greedy = sampling.temperature <= 0.0
         repetition_penalty = self._repetition_penalty(module)
+
+        output_ids = [prompt_ids]
+
+        def next_tokens(logits):
+            if repetition_penalty != 1.0:
+                logits = self._apply_repetition_penalty(logits, torch.cat(output_ids, dim=1), repetition_penalty)
+            return self._draw_token(logits, sampling)
 
         # AutoTP wraps module.config as a dict after sharding; restore the
         # original config object so cache creation and mask logic work
@@ -2356,10 +2479,10 @@ class HybridEngineRollout(RolloutEngine):
         is_hybrid = "linear_attention" in (getattr(getattr(module.config, "text_config", module.config), "layer_types",
                                                    None) or [])
         prefill_mask = {"full_attention": None, "linear_attention": None} if is_hybrid else prefill_attn
-        is_greedy = sampling.temperature <= 0.0
         if (self.enable_chunked_prefill and is_greedy and not is_hybrid and prompt_len > self.prefill_chunk_size):
             next_token, prefill_cache = self._chunked_prefill_cache(module, StaticCache, prompt_ids, prefill_attn,
                                                                     model_dtype, device, self.prefill_chunk_size)
+            next_logprob = None
         else:
             prefill_cache = self._create_static_cache(StaticCache, module.config, batch_size, max_len, device,
                                                       model_dtype)
@@ -2374,7 +2497,7 @@ class HybridEngineRollout(RolloutEngine):
                 cache_position=torch.arange(prompt_len, device=device),
                 **self._last_logits_kwargs(module),
             )
-            next_token = select_next_tokens(prefill_out.logits[:, -1, :])
+            next_token, next_logprob = next_tokens(prefill_out.logits[:, -1, :])
 
         # --- Copy prefill KV into DeepSpeedStaticCache ---
         # per-row positions: the batched step and decode-attention kernels
@@ -2414,7 +2537,11 @@ class HybridEngineRollout(RolloutEngine):
             ds_layer.keys[:, :, :prompt_len, :].copy_(hf_keys[:, :, :prompt_len, :])
             ds_layer.values[:, :, :prompt_len, :].copy_(hf_values[:, :, :prompt_len, :])
 
-        output_ids = [prompt_ids, next_token]
+        output_ids.append(next_token)
+        response_logprobs = None
+        if not is_greedy:
+            response_logprobs = torch.zeros(batch_size, max_new_tokens, dtype=torch.float32, device=device)
+            response_logprobs[:, 0] = next_logprob
 
         # --- Static buffers for graph capture ---
         static_token = torch.zeros(batch_size, 1, dtype=torch.long, device=device)
@@ -2579,8 +2706,10 @@ class HybridEngineRollout(RolloutEngine):
                 # b>1 attends every slot the mask reveals.
                 static_attn[:, :, :, pos] = True
                 get_accelerator().replay_graph(graph)
-                next_token = select_next_tokens(static_logits[:, -1, :])
+                next_token, next_logprob = next_tokens(static_logits[:, -1, :])
                 output_ids.append(next_token)
+                if response_logprobs is not None:
+                    response_logprobs[:, step + 1] = next_logprob
                 # eos_mask.all() is a device->host sync; running it every step
                 # serializes the ~50us of Python glue against the replay and
                 # idles the GPU between steps. Amortize it like the b=1 path:
@@ -2597,7 +2726,7 @@ class HybridEngineRollout(RolloutEngine):
                         output_ids.append(
                             torch.full((batch_size, remaining), pad_token_id, dtype=torch.long, device=device))
                     break
-            return torch.cat(output_ids, dim=1)
+            return torch.cat(output_ids, dim=1), response_logprobs
 
         # Full-step graph requires the step kernel to actually be in the
         # graph: mounting is conditional (b=1, CUDA bf16 logits), and a
@@ -2619,7 +2748,7 @@ class HybridEngineRollout(RolloutEngine):
                 for r in (first_eos < resp.shape[1]).nonzero(as_tuple=True)[0].tolist():
                     full_token_buf[r, prompt_len + first_eos[r].item() + 1:] = pad_token_id
             gen_ids = full_token_buf[:, prompt_len:prompt_len + max_new_tokens]
-            return torch.cat([prompt_ids, gen_ids], dim=1)
+            return torch.cat([prompt_ids, gen_ids], dim=1), response_logprobs
 
         eos_mask = torch.zeros(batch_size, dtype=torch.bool, device=device)
         for step in range(max_new_tokens - 1):
@@ -2631,10 +2760,77 @@ class HybridEngineRollout(RolloutEngine):
             write_pos.fill_(pos)
             static_attn[:, :, :, pos] = True
             get_accelerator().replay_graph(graph)
-            next_token = select_next_tokens(static_logits[:, -1, :])
+            next_token, next_logprob = next_tokens(static_logits[:, -1, :])
             output_ids.append(next_token)
-            eos_mask |= (next_token.view(1) == eos_token_id)
-        return torch.cat(output_ids, dim=1)
+            if response_logprobs is not None:
+                response_logprobs[:, step + 1] = next_logprob
+            eos_mask |= (next_token.squeeze(1) == eos_token_id)
+
+        return torch.cat(output_ids, dim=1), response_logprobs
+
+    @torch.no_grad()
+    def _generate_sampling(self, prompt_ids, prompt_attn, max_new_tokens, module, device, sampling):
+        """Sampling decode on a static cache, with the draw made on the device.
+
+        Sampling used to be delegated to ``module.generate``, which runs HuggingFace's logits
+        warpers and ``multinomial`` on the host and reallocates a dynamic KV cache on every
+        step. Here the prompt is prefilled once into a static cache and each step is one
+        forward plus one device-side draw (``deepspeed.runtime.rollout.sampling``), which also
+        reports the log-probability of the token it drew.
+        """
+        from transformers import StaticCache
+
+        batch_size, prompt_len = prompt_ids.shape
+        max_len = prompt_len + max_new_tokens
+        model_dtype = next(module.parameters()).dtype
+
+        # Prompts arrive left-padded. The cache column and the causal position stay column
+        # indices (the mask hides the pad columns), while the rotary position continues each
+        # row's *real* prompt length so padding does not shift the embedding.
+        first_position = prompt_attn.sum(dim=-1, keepdim=True)
+        position_ids = torch.zeros(batch_size, 1, dtype=torch.long, device=device)
+        cache_position = torch.zeros(1, dtype=torch.long, device=device)
+        attention_mask = torch.zeros(batch_size, max_len, dtype=torch.long, device=device)
+        attention_mask[:, :prompt_len] = prompt_attn
+
+        cache = self._create_static_cache(StaticCache, module.config, batch_size, max_len, device, model_dtype)
+        logits = module(
+            prompt_ids,
+            attention_mask=attention_mask[:, :prompt_len],
+            past_key_values=cache,
+            use_cache=True,
+            cache_position=torch.arange(prompt_len, device=device),
+            position_ids=self._prefill_position_ids(prompt_attn),
+            **self._last_logits_kwargs(module),
+        ).logits[:, -1, :]
+
+        next_token = torch.zeros(batch_size, 1, dtype=torch.long, device=device)
+        generated = torch.zeros(batch_size, max_new_tokens, dtype=torch.long, device=device)
+        logprobs = torch.zeros(batch_size, max_new_tokens, dtype=torch.float32, device=device)
+        for step in range(max_new_tokens):
+            token, logprob = sample(logits,
+                                    temperature=sampling.temperature,
+                                    top_k=sampling.top_k,
+                                    top_p=sampling.top_p)
+            generated[:, step] = token
+            logprobs[:, step] = logprob
+            if step + 1 == max_new_tokens:
+                break
+            next_token.copy_(token.unsqueeze(-1))
+            column = prompt_len + step
+            attention_mask[:, column] = 1
+            cache_position.fill_(column)
+            position_ids.copy_(first_position).add_(step)
+            logits = module(
+                next_token,
+                attention_mask=attention_mask,
+                past_key_values=cache,
+                use_cache=True,
+                cache_position=cache_position,
+                position_ids=position_ids,
+            ).logits[:, -1, :]
+
+        return torch.cat([prompt_ids, generated], dim=1), logprobs
 
     def sync_weights(self, step: int) -> None:  # noqa: ARG002
         """No-op: hybrid engine reads model weights live."""
