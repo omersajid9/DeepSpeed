@@ -18,6 +18,7 @@ from typing import Optional
 
 import torch
 
+from deepspeed.accelerator import get_accelerator
 from deepspeed.inference.v2.inference_utils import DtypeEnum
 from deepspeed.inference.v2.kernels.ragged_ops.blocked_flash.blocked_flash import (
     BlockedFlashAttn,
@@ -132,6 +133,10 @@ class PagedAttentionCache:
         self._block_counts = [0] * self.max_batch_size
         self._write_positions: Optional[torch.Tensor] = None
         self._active_rows = torch.arange(self.max_batch_size, dtype=torch.long, device=self.device)
+        # Host-side marker for the fused decode kernel, which addresses rows by
+        # batch index: only correct while the active rows are the leading
+        # slots 0..n. compact() and set_graph_mode() re-establish it.
+        self._active_rows_prefix = True
         self._kernel = BlockedFlashAttn(self.head_dim, DtypeEnum(dtype))
         self.q_block_size = get_q_block_size(self.head_dim)
         self._atom_count = self.max_batch_size * ((max_cache_len + self.q_block_size - 1) // self.q_block_size)
@@ -197,6 +202,15 @@ class PagedAttentionCache:
     def layer_count(self) -> int:
         return self.num_layers
 
+    @property
+    def active_rows_are_prefix(self) -> bool:
+        """True while the active rows are exactly the leading slots 0..n.
+
+        Kernels that address a row by its batch index (the fused segment-KI
+        decode) are only valid under that invariant; the native paged forward
+        indexes through ``_active_rows`` and works for any subset."""
+        return self._active_rows_prefix
+
     def set_write_position(self, pos: torch.Tensor) -> None:
         if not isinstance(pos, torch.Tensor) or pos.dim() != 1:
             raise ValueError("paged cache write positions must be a 1-D tensor")
@@ -209,10 +223,21 @@ class PagedAttentionCache:
         self._step_q_len = 1
 
     def set_active_rows(self, rows) -> None:
+        host_rows = None
+        if isinstance(rows, (list, tuple)):
+            host_rows = [int(r) for r in rows]
+        elif torch.is_tensor(rows) and not get_accelerator().on_accelerator(rows):
+            host_rows = [int(r) for r in rows.flatten().tolist()]
         rows = torch.as_tensor(rows, dtype=torch.long, device=self.device)
         if rows.dim() != 1:
             raise ValueError("active rows must be a 1-D tensor")
         self._active_rows = rows
+        count = int(rows.numel())
+        if host_rows is not None:
+            self._active_rows_prefix = count > 0 and host_rows == list(range(count))
+        else:
+            self._active_rows_prefix = count > 0 and bool(
+                (rows == torch.arange(count, dtype=torch.long, device=rows.device)).all())
         self._step_prepared = False
         self._step_atoms = None
         self._fi_step_planned = False
@@ -277,6 +302,7 @@ class PagedAttentionCache:
             self._init_graph_atom_structure()
         self._graph_atoms = self._atoms_device[:width]
         self._active_rows = rows
+        self._active_rows_prefix = True  # graph rows are always the leading slots
         self._step_prepared = True
         self._step_atoms = None
         self._step_q_len = 1
@@ -779,6 +805,9 @@ class PagedAttentionCache:
             self.block_ids[count:].fill_(-1)
             self.row_len[count:].zero_()
             self._block_counts[count:] = [0] * (self.max_batch_size - count)
+        # Survivors move onto the leading slots, so a later set_active_rows /
+        # set_graph_mode over [0, count) is again a prefix.
+        self._active_rows_prefix = count > 0
         if self._write_positions is not None:
             positions = self._write_positions
             compacted = positions[keep].clone() if count else positions[:0]
@@ -1299,7 +1328,12 @@ def install_paged_attention(module) -> list:
     patched = []
     for submodule in module.modules():
         forward = forwards.get(type(submodule).__name__)
-        if forward is None or getattr(submodule, "_paged_original_forward", None) is not None:
+        if forward is None:
+            continue
+        if getattr(submodule, "_paged_original_forward", None) is not None:
+            # Rollouts can share one module; re-installing on an already-patched
+            # layer is a no-op, not an error.
+            patched.append(submodule)
             continue
         submodule._paged_original_forward = submodule.forward
         submodule.forward = MethodType(forward, submodule)

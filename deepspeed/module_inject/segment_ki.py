@@ -893,10 +893,19 @@ def _paged_decode_attn_forward(self,
     over the block table."""
     cache = past_key_values
     op = getattr(self, "_ki_attn_op", None)
+    # Paged caches keep the write positions under ``_write_positions``; dense
+    # caches under ``_write_position``. The gate compares object identity, so
+    # resolve whichever name the cache actually uses.
+    cache_write_pos = getattr(cache, "_write_positions", getattr(cache, "_write_position", None))
     if (hidden_states.shape[1] > 1 or hidden_states.dtype is not torch.bfloat16 or not hidden_states.is_contiguous()
             or op is None or not hasattr(op, "decode_attn_paged") or getattr(self, "_ki_cos_t", None) is None
             or getattr(self, "_ki_prompt_padded", False) or getattr(cache, "_record_past", False)
-            or getattr(cache, "_write_position", None) is not getattr(self, "_ki_write_pos", None)):
+            or cache_write_pos is not getattr(self, "_ki_write_pos", None)
+            or not getattr(cache, "active_rows_are_prefix", False)):
+        # The kernel addresses a row by its batch index, which is only the
+        # row's cache slot while the active rows are the compacted leading
+        # prefix; anything else (e.g. staged rows beside decodable ones)
+        # falls back to the native paged forward, which indexes the slots.
         return self._ki_orig_attn_forward(hidden_states, position_embeddings, attention_mask, past_key_values,
                                           **kwargs)
 

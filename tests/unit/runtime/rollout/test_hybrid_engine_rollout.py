@@ -2222,6 +2222,28 @@ def _gdn_snapshot(rollout):
     return snapshot
 
 
+@contextmanager
+def _torch_gdn_backends():
+    """Pin the GDN layer's conv/delta-rule backends to their torch references.
+
+    The modeling module's GDN backends prefer the installed causal-conv1d /
+    fla CUDA kernels when they are importable; the hybrid tests in this file
+    roll the tiny model out on CPU, so pin the pure-torch implementations the
+    same module ships as references."""
+    import transformers.models.qwen3_5.modeling_qwen3_5 as modeling
+
+    names = ("causal_conv1d_fn", "causal_conv1d_update", "torch_chunk_gated_delta_rule",
+             "torch_recurrent_gated_delta_rule")
+    refs = {}
+    for name in names:
+        fn = getattr(modeling, name)
+        while hasattr(fn, "__wrapped__"):
+            fn = fn.__wrapped__
+        refs[name] = fn
+    with patch.multiple(modeling, **refs):
+        yield
+
+
 @patch("deepspeed.runtime.rollout.hybrid_engine_rollout.get_accelerator")
 def test_chunked_prefill_publishes_hybrid_gdn_state(mock_get_accelerator):
     """A staged hybrid prompt must publish its GDN state together with its KV.
@@ -2242,7 +2264,8 @@ def test_chunked_prefill_publishes_hybrid_gdn_state(mock_get_accelerator):
     engine = SimpleNamespace(module=model)
     tokenizer = SimpleNamespace(pad_token_id=0, eos_token_id=None)
 
-    with patch.object(HybridEngineRollout, "_capture_continuous_graph", side_effect=fake_capture):
+    with _torch_gdn_backends(), \
+            patch.object(HybridEngineRollout, "_capture_continuous_graph", side_effect=fake_capture):
         plain = HybridEngineRollout(engine, tokenizer, cfg=HybridEngineRolloutConfig(use_graph_capture=True))
         with torch.no_grad():
             plain_tokens = plain.generate(request, sampling).input_ids.tolist()
