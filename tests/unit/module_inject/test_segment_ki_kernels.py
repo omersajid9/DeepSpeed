@@ -291,6 +291,58 @@ class TestKernelReferenceConsistency:
             ref_out = ref_rmsnorm(x, w, eps=1e-5)
             torch.testing.assert_close(out.float(), ref_out.float(), atol=5e-2, rtol=5e-2)
 
+    def test_fused_attn_prep(self):
+        """Fused attention prep vs its unfused specification: zero-centered
+        per-head RMSNorm (bf16-rounded before RoPE), partial RoPE on the
+        leading r dims with the tail passed through, exact paged K/V scatter
+        through the block table, and the gate sigmoid.  Cos/sin in the model
+        dtype (bf16) and fp32."""
+        torch.manual_seed(0)
+        b, nq, nk, hd, r, bs, max_blocks = 4, 16, 4, 256, 64, 64, 32
+        half = r // 2
+        q_raw = _rand_bf16(b, nq * 2 * hd)
+        k_raw = _rand_bf16(b, nk * hd)
+        v_raw = _rand_bf16(b, nk * hd)
+        q_w = _rand_bf16(hd)
+        k_w = _rand_bf16(hd)
+        positions = torch.tensor([0, 63, 64, 130], dtype=torch.long, device=DEV)
+        block_ids = torch.stack([torch.arange(max_blocks, dtype=torch.int32, device=DEV) + i
+                                 for i in range(b)])
+        slots = (max_blocks + b) * bs
+        key_pool = torch.zeros(slots, nk, hd, dtype=torch.bfloat16, device=DEV)
+        value_pool = torch.zeros_like(key_pool)
+        q_out = torch.empty(b, nq, 1, hd, dtype=torch.bfloat16, device=DEV)
+        gate_out = torch.empty(b, nq * hd, dtype=torch.bfloat16, device=DEV)
+
+        def norm_rope(t, heads, w, eps):
+            x = t.view(b, heads, hd).float()
+            n = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
+            n = (n * (1.0 + w.float())).bfloat16().float()  # the kernel rounds after the norm
+            out = n.clone()
+            c1, s1 = cos[:, :half], sin[:, :half]
+            c2, s2 = cos[:, half:], sin[:, half:]
+            n1, n2 = n[..., :half], n[..., half:r]
+            out[..., :half] = n1 * c1.unsqueeze(1) - n2 * s1.unsqueeze(1)
+            out[..., half:r] = n2 * c2.unsqueeze(1) + n1 * s2.unsqueeze(1)
+            return out
+
+        for cstype in (torch.bfloat16, torch.float32):
+            cos = torch.randn(b, r, device=DEV).to(cstype)
+            sin = torch.randn(b, r, device=DEV).to(cstype)
+            key_pool.zero_()
+            value_pool.zero_()
+            _op().fused_attn_prep(q_raw, k_raw, v_raw, q_w, k_w, cos, sin,
+                                  positions, block_ids, key_pool, value_pool,
+                                  q_out, gate_out, bs, max_blocks, nq, nk, hd, r, 1e-5, 1e-5)
+            q_ref = norm_rope(q_raw.view(b, nq, 2, hd)[:, :, 0].contiguous(), nq, q_w, 1e-5)
+            k_ref = norm_rope(k_raw, nk, k_w, 1e-5)
+            torch.testing.assert_close(q_out.view(b, nq, hd).float(), q_ref, atol=5e-2, rtol=5e-2)
+            gate_ref = torch.sigmoid(q_raw.view(b, nq, 2, hd)[:, :, 1].float().view(b, 1, -1)).bfloat16()
+            torch.testing.assert_close(gate_out.float(), gate_ref.view(b, -1).float(), atol=5e-2, rtol=5e-2)
+            slot_ref = block_ids[torch.arange(b, device=DEV), (positions // bs).long()] * bs + positions % bs
+            torch.testing.assert_close(key_pool[slot_ref.long()], k_ref.bfloat16(), atol=5e-2, rtol=5e-2)
+            assert torch.equal(value_pool[slot_ref.long()], v_raw.view(b, nk, hd))
+
     def test_decode_attn(self):
         """Batched decode attention vs reference: uniform b=1, b=4 with a
         shared position, and b=4 with per-row positions."""
