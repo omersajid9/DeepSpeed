@@ -1160,7 +1160,21 @@ class TestAmpereGlueReferences:
         for B, Hk, dk, ratio in ((32, 8, 128, 2), (4, 16, 128, 2), (64, 4, 64, 4)):
             q = _rand_bf16(B, 1, Hk, dk)
             k = _rand_bf16(B, 1, Hk, dk)
-            qo, ko = _op().repeat_qk(q, k, ratio)
-            qr, kr = ref_repeat_qk(q, k, ratio)
+            v = _rand_bf16(B, 1, Hk * ratio, dk)
+            qo, ko, vo = _op().repeat_qk(q, k, v, ratio)
+            qr, kr, vr = ref_repeat_qk(q, k, v, ratio)
             torch.testing.assert_close(qo.float(), qr.float(), atol=0, rtol=0)
             torch.testing.assert_close(ko.float(), kr.float(), atol=0, rtol=0)
+            torch.testing.assert_close(vo.float(), vr.float(), atol=0, rtol=0)
+        # Decode layout: q/k/v are head slices of the wider fused qkv row, so
+        # the batch stride is wide (the kernel must index through strides).
+        wide = _rand_bf16(4, 1, 8, 128)
+        q = wide[:, :, 0:2, :]
+        k = wide[:, :, 2:4, :]
+        v = wide[:, :, 4:8, :]
+        qo, ko, vo = _op().repeat_qk(q, k, v, 2)
+        qr, kr, vr = ref_repeat_qk(q, k, v, 2)
+        torch.testing.assert_close(qo.float(), qr.float(), atol=0, rtol=0)
+        torch.testing.assert_close(ko.float(), kr.float(), atol=0, rtol=0)
+        torch.testing.assert_close(vo.float(), vr.float(), atol=0, rtol=0)
+        assert qo.is_contiguous() and ko.is_contiguous() and vo.is_contiguous()

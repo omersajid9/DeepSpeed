@@ -220,9 +220,11 @@ def silu_mul(gu, n):
     return (g / (1.0 + torch.exp(-g)) * u).to(gu.dtype)
 
 
-def repeat_qk(q, k, ratio):
-    """Head-repeat for the GDN scan's v-head layout: out[...,hv,:] = in[...,hv/ratio,:]."""
-    return q.repeat_interleave(ratio, dim=-2), k.repeat_interleave(ratio, dim=-2)
+def repeat_qk(q, k, v, ratio):
+    """Head-repeat for the GDN scan's v-head layout: out[...,hv,:] = in[...,hv/ratio,:].
+
+    v (already hv heads) is returned dense (a strided source is repacked)."""
+    return q.repeat_interleave(ratio, dim=-2), k.repeat_interleave(ratio, dim=-2), v.contiguous()
 
 
 def gated_norm(x, z, weight, eps=1e-5):

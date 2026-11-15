@@ -428,9 +428,14 @@ def _fused_gdn_forward(self, hidden_states, *args, **kwargs):
         g = -a_log_l.float().exp() * F.softplus(a.float() + dt_l)
     if num_v_heads // num_k_heads > 1:
         rep_op = getattr(self, "_ki_gdn_op", None)
+        # q/k/v are head slices of the wider fused qkv row, so they carry a
+        # wide batch stride; repeat_qk indexes through the strides and hands
+        # the scan three dense tensors in one launch (no repeat_interleave,
+        # no value repack).
         if (rep_op is not None and hasattr(rep_op, "repeat_qk") and not torch.is_grad_enabled()
-                and query.dtype is torch.bfloat16 and query.is_contiguous() and key.is_contiguous()):
-            query, key = rep_op.repeat_qk(query, key, num_v_heads // num_k_heads)
+                and query.dtype is torch.bfloat16 and key.dtype is torch.bfloat16 and value.dtype is torch.bfloat16
+                and query.stride(3) == 1 and key.stride(3) == 1 and value.stride(3) == 1):
+            query, key, value = rep_op.repeat_qk(query, key, value, num_v_heads // num_k_heads)
         else:
             query = query.repeat_interleave(num_v_heads // num_k_heads, dim=2)
             key = key.repeat_interleave(num_v_heads // num_k_heads, dim=2)
