@@ -904,8 +904,8 @@ def _decode_attn_forward(self,
     num_q_heads, num_kv_heads, head_dim = self._ki_num_q_heads, self._ki_num_kv_heads, self.head_dim
     batch = hidden_states.shape[0]
     out = torch.empty(batch, num_q_heads, head_dim, dtype=hidden_states.dtype, device=hidden_states.device)
-    fuse_q = getattr(self, "_ki_q_norm_w", None) is not None
-    fuse_k = fuse_q and getattr(self, "_ki_k_norm_w", None) is not None
+    fuse_q = getattr(self, "_ki_q_norm_fused", False)
+    fuse_k = fuse_q and getattr(self, "_ki_k_norm_fused", False)
     if fuse_k:
         # The kernel norms + ropes K and writes both K/V cache slots itself;
         # skip the eager k_norm, rope helper, and cache update. Cache tensors
@@ -940,13 +940,15 @@ def _decode_attn_forward(self,
             num_kv_heads,
             head_dim,
             key_states.shape[2],
-            q_norm_w=self._ki_q_norm_w,
+            # Norm scales are rebuilt from the live Parameters each forward so
+            # replays track in-place weight updates (no install-time snapshot).
+            q_norm_w=((1.0 + self.q_norm.weight.detach().float()).contiguous() if fuse_q else None),
             cos_t=self._ki_cos_t,
             sin_t=self._ki_sin_t,
             gate=gate,
             k_raw=(k_flat.reshape(batch, num_kv_heads, head_dim) if fuse_k else key_states.new_empty(0)),
             v_raw=(v_flat.reshape(batch, num_kv_heads, head_dim) if fuse_k else key_states.new_empty(0)),
-            k_norm_w=(self._ki_k_norm_w if fuse_k else key_states.new_empty(0)),
+            k_norm_w=((1.0 + self.k_norm.weight.detach().float()).contiguous() if fuse_k else key_states.new_empty(0)),
             eps=self.q_norm.eps,
             rope_dim=self._ki_cos_t.shape[-1])
     else:
@@ -1052,13 +1054,14 @@ def install_decode_attention(model: torch.nn.Module,
             continue
         if getattr(module, "_ki_orig_attn_forward", None) is None:
             module._ki_orig_attn_forward = module.forward
-        # Fused q-side preprocessing inputs: the (1+w) norm scale and the
-        # full-length RoPE tables (indexable by the GPU-resident position,
-        # so replays stay graph-safe). Missing tables disable the fusion.
-        module._ki_q_norm_w = (1.0 +
-                               module.q_norm.weight.detach().float()).contiguous() if cos_table is not None else None
-        module._ki_k_norm_w = (1.0 +
-                               module.k_norm.weight.detach().float()).contiguous() if cos_table is not None else None
+        # Fused q-side preprocessing: the (1+w) norm scale is rebuilt from the
+        # live Parameters on every forward (the captured graph replays that
+        # rebuild, so in-place weight updates are tracked); only the fuse flag
+        # and the full-length RoPE tables (indexable by the GPU-resident
+        # position, so replays stay graph-safe) are cached. Missing tables
+        # disable the fusion.
+        module._ki_q_norm_fused = cos_table is not None
+        module._ki_k_norm_fused = cos_table is not None
         module._ki_cos_t = cos_table
         module._ki_sin_t = sin_table
         module._ki_attn_op = kernel_op
