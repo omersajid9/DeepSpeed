@@ -1237,9 +1237,17 @@ class HybridEngineRollout(RolloutEngine):
                 decode_logits_all = self._run_bucket(module, cache, bucket, state.static_cache_position,
                                                      bucket.write_positions, fi_positions)
                 self._profile_end(profile, "decode_forward_ms", decode_start, count="num_decode_forwards")
-                decode_logits = torch.cat(
-                    [decode_logits_all[slot_by_request[request_id], -1, :].unsqueeze(0) for request_id in decode_ids],
-                    dim=0)
+                # Steady state: the decoding requests own the bucket rows in
+                # slot order (no row has finished), so the rows are already
+                # laid out per request and the gather is a pure view. When a
+                # row has finished and the slots are ragged, one indexed copy
+                # replaces the per-row cat.
+                slots = [slot_by_request[request_id] for request_id in decode_ids]
+                if slots == list(range(len(slots))):
+                    decode_logits = decode_logits_all[:len(slots), -1, :]
+                else:
+                    rows = torch.tensor(slots, dtype=torch.long, device=decode_logits_all.device)
+                    decode_logits = decode_logits_all[rows, -1, :]
                 decoded, decoded_logprobs = self._continuous_next_tokens(
                     decode_logits,
                     decode_ids,
