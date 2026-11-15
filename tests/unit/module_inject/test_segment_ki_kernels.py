@@ -27,6 +27,7 @@ from deepspeed.accelerator import get_accelerator
 
 from deepspeed.module_inject.kernel_reference import decode_attn as ref_decode_attn
 from deepspeed.module_inject.kernel_reference import fused_add_norm as ref_add_norm
+from deepspeed.module_inject.kernel_reference import fused_rmsnorm as ref_rmsnorm
 from deepspeed.module_inject.kernel_reference import gdn_gates as ref_gdn_gates
 from deepspeed.module_inject.kernel_reference import gated_norm as ref_gated_norm
 from deepspeed.module_inject.kernel_reference import grouped_linear as ref_grouped_linear
@@ -275,6 +276,14 @@ class TestKernelReferenceConsistency:
             torch.testing.assert_close(out.float(), ref_out.float(), atol=5e-2, rtol=5e-2)
             # hidden is updated in place to the pre-norm sum, every row
             torch.testing.assert_close(h_kernel.float(), (h.float() + r.float()), atol=5e-2, rtol=5e-2)
+
+    def test_fused_rmsnorm(self):
+        for rows in (1, 4):  # the kernel is one-block-per-row
+            x = _rand_bf16(rows, 128)
+            w = _rand_bf16(128)
+            out = _op().fused_rmsnorm(x, w, 1e-5)
+            ref_out = ref_rmsnorm(x, w, eps=1e-5)
+            torch.testing.assert_close(out.float(), ref_out.float(), atol=5e-2, rtol=5e-2)
 
     def test_decode_attn(self):
         """Batched decode attention vs reference: uniform b=1, b=4 with a

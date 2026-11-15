@@ -237,3 +237,10 @@ def fused_add_norm(hidden, residual, weight, eps=1e-5):
     combined = hidden.float() + residual.float()
     rms = torch.rsqrt(combined.pow(2).mean(dim=-1, keepdim=True) + eps)
     return (combined * rms * weight.float()).to(hidden.dtype)
+
+
+def fused_rmsnorm(x, weight, eps=1e-5):
+    """Zero-centered RMSNorm: rms(x) * (1 + weight)."""
+    xf = x.float()
+    rms = torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + eps)
+    return (xf * rms * (1.0 + weight.float())).to(x.dtype)

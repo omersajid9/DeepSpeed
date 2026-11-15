@@ -1205,6 +1205,74 @@ at::Tensor fused_add_norm(at::Tensor hidden, at::Tensor residual, at::Tensor wei
     return out;
 }
 
+// Zero-centered RMSNorm for the pre-attention input norm:
+// out = rms(x) * (1 + w). The +1 is applied in-register — the norm's weight
+// is zero-centered (initialized to 0), and materializing 1+w host-side costs
+// an extra launch per call; inside a captured graph the captured add would
+// also read stale memory if the weight is updated later.
+__global__ void fused_rmsnorm_kernel(const __nv_bfloat16* __restrict__ x,
+                                     const __nv_bfloat16* __restrict__ weight,
+                                     __nv_bfloat16* __restrict__ out,
+                                     float eps,
+                                     int dim)
+{
+    extern __shared__ float s_data[];
+    __shared__ float s_reduce[32];
+
+    int tid = threadIdx.x;
+    int n_threads = blockDim.x;
+    const long row = blockIdx.x;
+    const __nv_bfloat16* xr = x + row * dim;
+    __nv_bfloat16* orow = out + row * dim;
+
+    float local_ss = 0.0f;
+    for (int i = tid; i < dim; i += n_threads) {
+        float v = __bfloat162float(xr[i]);
+        s_data[i] = v;
+        local_ss += v * v;
+    }
+    for (int offset = 16; offset > 0; offset >>= 1)
+        local_ss += __shfl_down_sync(0xffffffff, local_ss, offset);
+    int warp_id = tid >> 5;
+    if ((tid & 31) == 0) s_reduce[warp_id] = local_ss;
+    __syncthreads();
+    if (warp_id == 0) {
+        float v = (tid < (n_threads >> 5)) ? s_reduce[tid] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1)
+            v += __shfl_down_sync(0xffffffff, v, offset);
+        if (tid == 0) s_reduce[0] = rsqrtf(v / dim + eps);
+    }
+    __syncthreads();
+    float rms = s_reduce[0];
+    for (int i = tid; i < dim; i += n_threads)
+        orow[i] = __float2bfloat16_rn(s_data[i] * rms * (1.0f + __bfloat162float(weight[i])));
+}
+
+at::Tensor fused_rmsnorm(at::Tensor x, at::Tensor weight, double eps)
+{
+    TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::ScalarType::BFloat16,
+                "x must be CUDA bf16");
+    TORCH_CHECK(x.is_contiguous() && weight.is_contiguous(), "inputs must be contiguous");
+    int64_t rows = x.numel() / x.size(-1);
+    int dim = (int)x.size(-1);
+    TORCH_CHECK(weight.numel() == dim, "weight size mismatch");
+    TORCH_CHECK((int64_t)dim * sizeof(float) <= 48 * 1024,
+                "dim too large for one-block shared memory: ",
+                dim);
+    auto out = at::empty_like(x);
+    auto stream = at::cuda::getCurrentCUDAStream();
+    int threads = std::min(1024, ((dim + 31) / 32) * 32);
+    if (threads == 0) threads = 32;
+    fused_rmsnorm_kernel<<<(int)rows, threads, (size_t)dim * sizeof(float), stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(weight.data_ptr<at::BFloat16>()),
+        reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()),
+        (float)eps,
+        dim);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
+
 // ─── Triple-weight QKV GEMV (b=1 decode) ───
 // Reads q_proj/k_proj/v_proj weights directly — no concat, no weight copies
 // (gradient-safe). One warp per output row across all three
@@ -2241,6 +2309,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("fused_add_norm",
           &fused_add_norm,
           "fused residual add + RMSNorm, in-place residual update (CUDA)");
+    m.def("fused_rmsnorm", &fused_rmsnorm, "fused zero-centered RMSNorm (CUDA)");
     m.def(
         "gated_norm",
         [](at::Tensor x, at::Tensor z, at::Tensor w, at::Tensor out, double eps) {

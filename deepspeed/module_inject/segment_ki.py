@@ -1214,13 +1214,12 @@ def _fused_norm_layer_forward(self,
                               past_key_values=None,
                               **kwargs):
     """Replacement forward for decoder layers at b=1, seq_len=1: the
-    post-attention residual-add + RMSNorm pair runs through the
-    fused_add_norm kernel (one launch updates the residual stream in-place
-    and produces the normalized MLP input) instead of two launches. The
-    pre-attention norm stays native — the HF layer normifies the raw hidden
-    state there, with no add to fuse — and the final post-MLP add stays a
-    plain add for the same reason. Attention and MLP are called unchanged,
-    so attention-level patches (decode_attn / grouped_linear) still apply."""
+    pre-attention RMSNorm and the post-attention residual-add + RMSNorm pair
+    each run as one kernel launch instead of HF's unfused elementwise chains.
+    fused_add_norm updates the residual stream in-place and produces the
+    normalized MLP input in a single launch. Attention and MLP are called
+    unchanged, so attention-level patches (decode_attn / grouped_linear)
+    still apply."""
     if (hidden_states.shape[1] > 1 or hidden_states.dtype is not torch.bfloat16 or not hidden_states.is_contiguous()
             or getattr(self, "_ki_norm_op", None) is None or torch.is_grad_enabled()):
         # Prefill, a non-graph path, or any grad-enabled
@@ -1233,7 +1232,13 @@ def _fused_norm_layer_forward(self,
 
     op = self._ki_norm_op
     residual = hidden_states
-    hidden_states = self.input_layernorm(hidden_states)
+    # Zero-centered RMSNorm (Qwen3.5 style: rms(x) * (1 + weight)) as one
+    # launch; the +1 is applied in-kernel and the live weight is read each
+    # replay, so post-training updates are reflected.
+    if hasattr(op, "fused_rmsnorm"):
+        hidden_states = op.fused_rmsnorm(hidden_states, self.input_layernorm.weight, self.input_layernorm.eps)
+    else:
+        hidden_states = self.input_layernorm(hidden_states)
 
     if self.block_type == "linear_attention":
         hidden_states = self.linear_attn(
