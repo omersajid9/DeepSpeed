@@ -2239,8 +2239,14 @@ class _ReplayedForward:
 def _replaying_graph_accelerator(mock_get_accelerator, captures):
     """Accelerator mock whose replays run the forward again, recording every capture."""
 
-    def fake_capture(module, cache, static_input, static_attention, static_write_positions, static_cache_position,
-                     static_position_ids, logits_kwargs=None):
+    def fake_capture(module,
+                     cache,
+                     static_input,
+                     static_attention,
+                     static_write_positions,
+                     static_cache_position,
+                     static_position_ids,
+                     logits_kwargs=None):
         graph = _ReplayedForward(module, cache, static_input, static_attention, static_write_positions,
                                  static_cache_position, static_position_ids, logits_kwargs or {})
         captures.append(graph)

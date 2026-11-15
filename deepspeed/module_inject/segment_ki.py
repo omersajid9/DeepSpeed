@@ -824,6 +824,118 @@ def apply_segment_ki(model: torch.nn.Module) -> dict:
 # ─── Custom b=1 decode attention: replace SDPA in full-attention layers ───
 
 
+def _ki_project_decode_qkv(module, hidden_states, input_shape):
+    """Decode-step projection shared by the fused decode-attention kernels.
+
+    Returns ``(query_states, gate, k_flat, v_flat)``: query/gate are views of
+    the 2x-wide query|gate projection ([b, heads, head_dim] each), k/v are
+    flat [b, kv_heads * head_dim]. All four are pre-norm and pre-RoPE — the
+    fused kernels replay HF's per-head norms, RoPE and cache write
+    themselves."""
+    batch = hidden_states.shape[0]
+    qkv_op = getattr(module, "_ki_qkv_op", None)
+    # b=1: flat GEMV; 1 < b <= 32: grouped WMMA (both via grouped_linear);
+    # larger batches use the projections as-is. Every branch yields the raw
+    # (pre-norm, pre-RoPE) flat K/V so the fused-K path can hand them to the
+    # kernel.
+    if qkv_op is not None and hasattr(qkv_op, "grouped_linear"):
+        # single dispatcher entry; the backend routes by batch internally.
+        # The projections are static across the rollout — cache the
+        # concatenated weight so one wide GEMM replaces three skinny ones.
+        cw = getattr(module, "_ki_attn_cat_w", None)
+        if cw is None or cw[0] is not module.q_proj.weight:
+            cw = (module.q_proj.weight, torch.cat([module.q_proj.weight, module.k_proj.weight, module.v_proj.weight]))
+            module._ki_attn_cat_w = cw
+        fused = qkv_op.grouped_linear(hidden_states.reshape(-1, hidden_states.shape[-1]), [cw[1]], False)[0]
+        if fused.dim() == 1:
+            fused = fused.view(1, -1)  # flat GEMV path returns [N] for M=1
+        qn, kn = module.q_proj.weight.shape[0], module.k_proj.weight.shape[0]
+        # decode_attn needs contiguous k/v; the tiny materialization (B*k_dims
+        # bf16) is far cheaper than the two extra GEMM launches it replaces
+        q_out = fused[:, :qn]
+        k_flat = fused[:, qn:qn + kn].contiguous()
+        v_flat = fused[:, qn + kn:].contiguous()
+        query_states, gate = torch.chunk(q_out.reshape(*input_shape, -1, module.head_dim * 2), 2, dim=-1)
+    elif qkv_op is not None and batch == 1:
+        # One GEMV launch over q/k/v weights directly — replaces the
+        # three separate F.linear launches. q_proj keeps its 2x-wide
+        # query|gate layout, so the gate split below is unchanged from HF.
+        q_out, k_flat, v_flat = qkv_op.grouped_linear(
+            hidden_states.view(-1), [module.q_proj.weight, module.k_proj.weight, module.v_proj.weight], False)
+        query_states, gate = torch.chunk(q_out.view(*input_shape, -1, module.head_dim * 2), 2, dim=-1)
+    elif qkv_op is not None:
+        q_out, k_flat, v_flat = qkv_op.grouped_linear(hidden_states.reshape(
+            -1, hidden_states.shape[-1]), [module.q_proj.weight, module.k_proj.weight, module.v_proj.weight], False)
+        query_states, gate = torch.chunk(q_out.view(*input_shape, -1, module.head_dim * 2), 2, dim=-1)
+    else:
+        query_states, gate = torch.chunk(module.q_proj(hidden_states).view(*input_shape, -1, module.head_dim * 2),
+                                         2,
+                                         dim=-1)
+        k_flat = module.k_proj(hidden_states).reshape(batch, -1)
+        v_flat = module.v_proj(hidden_states).reshape(batch, -1)
+    return query_states, gate, k_flat, v_flat
+
+
+def _paged_decode_attn_forward(self,
+                               hidden_states,
+                               position_embeddings=None,
+                               attention_mask=None,
+                               past_key_values=None,
+                               **kwargs):
+    """Fused decode attention over a paged (block-table) KV cache.
+
+    Same kernel body as the static-cache path — fused q-side norm/partial
+    RoPE, fused K norm/RoPE/cache write, split-KV softmax, sigmoid output
+    gate — but the K/V rows are resolved through the row's block table, and
+    the KV store lands in the block pool the paged cache addresses. Prefill
+    (q_len > 1), recording windows, padded prompts and any missing kernel
+    support fall back to the native paged forward, which replays HF attention
+    over the block table."""
+    cache = past_key_values
+    op = getattr(self, "_ki_attn_op", None)
+    if (hidden_states.shape[1] > 1 or hidden_states.dtype is not torch.bfloat16 or not hidden_states.is_contiguous()
+            or op is None or not hasattr(op, "decode_attn_paged") or getattr(self, "_ki_cos_t", None) is None
+            or getattr(self, "_ki_prompt_padded", False) or getattr(cache, "_record_past", False)
+            or getattr(cache, "_write_position", None) is not getattr(self, "_ki_write_pos", None)):
+        return self._ki_orig_attn_forward(hidden_states, position_embeddings, attention_mask, past_key_values,
+                                          **kwargs)
+
+    input_shape = hidden_states.shape[:-1]
+    batch = hidden_states.shape[0]
+    num_q_heads, num_kv_heads, head_dim = self._ki_num_q_heads, self._ki_num_kv_heads, self.head_dim
+    query_states, gate, k_flat, v_flat = _ki_project_decode_qkv(self, hidden_states, input_shape)
+    # The pool views alias the storage the block table addresses, so the
+    # kernel's fused K/V store lands on the current position's slots.
+    slot = cache._kv_slot(self.layer_idx)
+    keys = cache._key_views[slot].view(-1, num_kv_heads * head_dim)
+    values = cache._value_views[slot].view(-1, num_kv_heads * head_dim)
+    out = torch.empty(batch, num_q_heads, head_dim, dtype=hidden_states.dtype, device=hidden_states.device)
+    op.decode_attn_paged(query_states.reshape(batch, num_q_heads, head_dim),
+                         keys,
+                         values,
+                         cache.block_ids,
+                         self._ki_write_pos,
+                         out,
+                         num_q_heads,
+                         num_kv_heads,
+                         head_dim,
+                         self._ki_cos_t.shape[0],
+                         cache.block_size,
+                         q_norm_w=(1.0 + self.q_norm.weight.detach().float()).contiguous(),
+                         cos_t=self._ki_cos_t,
+                         sin_t=self._ki_sin_t,
+                         gate=gate.reshape(batch, num_q_heads, head_dim),
+                         k_raw=k_flat.reshape(batch, num_kv_heads, head_dim),
+                         v_raw=v_flat.reshape(batch, num_kv_heads, head_dim),
+                         k_norm_w=(1.0 + self.k_norm.weight.detach().float()).contiguous(),
+                         eps=self.q_norm.eps,
+                         rope_dim=self._ki_cos_t.shape[-1],
+                         kv_start=getattr(self, "_ki_kv_start", None),
+                         rope_pos=getattr(self, "_ki_rope_pos", None))
+    cache.note_step_written()
+    return self.o_proj(out.view(*input_shape, -1)), None
+
+
 def _decode_attn_forward(self,
                          hidden_states,
                          position_embeddings=None,
@@ -841,6 +953,11 @@ def _decode_attn_forward(self,
     The kernel reads the valid KV length from the same GPU-resident
     write_pos tensor the cache update writes through, keeping the whole
     step CUDA-graph replayable."""
+    if getattr(past_key_values, "is_paged_cache", False):
+        # Paged caches address K/V through a block table, so they take the
+        # paged variant of the same fused kernel.
+        return _paged_decode_attn_forward(self, hidden_states, position_embeddings, attention_mask, past_key_values,
+                                          **kwargs)
     if (hidden_states.shape[1] > 1 or hidden_states.dtype is not torch.bfloat16 or not hidden_states.is_contiguous()
             or past_key_values is None or getattr(self, "_ki_attn_op", None) is None
             or getattr(self, "_ki_prompt_padded", False)
@@ -856,50 +973,7 @@ def _decode_attn_forward(self,
     input_shape = hidden_states.shape[:-1]
     hidden_shape = (*input_shape, -1, self.head_dim)
 
-    # b=1: flat GEMV; 1 < b <= 32: grouped WMMA (both via grouped_linear)
-    # grouped kernel (same weights, one launch); larger batches use the
-    # projections as-is.
-    batch = hidden_states.shape[0]
-    qkv_op = getattr(self, "_ki_qkv_op", None)
-    # every branch yields the raw (pre-norm, pre-rope) flat K/V so the
-    # fused-K path can hand them to the kernel
-    if qkv_op is not None and hasattr(qkv_op, "grouped_linear"):
-        # single dispatcher entry; the backend routes by batch internally.
-        # The projections are static across the rollout — cache the
-        # concatenated weight so one wide GEMM replaces three skinny ones.
-        cw = getattr(self, "_ki_attn_cat_w", None)
-        if cw is None or cw[0] is not self.q_proj.weight:
-            cw = (self.q_proj.weight, torch.cat([self.q_proj.weight, self.k_proj.weight, self.v_proj.weight]))
-            self._ki_attn_cat_w = cw
-        fused = qkv_op.grouped_linear(hidden_states.reshape(-1, hidden_states.shape[-1]), [cw[1]], False)[0]
-        if fused.dim() == 1:
-            fused = fused.view(1, -1)  # flat GEMV path returns [N] for M=1
-        qn, kn = self.q_proj.weight.shape[0], self.k_proj.weight.shape[0]
-        # decode_attn needs contiguous k/v; the tiny materialization (B*k_dims
-        # bf16) is far cheaper than the two extra GEMM launches it replaces
-        q_out = fused[:, :qn]
-        k_flat = fused[:, qn:qn + kn].contiguous()
-        v_flat = fused[:, qn + kn:].contiguous()
-        query_states, gate = torch.chunk(q_out.reshape(*input_shape, -1, self.head_dim * 2), 2, dim=-1)
-    elif qkv_op is not None and batch == 1:
-        # One GEMV launch over q/k/v weights directly — replaces the
-        # three separate F.linear launches. q_proj keeps its 2x-wide
-        # query|gate layout, so the gate split below is unchanged from HF.
-        q_out, k_flat, v_flat = qkv_op.grouped_linear(hidden_states.view(-1),
-                                                      [self.q_proj.weight, self.k_proj.weight, self.v_proj.weight],
-                                                      False)
-        query_states, gate = torch.chunk(q_out.view(*input_shape, -1, self.head_dim * 2), 2, dim=-1)
-    elif qkv_op is not None:
-        q_out, k_flat, v_flat = qkv_op.grouped_linear(hidden_states.reshape(-1, hidden_states.shape[-1]),
-                                                      [self.q_proj.weight, self.k_proj.weight, self.v_proj.weight],
-                                                      False)
-        query_states, gate = torch.chunk(q_out.view(*input_shape, -1, self.head_dim * 2), 2, dim=-1)
-    else:
-        query_states, gate = torch.chunk(self.q_proj(hidden_states).view(*input_shape, -1, self.head_dim * 2),
-                                         2,
-                                         dim=-1)
-        k_flat = self.k_proj(hidden_states).reshape(batch, -1)
-        v_flat = self.v_proj(hidden_states).reshape(batch, -1)
+    query_states, gate, k_flat, v_flat = _ki_project_decode_qkv(self, hidden_states, input_shape)
 
     num_q_heads, num_kv_heads, head_dim = self._ki_num_q_heads, self._ki_num_kv_heads, self.head_dim
     batch = hidden_states.shape[0]
@@ -950,7 +1024,9 @@ def _decode_attn_forward(self,
             v_raw=(v_flat.reshape(batch, num_kv_heads, head_dim) if fuse_k else key_states.new_empty(0)),
             k_norm_w=((1.0 + self.k_norm.weight.detach().float()).contiguous() if fuse_k else key_states.new_empty(0)),
             eps=self.q_norm.eps,
-            rope_dim=self._ki_cos_t.shape[-1])
+            rope_dim=self._ki_cos_t.shape[-1],
+            kv_start=getattr(self, "_ki_kv_start", None),
+            rope_pos=getattr(self, "_ki_rope_pos", None))
     else:
         self._ki_attn_op.decode_attn(query_states.reshape(batch, num_q_heads, head_dim), key_states, value_states,
                                      self._ki_write_pos, out, num_q_heads, num_kv_heads, head_dim, key_states.shape[2])
@@ -964,16 +1040,22 @@ def _decode_attn_forward(self,
     return self.o_proj(attn_output), None
 
 
-def rebind_decode_write_pos(model: torch.nn.Module, write_pos: torch.Tensor) -> int:
+def rebind_decode_write_pos(model: torch.nn.Module,
+                            write_pos: torch.Tensor,
+                            kv_start: torch.Tensor | None = None,
+                            rope_pos: torch.Tensor | None = None) -> int:
     """Point every installed decode-attention layer's write-position gate at
-    ``write_pos``. Bucket caches hold slices of one static position tensor,
-    and the forward's gate compares object identity, so the slice the cache
-    writes through must also be the slice the forward reads. Returns the
-    number of layers re-bound."""
+    ``write_pos`` and its KV-window start at ``kv_start``. Bucket caches hold
+    slices of one static position tensor, and the forward's gate compares
+    object identity, so the slice the cache writes through must also be the
+    slice the forward reads; the window start rides the same slice. Returns
+    the number of layers re-bound."""
     n = 0
     for module in model.modules():
         if getattr(module, "_ki_attn_op", None) is not None:
             module._ki_write_pos = write_pos
+            module._ki_kv_start = kv_start
+            module._ki_rope_pos = rope_pos
             n += 1
     return n
 
@@ -1031,7 +1113,9 @@ def install_decode_attention(model: torch.nn.Module,
                              write_pos: torch.Tensor,
                              kernel_op,
                              cos_table: torch.Tensor = None,
-                             sin_table: torch.Tensor = None) -> int:
+                             sin_table: torch.Tensor = None,
+                             kv_start: torch.Tensor | None = None,
+                             rope_pos: torch.Tensor | None = None) -> int:
     """Patch full-attention layers to use the custom decode_attn kernel.
 
     Detection mirrors find_glu_segments: structural (q/k/v/o projections
@@ -1088,6 +1172,13 @@ def install_decode_attention(model: torch.nn.Module,
         unbiased_qkv = all(p.bias is None for p in projections[:3])
         module._ki_qkv_op = kernel_op if (hasattr(kernel_op, "grouped_linear") and unbiased_qkv) else None
         module._ki_write_pos = write_pos
+        # First valid KV column per row: dense caches hold left-padded prompts
+        # and rows that sit behind a decode front, which the kernel's scan
+        # must skip.
+        module._ki_kv_start = kv_start
+        # RoPE position per row: it equals the write column unless the prompt
+        # carries leading pad columns (then it is the logical position).
+        module._ki_rope_pos = rope_pos
         module._ki_rope = apply_rotary_pos_emb
         module._ki_num_q_heads = num_q_heads
         module._ki_num_kv_heads = num_kv_heads
