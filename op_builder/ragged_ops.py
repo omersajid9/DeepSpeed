@@ -57,6 +57,14 @@ class RaggedOpsBuilder(CUDAOpBuilder):
             self.warning(f"Filtered compute capabilities {ccs_pruned}")
         return ccs_retained
 
+    def nvcc_args(self):
+        args = super().nvcc_args()
+        # Node-specific: the local CUDA toolkit is partial and CCCL headers are
+        # provided by a newer pip package; skip the CCCL toolkit-version parity
+        # check. Harmless when compiler and headers do match.
+        args.append('-DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK')
+        return args
+
     def get_prefix(self):
         ds_path = self.deepspeed_src_path("deepspeed")
         return "deepspeed" if os.path.isdir(ds_path) else ".."

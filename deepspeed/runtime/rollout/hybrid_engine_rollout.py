@@ -183,6 +183,8 @@ class HybridEngineRolloutConfig:
     enable_paged_prefill: bool = False
     enable_prefix_reuse: bool = False
     enable_torch_compile: bool = False
+    use_flashinfer_prefill: bool = False
+    use_flashinfer_decode: bool = False
     enable_compiled_sampler: bool = False
 
 
@@ -338,6 +340,8 @@ class HybridEngineRollout(RolloutEngine):
         self.enable_paged_prefill = getattr(cfg, 'enable_paged_prefill', False) if cfg else False
         self.enable_prefix_reuse = getattr(cfg, 'enable_prefix_reuse', False) if cfg else False
         self.enable_torch_compile = getattr(cfg, 'enable_torch_compile', False) if cfg else False
+        self.use_flashinfer_prefill = getattr(cfg, 'use_flashinfer_prefill', False) if cfg else False
+        self.use_flashinfer_decode = getattr(cfg, 'use_flashinfer_decode', False) if cfg else False
         self.enable_compiled_sampler = getattr(cfg, 'enable_compiled_sampler', False) if cfg else False
         if self.enable_compiled_sampler:
             configure_compiled_sampler(True)
@@ -603,7 +607,7 @@ class HybridEngineRollout(RolloutEngine):
 
     @torch.no_grad()
     def _generate_continuous(self, request, sampling, max_batch_size):
-        """Generate independent greedy requests in an experimental continuous batch.
+        """Generate independent requests in an experimental continuous batch.
 
         Continuous batching requires one prompt row per request and one sample per prompt.
         Completed rows retire immediately and pending prompts prefill into the released rows
@@ -686,6 +690,8 @@ class HybridEngineRollout(RolloutEngine):
                 device=device,
                 dtype=model_dtype,
                 block_size=self.paged_block_size,
+                use_flashinfer_prefill=self.use_flashinfer_prefill,
+                use_flashinfer_decode=self.use_flashinfer_decode,
             )
         else:
             # Layers are sized by the first prefill because AutoTP shards KV heads per rank.
@@ -1173,25 +1179,38 @@ class HybridEngineRollout(RolloutEngine):
             # Captured replay always executes every physical row. Keep non-decoding
             # rows away from their prefetched prompt KV until they become active.
             static_write_positions.fill_(max_cache_len - 1)
+            fi_positions = {}
+            # Paged prefill stores prompts at compact columns from zero, so the row
+            # position is the write position itself and the reduce over the mask is
+            # not needed.
+            paged_compact = self.use_paged_cache and self.enable_paged_prefill
             for request_id in decode_ids:
                 slot = slot_by_request[request_id]
                 position = write_positions[request_id]
                 static_input[slot:slot + 1].copy_(next_tokens[request_id])
-                static_position_ids[slot, 0] = static_attention[slot, :position].sum()
+                if paged_compact:
+                    static_position_ids[slot, 0] = position
+                else:
+                    static_position_ids[slot, 0] = static_attention[slot, :position].sum()
                 static_attention[slot, position] = 1
                 static_write_positions[slot] = position
+                if self.use_flashinfer_decode:
+                    fi_positions[slot] = position
 
             decoded_tokens = {}
             if decode_ids:
-                self._update_static_causal_attention(static_attention, static_causal_attention)
+                # Paged decode passes a dict mask to the model, so the dense causal mask
+                # is never read; only the dense path pays for it.
+                if not self.use_paged_cache:
+                    self._update_static_causal_attention(static_attention, static_causal_attention)
                 # Only the rows that are decoding need to be covered, so the step replays the
                 # smallest captured batch that holds them instead of the whole physical batch.
                 bucket = self._decode_bucket(max(slot_by_request[request_id] for request_id in decode_ids) + 1)
                 self._capture_bucket_if_needed(module, cache, bucket, state.static_cache_position,
-                                               bucket.write_positions)
+                                               bucket.write_positions, fi_positions)
                 decode_start = self._profile_start(profile)
                 decode_logits_all = self._run_bucket(module, cache, bucket, state.static_cache_position,
-                                                     bucket.write_positions)
+                                                     bucket.write_positions, fi_positions)
                 self._profile_end(profile, "decode_forward_ms", decode_start, count="num_decode_forwards")
                 decode_logits = torch.cat(
                     [decode_logits_all[slot_by_request[request_id], -1, :].unsqueeze(0) for request_id in decode_ids],
@@ -1315,7 +1334,7 @@ class HybridEngineRollout(RolloutEngine):
     def _get_continuous_graph_state(self, module, max_batch_size, max_cache_len, device, model_dtype, cache_type):
         ladder = self._graph_capture_ladder(max_batch_size, self.graph_capture_batch_sizes)
         signature = self._continuous_graph_signature(module, max_batch_size, max_cache_len, device, model_dtype, ladder)
-        signature = signature + (self.use_paged_cache, self.paged_block_size)
+        signature = signature + (self.use_paged_cache, self.paged_block_size, self.use_flashinfer_decode)
         state = self._continuous_graph_state
         if state is None or state.signature != signature:
             # Free the stale cache and graph pool before allocating replacements.
@@ -1330,6 +1349,8 @@ class HybridEngineRollout(RolloutEngine):
                     device=device,
                     dtype=model_dtype,
                     block_size=self.paged_block_size,
+                    use_flashinfer_prefill=self.use_flashinfer_prefill,
+                    use_flashinfer_decode=self.use_flashinfer_decode,
                 )
                 cache.enable_graph_safe()
             else:
@@ -1410,11 +1431,23 @@ class HybridEngineRollout(RolloutEngine):
             state.prefill[width] = bucket
         return bucket
 
-    def _capture_bucket_if_needed(self, module, cache, bucket, cache_position, write_position):
+    def _capture_bucket_if_needed(self, module, cache, bucket, cache_position, write_position, fi_positions=None):
         """Capture a bucket the first time the loop needs it."""
         if bucket.graph is None and not bucket.disabled:
-            self._capture_bucket(module, cache, bucket, cache_position, write_position)
+            self._capture_bucket(module, cache, bucket, cache_position, write_position, fi_positions)
         return bucket
+
+    def _paged_decode_step(self, cache, fi_positions):
+        """Refresh the paged decode metadata just before the forward.
+
+        FlashInfer decode re-plans from host write positions (one small block-table
+        read, then pinned host-to-device copies before the replay); the atom path
+        recomputes the device-side atom length fields.
+        """
+        if self.use_flashinfer_decode and fi_positions is not None:
+            cache.plan_flashinfer_decode(fi_positions)
+        else:
+            cache.update_graph_atoms()
 
     @staticmethod
     def _bucket_attention_mask(cache, bucket):
@@ -1425,7 +1458,7 @@ class HybridEngineRollout(RolloutEngine):
             return {"full_attention": None, "sliding_attention": None}
         return bucket.causal_attention
 
-    def _capture_bucket(self, module, cache, bucket, cache_position, write_position):
+    def _capture_bucket(self, module, cache, bucket, cache_position, write_position, fi_positions=None):
         """Capture one bucket's forward, falling back to eager forwards if capture fails.
 
         The capture runs the model for real during its warmup, with the buffers the next
@@ -1440,7 +1473,7 @@ class HybridEngineRollout(RolloutEngine):
                 cache.set_write_position(write_position)
             attention_mask = self._bucket_attention_mask(cache, bucket)
             if is_paged:
-                cache.update_graph_atoms()
+                self._paged_decode_step(cache, fi_positions)
             bucket.graph, bucket.logits = self._capture_continuous_graph(module, cache, bucket.input_ids,
                                                                          attention_mask, write_position,
                                                                          cache_position, bucket.position_ids,
@@ -1453,13 +1486,13 @@ class HybridEngineRollout(RolloutEngine):
                 "Rollout graph capture failed for batch width %s (%s); this bucket will run eagerly "
                 "for the rest of the rollout.", bucket.width, error)
 
-    def _run_bucket(self, module, cache, bucket, cache_position, write_position):
+    def _run_bucket(self, module, cache, bucket, cache_position, write_position, fi_positions=None):
         """Replay a bucket's captured forward, or run the same buffers eagerly without a graph."""
         from deepspeed.runtime.rollout.paged_cache import PagedAttentionCache
         is_paged = isinstance(cache, PagedAttentionCache)
         attention_mask = self._bucket_attention_mask(cache, bucket)
         if is_paged:
-            cache.update_graph_atoms()
+            self._paged_decode_step(cache, fi_positions)
         if bucket.graph is not None:
             get_accelerator().replay_graph(bucket.graph)
             return bucket.logits

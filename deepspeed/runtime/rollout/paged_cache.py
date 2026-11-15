@@ -57,6 +57,8 @@ class PagedAttentionCache:
         device,
         dtype,
         block_size: Optional[int] = None,
+        use_flashinfer_prefill: bool = False,
+        use_flashinfer_decode: bool = False,
     ) -> None:
         if batch_size <= 0:
             raise ValueError("paged cache requires a positive batch size")
@@ -134,6 +136,16 @@ class PagedAttentionCache:
         self._block_hash_by_id: dict[int, bytes] = {}
         self.prefix_reuse_blocks = 0
         self.prefix_reuse_tokens = 0
+        self.use_flashinfer_prefill = use_flashinfer_prefill
+        self._flashinfer_prefill_wrapper = None
+        self._flashinfer_workspace = None
+        self.use_flashinfer_decode = use_flashinfer_decode
+        self._flashinfer_decode_wrapper = None
+        self._flashinfer_decode_workspace = None
+        self._fi_decode_indptr_host = None
+        self._fi_decode_last_page_len_host = None
+        self._fi_decode_q = None
+        self._fi_step_planned = False
 
     @property
     def layers(self) -> list[_PagedLayer]:
@@ -163,6 +175,7 @@ class PagedAttentionCache:
         self._write_positions = pos
         self._step_prepared = False
         self._step_atoms = None
+        self._fi_step_planned = False
         self._step_q_len = 1
 
     def set_active_rows(self, rows) -> None:
@@ -172,6 +185,7 @@ class PagedAttentionCache:
         self._active_rows = rows
         self._step_prepared = False
         self._step_atoms = None
+        self._fi_step_planned = False
 
     def enable_graph_safe(self) -> None:
         """Preallocate the whole block table so replay never allocates or reads host state.
@@ -190,6 +204,8 @@ class PagedAttentionCache:
             self._graph_outputs = torch.empty((self.num_layers, self.max_batch_size, self.num_q_heads * self.head_dim),
                                               dtype=self.dtype,
                                               device=self.device)
+        if self.use_flashinfer_decode:
+            self._init_flashinfer_decode_graph()
 
     def set_eager_mode(self) -> None:
         """Return to eager writes/attention after a decode graph has run."""
@@ -199,6 +215,7 @@ class PagedAttentionCache:
         self._step_prepared = False
         self._step_atoms = None
         self._step_q_len = 1
+        self._fi_step_planned = False
 
     def set_graph_mode(self, width: int) -> None:
         """Address exactly ``width`` rows from device-resident buffers for a replay step."""
@@ -222,8 +239,11 @@ class PagedAttentionCache:
         self._graph_active_rows = rows
         self._graph_atoms = atoms
         # Eager prefill may have overwritten the shared atom buffer with multi-token
-        # atoms. Restore the decode atom structure before every capture/replay.
-        self._init_graph_atom_structure()
+        # atoms. Restore the decode atom structure before every capture/replay. With
+        # FlashInfer decode the replayed decode steps never read the atom table (the
+        # multi-token paths rebuild their own atoms), so the rebuild is skipped.
+        if not (self.use_flashinfer_decode and self._graph_safe):
+            self._init_graph_atom_structure()
         self._graph_atoms = self._atoms_device[:width]
         self._active_rows = rows
         self._step_prepared = True
@@ -264,6 +284,159 @@ class PagedAttentionCache:
         atoms[:, 4:7] = 0
         atoms[:, 7] = 0
         self._atoms_device.copy_(atoms)
+
+    def _init_flashinfer_decode_graph(self) -> None:
+        """Reserve the fixed buffers the FlashInfer decode plan reads at replay time.
+
+        FlashInfer's cudagraph mode copies the page-table metadata passed to ``plan``
+        into these fixed device buffers before every replay, so the captured kernels
+        see each step's table. The table is ragged: a row claims exactly the blocks
+        holding its valid tokens, because the paged kernel reads whole pages. The
+        index buffer is separate from the live block table, whose rows stay in place
+        while the ragged prefixes are concatenated here.
+        """
+        from flashinfer import BatchDecodeWithPagedKVCacheWrapper
+
+        if self._flashinfer_decode_wrapper is not None:
+            return
+        self._flashinfer_decode_workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=self.device)
+        max_pages = self.max_batch_size * self.max_blocks_per_row
+        self._fi_decode_indptr_host = torch.zeros(self.max_batch_size + 1, dtype=torch.int32, pin_memory=True)
+        self._fi_decode_last_page_len_host = torch.ones(self.max_batch_size, dtype=torch.int32, pin_memory=True)
+        self._fi_decode_indices_host = torch.zeros(max_pages, dtype=torch.int32, pin_memory=True)
+        self._flashinfer_decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
+            self._flashinfer_decode_workspace,
+            "NHD",
+            use_cuda_graph=True,
+            use_tensor_cores=True,
+            backend="fa2",
+            paged_kv_indptr_buffer=torch.zeros(self.max_batch_size + 1, dtype=torch.int32, device=self.device),
+            paged_kv_indices_buffer=torch.zeros(max_pages, dtype=torch.int32, device=self.device),
+            paged_kv_last_page_len_buffer=torch.ones(self.max_batch_size, dtype=torch.int32, device=self.device))
+        # Padded rows attend through this query; their outputs are never read, so any
+        # finite values keep the fixed-batch kernel busy without touching live state.
+        self._fi_decode_q = torch.zeros(self.max_batch_size,
+                                        self.num_q_heads,
+                                        self.head_dim,
+                                        dtype=self.dtype,
+                                        device=self.device)
+
+    def _get_eager_flashinfer_decode_wrapper(self):
+        from flashinfer import BatchDecodeWithPagedKVCacheWrapper
+
+        if self._flashinfer_decode_wrapper is None:
+            workspace = self._flashinfer_workspace
+            if workspace is None:
+                workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=self.device)
+                self._flashinfer_workspace = workspace
+            self._flashinfer_decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(workspace,
+                                                                                 "NHD",
+                                                                                 use_cuda_graph=False,
+                                                                                 use_tensor_cores=True,
+                                                                                 backend="fa2")
+        return self._flashinfer_decode_wrapper
+
+    @staticmethod
+    def _last_page_len(position: int, block_size: int) -> int:
+        total = int(position) + 1
+        full = (total + block_size - 1) // block_size
+        return total - (full - 1) * block_size
+
+    def plan_flashinfer_decode(self, positions_by_row) -> None:
+        """Plan the FlashInfer decode step from host write positions.
+
+        ``positions_by_row`` maps the rows that decode this step to the column of the
+        token just written. The page table is ragged: a row claims exactly the blocks
+        holding its valid tokens, because the paged kernel reads whole pages and would
+        fault on blocks the row does not own. Rows that do not decode claim one valid
+        block so the fixed-batch kernel has finite work for them; their outputs are
+        never read. The graph-safe path plans from a small host copy of the block
+        table and only issues pinned host-to-device copies before the replay.
+        """
+        block_size = self.block_size
+        if self._graph_mode:
+            if self._flashinfer_decode_wrapper is None:
+                raise RuntimeError("FlashInfer decode plan needs a graph-safe cache")
+            table_host = self.block_ids.cpu()
+            indptr_host = self._fi_decode_indptr_host
+            last_page_len_host = self._fi_decode_last_page_len_host
+            indices_host = self._fi_decode_indices_host
+            offset = 0
+            for row in range(self.max_batch_size):
+                position = positions_by_row.get(row)
+                if position is None:
+                    indptr_host[row + 1] = offset + 1
+                    last_page_len_host[row] = 1
+                    indices_host[offset] = table_host[row, 0]
+                    offset += 1
+                    continue
+                total = int(position) + 1
+                pages = (total + block_size - 1) // block_size
+                indptr_host[row + 1] = offset + pages
+                last_page_len_host[row] = self._last_page_len(total - 1, block_size)
+                indices_host[offset:offset + pages].copy_(table_host[row, :pages])
+                offset += pages
+            self._flashinfer_decode_wrapper.plan(
+                indptr_host,
+                indices_host[:offset],
+                last_page_len_host,
+                self.num_q_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                self.block_size,
+                pos_encoding_mode="NONE",
+                q_data_type=self.dtype,
+                kv_data_type=self.dtype,
+                sm_scale=self._scale,
+            )
+        else:
+            rows = sorted(positions_by_row)
+            table_host = self.block_ids[torch.tensor(rows, dtype=torch.long, device=self.device)].cpu()
+            totals = [int(positions_by_row[row]) + 1 for row in rows]
+            pages_by_row = [(total + block_size - 1) // block_size for total in totals]
+            total_pages = sum(pages_by_row)
+            indptr_host = torch.zeros(len(rows) + 1, dtype=torch.int32)
+            last_page_len_host = torch.empty(len(rows), dtype=torch.int32)
+            indices_host = torch.empty(total_pages, dtype=torch.int32)
+            offset = 0
+            for local, row in enumerate(rows):
+                pages = pages_by_row[local]
+                indptr_host[local + 1] = offset + pages
+                last_page_len_host[local] = self._last_page_len(totals[local] - 1, block_size)
+                indices_host[offset:offset + pages] = table_host[local, :pages]
+                offset += pages
+            self._get_eager_flashinfer_decode_wrapper().plan(indptr_host,
+                                                             indices_host,
+                                                             last_page_len_host,
+                                                             self.num_q_heads,
+                                                             self.num_kv_heads,
+                                                             self.head_dim,
+                                                             self.block_size,
+                                                             pos_encoding_mode="NONE",
+                                                             q_data_type=self.dtype,
+                                                             kv_data_type=self.dtype,
+                                                             sm_scale=self._scale)
+        self._fi_step_planned = True
+
+    def _flashinfer_decode_attention(self, layer_idx: int, query_states: torch.Tensor, scale: float) -> torch.Tensor:
+        """Decode one token per row through FlashInfer's split-KV paged backend."""
+        if not self._fi_step_planned:
+            # No host plan was issued this step; derive one from the device state.
+            rows = self._active_rows.tolist()
+            self.plan_flashinfer_decode(dict(zip(rows, self._write_positions[rows].tolist())))
+        num_rows, num_heads, _, head_dim = query_states.shape
+        if self._graph_mode:
+            wrapper = self._flashinfer_decode_wrapper
+            self._fi_decode_q[:num_rows].copy_(query_states.squeeze(2))
+            query = self._fi_decode_q
+            output = self._graph_outputs[layer_idx].view(self.max_batch_size, num_heads, head_dim)
+        else:
+            wrapper = self._get_eager_flashinfer_decode_wrapper()
+            query = query_states.squeeze(2)
+            output = torch.empty((num_rows, num_heads, head_dim), dtype=query_states.dtype, device=query_states.device)
+        paged_kv = (self._key_views[layer_idx], self._value_views[layer_idx])
+        wrapper.run(query, paged_kv, out=output)
+        return output[:num_rows].view(num_rows, 1, num_heads * head_dim)
 
     def _ensure_blocks(self, row: int, num_tokens: int) -> None:
         needed = (num_tokens + self.block_size - 1) // self.block_size
@@ -450,14 +623,62 @@ class PagedAttentionCache:
         self._step_q_len = q_len
         return self._step_atoms
 
-    def attention(self, layer_idx: int, query_states: torch.Tensor, scale: float) -> torch.Tensor:
-        """Run blocked flash attention for one decode step.
+    def _flashinfer_prefill_attention(self, layer_idx: int, query_states: torch.Tensor, scale: float) -> torch.Tensor:
+        """Prefill a single prompt row through FlashInfer's paged-KV backend."""
+        if query_states.shape[0] != 1:
+            raise ValueError("FlashInfer prefill currently supports one active row")
+        if self._graph_mode:
+            raise RuntimeError("FlashInfer prefill cannot run inside a graph replay")
 
-        ``query_states`` is ``[rows, heads, 1, head_dim]`` for the active rows;
-        the return has the same shape. Graph replay derives the atom lengths on device and
-        writes into a preallocated output, so the replay performs no host work.
+        from flashinfer import BatchPrefillWithPagedKVCacheWrapper
+
+        if self._flashinfer_prefill_wrapper is None:
+            self._flashinfer_workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=self.device)
+            self._flashinfer_prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(self._flashinfer_workspace,
+                                                                                   "NHD",
+                                                                                   use_cuda_graph=False)
+
+        row = int(self._active_rows[0])
+        total_len = int(self.row_len[row])
+        block_count = (total_len + self.block_size - 1) // self.block_size
+        last_page_len = total_len - (block_count - 1) * self.block_size
+        if last_page_len == 0:
+            last_page_len = self.block_size
+        indices = self.block_ids[row, :block_count].to(torch.int32)
+        indptr = torch.tensor([0, block_count], dtype=torch.int32, device=self.device)
+        last_page = torch.tensor([last_page_len], dtype=torch.int32, device=self.device)
+        q = query_states.transpose(1, 2).reshape(-1, query_states.shape[1], query_states.shape[3])
+        qo_indptr = torch.tensor([0, q.shape[0]], dtype=torch.int32, device=self.device)
+        wrapper = self._flashinfer_prefill_wrapper
+        wrapper.plan(qo_indptr,
+                     indptr,
+                     indices,
+                     last_page,
+                     query_states.shape[1],
+                     self.num_kv_heads,
+                     self.head_dim,
+                     self.block_size,
+                     causal=True,
+                     sm_scale=scale,
+                     q_data_type=query_states.dtype,
+                     kv_data_type=query_states.dtype)
+        output = wrapper.run(q, (self._key_views[layer_idx], self._value_views[layer_idx]))
+        return output.view(1, q.shape[0], query_states.shape[1] * query_states.shape[3])
+
+    def attention(self, layer_idx: int, query_states: torch.Tensor, scale: float) -> torch.Tensor:
+        """Run paged attention for the active rows.
+
+        ``query_states`` is ``[rows, heads, q_len, head_dim]``; the return is
+        ``[rows, q_len, heads * head_dim]`` head-major and contiguous, so the
+        attention shim can feed ``o_proj`` without a copy. Graph replay derives the
+        atom lengths on device and writes into a preallocated output, so the replay
+        performs no host work.
         """
         num_rows, num_heads, q_len, head_dim = query_states.shape
+        if q_len > 1 and self.use_flashinfer_prefill:
+            return self._flashinfer_prefill_attention(layer_idx, query_states, scale)
+        if q_len == 1 and self.use_flashinfer_decode:
+            return self._flashinfer_decode_attention(layer_idx, query_states, scale)
         if self._graph_mode and q_len != 1:
             raise ValueError("graph replay paged attention expects one query token per row")
         if self._graph_mode:
@@ -474,7 +695,7 @@ class PagedAttentionCache:
                                  device=query_states.device)
         query = query_states.transpose(1, 2).reshape(num_rows * q_len, num_heads * head_dim)
         self._kernel(output, query, self._key_views[layer_idx], self._value_views[layer_idx], atoms, scale)
-        return output.view(num_rows, q_len, num_heads, head_dim).transpose(1, 2)
+        return output.view(num_rows, q_len, num_heads * head_dim)
 
     def materialize(self, layer_idx: int, row: int, length: Optional[int] = None) -> tuple[torch.Tensor, torch.Tensor]:
         """Gather a row's blocks into dense ``[heads, length, head_dim]`` K/V for tests."""
@@ -584,8 +805,6 @@ def _paged_qwen3_forward(
     if self.sliding_window is not None:
         raise RuntimeError("paged attention does not support sliding-window Qwen3 layers yet")
 
-    from transformers.models.qwen3.modeling_qwen3 import apply_rotary_pos_emb
-
     input_shape = hidden_states.shape[:-1]
     hidden_shape = (*input_shape, -1, self.head_dim)
     query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
@@ -593,13 +812,28 @@ def _paged_qwen3_forward(
     value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
     cos, sin = position_embeddings
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+    # Same math as transformers' apply_rotary_pos_emb without the rotate_half
+    # cat allocation: rotate_half(x) = (-x2, x1), so x*cos + rotate_half(x)*sin
+    # is (x1*cos1 - x2*sin1, x2*cos2 + x1*sin2) element-wise.
+    cos = cos.unsqueeze(1)
+    sin = sin.unsqueeze(1)
+    half = self.head_dim // 2
+    q1, q2 = query_states[..., :half], query_states[..., half:]
+    k1, k2 = key_states[..., :half], key_states[..., half:]
+    c1, c2 = cos[..., :half], cos[..., half:]
+    s1, s2 = sin[..., :half], sin[..., half:]
+    query_states = torch.empty_like(query_states)
+    key_states = torch.empty_like(key_states)
+    query_states[..., :half] = q1 * c1 - q2 * s1
+    query_states[..., half:] = q2 * c2 + q1 * s2
+    key_states[..., :half] = k1 * c1 - k2 * s1
+    key_states[..., half:] = k2 * c2 + k1 * s2
 
     past_key_values.write(self.layer_idx, key_states, value_states)
     attn_output = past_key_values.attention(self.layer_idx, query_states, self.scaling)
-    # attention() returns [rows, query, heads, head_dim]; the original forward gets
-    # [rows, query, hidden] from SDPA, so transpose before flattening the head layout.
-    attn_output = attn_output.transpose(1, 2).reshape(*input_shape, -1).contiguous()
+    # attention() returns [rows, query, heads * head_dim] head-major and contiguous,
+    # the same layout o_proj expects, so no flatten/copy is needed.
+    attn_output = attn_output.reshape(*input_shape, -1)
     attn_output = self.o_proj(attn_output)
     return attn_output, None
 
