@@ -964,6 +964,20 @@ def _decode_attn_forward(self,
     return self.o_proj(attn_output), None
 
 
+def rebind_decode_write_pos(model: torch.nn.Module, write_pos: torch.Tensor) -> int:
+    """Point every installed decode-attention layer's write-position gate at
+    ``write_pos``. Bucket caches hold slices of one static position tensor,
+    and the forward's gate compares object identity, so the slice the cache
+    writes through must also be the slice the forward reads. Returns the
+    number of layers re-bound."""
+    n = 0
+    for module in model.modules():
+        if getattr(module, "_ki_attn_op", None) is not None:
+            module._ki_write_pos = write_pos
+            n += 1
+    return n
+
+
 def install_lm_head(model: torch.nn.Module, kernel_op) -> int:
     """Route lm_head decode batches of 16..32 through the grouped kernel.
 
