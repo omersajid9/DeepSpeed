@@ -42,6 +42,9 @@ Arguments:
     --prefill-first   give the first requests the long prompts (order matters)
     --dtype           fp32 | fp16 | bf16 (default: bf16 on cuda, fp32 otherwise)
     --graph           auto | on | off capture of the decode graph (default: auto)
+    --graph-ladder    captured batch widths, e.g. 1,2,4,8 (default: powers of two up to
+                      --max-batch-size). Both the decode and the chunked-prefill forwards
+                      replay the smallest captured width that covers the live rows.
     --trials          measured repetitions per configuration, best is reported (default: 3)
     --warmup          unmeasured repetitions per configuration (default: 1)
     --layers/--hidden-size/--heads   shape of the random model
@@ -75,6 +78,7 @@ def parse_args():
     parser.add_argument("--prefill-first", action="store_true", help="give the first requests the long prompts")
     parser.add_argument("--dtype", type=str, default=None, choices=list(DTYPES))
     parser.add_argument("--graph", type=str, default="auto", choices=["auto", "on", "off"])
+    parser.add_argument("--graph-ladder", type=str, default=None)
     parser.add_argument("--layers", type=int, default=4)
     parser.add_argument("--hidden-size", type=int, default=256)
     parser.add_argument("--heads", type=int, default=4)
@@ -128,10 +132,13 @@ def build_workload(args, device, pad_token_id):
 
 
 def run_once(args, model, workload, chunk_size, graph_capture, device):
+    ladder = tuple(int(width) for width in args.graph_ladder.split(",")
+                   if width.strip()) if args.graph_ladder else None
     cfg = HybridEngineRolloutConfig(use_graph_capture=graph_capture,
                                     enable_profiling=True,
                                     enable_chunked_prefill=chunk_size is not None,
-                                    prefill_chunk_size=chunk_size or 512)
+                                    prefill_chunk_size=chunk_size or 512,
+                                    graph_capture_batch_sizes=ladder)
     rollout = HybridEngineRollout(SimpleNamespace(module=model),
                                   SimpleNamespace(pad_token_id=0, eos_token_id=None),
                                   cfg=cfg)
@@ -180,10 +187,15 @@ def summarize(name, run, args):
     prefill_forwards = profile.get("num_prefill_forwards", 0)
     decode_forwards = profile.get("num_decode_forwards", 0)
     tokens = stats.get("num_generated_tokens") or args.requests * args.max_new_tokens
+    decode_widths = ",".join(str(width) for width in sorted(stats.get("decode_bucket_widths", {})))
     return {
         "config": name,
         "chunks": stats.get("chunked_prefill_chunks", 0),
         "staging MB": stats.get("chunked_prefill_staging_bytes", 0) / 2**20,
+        "pref steps": stats.get("prefill_bucket_steps", 0),
+        "pad rows": stats.get("prefill_padded_rows", 0),
+        "caps": stats.get("graph_captures", 0),
+        "dec widths": decode_widths or "-",
         "prefill fwd": prefill_forwards,
         "prefill ms": profile.get("prefill_forward_ms", 0.0),
         "ms/fwd": profile.get("prefill_forward_ms", 0.0) / prefill_forwards if prefill_forwards else 0.0,
@@ -200,8 +212,8 @@ def summarize(name, run, args):
 def print_table(rows):
     columns = list(rows[0])
     numeric = [
-        "chunks", "staging MB", "prefill fwd", "prefill ms", "ms/fwd", "decode fwd", "decode ms", "sched ms",
-        "cache ms", "steps", "total ms", "tokens/s"
+        "chunks", "staging MB", "pref steps", "pad rows", "caps", "prefill fwd", "prefill ms", "ms/fwd", "decode fwd",
+        "decode ms", "sched ms", "cache ms", "steps", "total ms", "tokens/s"
     ]
     print("  ".join(f"{c:>12}" if c in numeric else f"{c:<16}" for c in columns))
     print("-" * (len(columns) * 15))
@@ -256,6 +268,11 @@ def main():
 
     print("generation profile:")
     print_table([summarize(name, run, args) for name, run in results.items()])
+    if graph_capture:
+        print("\nNOTE: with graph capture the forward counters and forward times only cover the captures'\n"
+              "      warmups; the replayed steps show up in total ms and tokens/s. 'caps' is how many bucket\n"
+              "      captures this rollout paid for, 'pad rows' is how many rows the ladder padded away, and\n"
+              "      'dec widths' is the set of decode buckets the loop dispatched to.")
 
 
 if __name__ == "__main__":
