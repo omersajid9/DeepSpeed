@@ -137,9 +137,10 @@ def _hybrid_engine():
 
 
 def test_continuous_generation_rejects_hybrid_models_without_state_pool_support():
-    # GDN state pools only exist in the static-cache continuous path; paged
-    # decode and chunked prefill must be rejected up front by both CB
-    # validators (the eager loop and the captured-graph loop).
+    # GDN state lives in the static cache's state pools and the paged
+    # cache's row pools. The paged path must prefill through the paged
+    # path to build the states, and must not invalidate the state/KV
+    # alignment; chunked prefill stays unsupported.
     rollout = HybridEngineRollout(_hybrid_engine(), _make_tokenizer())
     request = RolloutRequest(
         prompt_ids=torch.tensor([[0, 1, 2]]),
@@ -152,10 +153,29 @@ def test_continuous_generation_rejects_hybrid_models_without_state_pool_support(
     rollout._validate_continuous_graph_options(3, sampling)
 
     rollout.use_paged_cache = True
-    with pytest.raises(ValueError, match="paged cache does not yet support hybrid"):
+    # Without the paged prefill the GDN states never reach the pools.
+    with pytest.raises(ValueError, match="enable_paged_prefill=True"):
         rollout._validate_continuous_inputs((request, ), sampling, 1)
-    with pytest.raises(ValueError, match="paged cache does not yet support hybrid"):
+    with pytest.raises(ValueError, match="enable_paged_prefill=True"):
         rollout._validate_continuous_graph_options(3, sampling)
+
+    rollout.enable_paged_prefill = True
+    rollout._validate_continuous_inputs((request, ), sampling, 1)
+    rollout._validate_continuous_graph_options(3, sampling)
+
+    # Prefix reuse and trimming would desync the GDN state from the KV.
+    rollout.enable_prefix_reuse = True
+    with pytest.raises(ValueError, match="prefix reuse does not support hybrid"):
+        rollout._validate_continuous_inputs((request, ), sampling, 1)
+    with pytest.raises(ValueError, match="prefix reuse does not support hybrid"):
+        rollout._validate_continuous_graph_options(3, sampling)
+    rollout.enable_prefix_reuse = False
+    rollout.enable_cache_trimming = True
+    with pytest.raises(ValueError, match="cache trimming does not support hybrid"):
+        rollout._validate_continuous_inputs((request, ), sampling, 1)
+    with pytest.raises(ValueError, match="cache trimming does not support hybrid"):
+        rollout._validate_continuous_graph_options(3, sampling)
+    rollout.enable_cache_trimming = False
 
     rollout.use_paged_cache = False
     rollout.enable_chunked_prefill = True
