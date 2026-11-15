@@ -29,6 +29,8 @@ gate_proj/up_proj/down_proj.
 from dataclasses import dataclass
 from typing import List
 
+import os
+
 import torch
 import torch.nn.functional as F
 
@@ -175,6 +177,21 @@ class DualWeightGluGEMV(torch.autograd.Function):
         return grad_hidden, grad_gate_w, grad_up_w, None
 
 
+_GDN_PROJ_CONCAT = None
+
+
+def _gdn_proj_concat_enabled() -> bool:
+    """DS_SEGKI_GDN_CONCAT=1 (set from the rollout config flag): the GDN
+    input projection runs one GEMM over the cached stacked [qkv|z|b|a]
+    weight instead of four GEMMs + a concat. Off by default because the
+    single-GEMM accumulation order is not bit-exact against the
+    per-matrix reference."""
+    global _GDN_PROJ_CONCAT
+    if _GDN_PROJ_CONCAT is None:
+        _GDN_PROJ_CONCAT = os.environ.get("DS_SEGKI_GDN_CONCAT", "0") == "1"
+    return _GDN_PROJ_CONCAT
+
+
 class GDNInputProj(torch.autograd.Function):
     """GDN input projections (qkv|z|b|a) reading the four original weights.
 
@@ -186,8 +203,14 @@ class GDNInputProj(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, hidden, w_qkv, w_z, w_b, w_a, kernel_op):
+    def forward(ctx, hidden, w_qkv, w_z, w_b, w_a, kernel_op, w_cat=None):
         ctx.save_for_backward(hidden, w_qkv, w_z, w_b, w_a)
+        if w_cat is not None:
+            # One GEMM over the caller-cached stacked [qkv|z|b|a] weight
+            # (decode-only lever; numerics differ from the per-matrix
+            # composite, so it stays behind the config flag).
+            flat = hidden.reshape(hidden.shape[0], -1)
+            return flat.matmul(w_cat.t()).view(*hidden.shape[:-1], -1)
         if _native_kernel_ready(kernel_op, hidden, w_qkv, w_z, w_b, w_a):
             if hidden.dim() == 1:
                 return kernel_op.grouped_linear(hidden, [w_qkv, w_z, w_b, w_a], False)[0]
@@ -241,7 +264,7 @@ class GDNInputProj(torch.autograd.Function):
                 for g, w in ((g0, w_qkv), (g1, w_z), (g2, w_b), (g3, w_a)))
             grad_hidden = (torch.matmul(g0, w_qkv) + torch.matmul(g1, w_z) + torch.matmul(g2, w_b) +
                            torch.matmul(g3, w_a))
-        return (grad_hidden, ) + grads_w + (None, )
+        return (grad_hidden, ) + grads_w + (None, None)
 
 
 def _dual_weight_glu_forward(self, input):
@@ -362,18 +385,35 @@ def _fused_gdn_forward(self, hidden_states, *args, **kwargs):
             hidden_states.squeeze(0).squeeze(0), self.in_proj_qkv.weight, self.in_proj_z.weight, self.in_proj_b.weight,
             self.in_proj_a.weight, gdn_kernel_op).view(1, 1, -1)
     else:
+        # decode (b>1, s=1) with the flag on: one GEMM over the cached
+        # stacked [qkv|z|b|a] weight instead of four GEMMs + a concat —
+        # the Ampere grouped-WMMA threshold is 1, so without this the
+        # small-batch projection rides the aten composite.
+        w_cat = None
+        if _gdn_proj_concat_enabled() and seq_len == 1:
+            cached = getattr(self, "_ki_gdn_cat_w", None)
+            if cached is None:
+                cached = torch.cat((self.in_proj_qkv.weight, self.in_proj_z.weight,
+                                    self.in_proj_b.weight, self.in_proj_a.weight), dim=0)
+                self._ki_gdn_cat_w = cached
+            w_cat = cached
         fused = GDNInputProj.apply(hidden_states, self.in_proj_qkv.weight, self.in_proj_z.weight,
-                                   self.in_proj_b.weight, self.in_proj_a.weight, gdn_kernel_op)
+                                   self.in_proj_b.weight, self.in_proj_a.weight, gdn_kernel_op, w_cat)
     qkv_end = key_dim * 2 + value_dim
     z_end = qkv_end + value_dim
     b_end = z_end + num_v_heads
-    # One explicit repack of the qkv slice into the [b, conv_dim, s] layout
-    # conv1d consumes; handing FLA a non-contiguous view triggers a slower
-    # multi-op internal path (measured as ~40 extra launches per layer).
-    # varlen keeps the transposed view: the conv package only accepts
-    # seq_idx with the native memory format.
+    # Decode: the conv update indexes through x's strides, so the
+    # wide-batch-stride qkv view goes in directly (measured bit-exact at
+    # 1.00x on a strided source) and the repack copy is skipped. Prefill
+    # keeps the explicit repack: the chunked conv fn has a slower
+    # multi-op internal path on non-contiguous views (measured as ~40
+    # extra launches per layer). varlen keeps the transposed view: the
+    # conv package only accepts seq_idx with the native memory format.
     qkv_view = fused[..., :qkv_end].transpose(1, 2)
-    mixed_qkv = qkv_view if kwargs.get("seq_idx") is not None else qkv_view.contiguous()
+    if kwargs.get("seq_idx") is not None or seq_len == 1:
+        mixed_qkv = qkv_view
+    else:
+        mixed_qkv = qkv_view.contiguous()
     z = fused[..., qkv_end:z_end].reshape(batch_size, seq_len, -1, self.head_v_dim)
     b = fused[..., z_end:b_end]
     a = fused[..., b_end:]
@@ -755,7 +795,8 @@ def segki_refresh(model: torch.nn.Module) -> None:
     """
     op = None
     for module in model.modules():
-        for attr in ("_ki_tp_cat_w", "_ki_attn_cat_w", "_ki_conv_w_local", "_ki_gates_cache"):
+        for attr in ("_ki_tp_cat_w", "_ki_attn_cat_w", "_ki_conv_w_local", "_ki_gates_cache",
+                     "_ki_gdn_cat_w"):
             if hasattr(module, attr):
                 delattr(module, attr)
                 op = op if op is not None else getattr(module, "_ki_gdn_op", None)

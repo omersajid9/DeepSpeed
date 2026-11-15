@@ -23,6 +23,7 @@ Generation paths:
 """
 
 import hashlib
+import os
 import time
 from copy import copy
 from dataclasses import dataclass, field
@@ -171,6 +172,11 @@ class HybridEngineRolloutConfig:
     # construction. Fuses comm-free projection+activation segments into
     # single GEMM+custom-kernel calls (MLP gate|up and GDN input projections).
     use_segki: bool = False
+    # GDN input projection: cache the stacked [qkv|z|b|a] weight per layer
+    # and run one GEMM instead of four GEMMs + a concat (the Ampere
+    # grouped-WMMA threshold is 1, so small-batch decode otherwise rides
+    # the aten composite). Changes numerics — off by default.
+    gdn_proj_concat: bool = False
     align_decode_fronts: bool = False
     enable_cache_trimming: bool = False
     continuous_cache_capacity: Optional[int] = None
@@ -376,6 +382,8 @@ class HybridEngineRollout(RolloutEngine):
             )
 
         self.use_segki = cfg is not None and getattr(cfg, 'use_segki', False)
+        if self.use_segki and getattr(cfg, 'gdn_proj_concat', False):
+            os.environ["DS_SEGKI_GDN_CONCAT"] = "1"
         if self.use_segki:
             self._segki_report = self._apply_segki()
         else:
@@ -953,6 +961,8 @@ class HybridEngineRollout(RolloutEngine):
 
             next_tokens = decoded_tokens | admitted_tokens
             finished_ids = []
+            eos_hits = self._batch_eos_check([r for r in update.active_ids if next_tokens.get(r) is not None],
+                                             next_tokens)
             for request_id in update.active_ids:
                 token = next_tokens.get(request_id)
                 if token is None:
@@ -961,7 +971,7 @@ class HybridEngineRollout(RolloutEngine):
                 responses[request_id].append(token)
                 if response_logprobs is not None:
                     response_logprobs[request_id].append(next_logprobs.pop(request_id))
-                if self._is_eos(token):
+                if request_id in eos_hits:
                     finished_ids.append(request_id)
 
             if decodable_ids:
@@ -1258,6 +1268,8 @@ class HybridEngineRollout(RolloutEngine):
                 next_tokens.update(decoded_tokens)
 
             finished_ids = []
+            eos_hits = self._batch_eos_check([r for r in update.active_ids if next_tokens.get(r) is not None],
+                                             next_tokens)
             for request_id in update.active_ids:
                 token = next_tokens.get(request_id)
                 if token is None:
@@ -1267,7 +1279,7 @@ class HybridEngineRollout(RolloutEngine):
                 responses[request_id].append(token)
                 if response_logprobs is not None:
                     response_logprobs[request_id].append(next_logprobs.pop(request_id))
-                if self._is_eos(token):
+                if request_id in eos_hits:
                     finished_ids.append(request_id)
 
             scheduler_start = self._profile_start(profile)
@@ -2711,6 +2723,19 @@ class HybridEngineRollout(RolloutEngine):
     def _prefill_position_ids(attention_mask):
         position_ids = attention_mask.long().cumsum(dim=-1) - 1
         return position_ids.masked_fill(attention_mask == 0, 1)
+
+    def _batch_eos_check(self, ids, tokens):
+        """Batched EOS test over one step's rows: a single device read in
+        the common all-clear case; per-row reads only when at least one
+        row actually hit. Returns the request ids that hit."""
+        eos_token_id = self.tokenizer.eos_token_id
+        if eos_token_id is None or not ids:
+            return set()
+        stacked = torch.cat([tokens[r] for r in ids], dim=0)
+        eos_ids = torch.as_tensor(eos_token_id, dtype=stacked.dtype, device=stacked.device).flatten()
+        if not bool((stacked == eos_ids).any().item()):
+            return set()
+        return {r for r, t in zip(ids, stacked.split(1, dim=0)) if bool((t == eos_ids).any().item())}
 
     def _is_eos(self, token):
         eos_token_id = self.tokenizer.eos_token_id
