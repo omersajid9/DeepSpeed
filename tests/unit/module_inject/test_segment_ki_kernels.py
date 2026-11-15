@@ -679,6 +679,38 @@ class TestInjectionInvariants:
             exp = unfused(x)
         torch.testing.assert_close(got.float(), exp.float(), atol=5e-2, rtol=5e-2)
 
+    def test_install_norm_modules(self):
+        """install_norm_modules patches the q/k norms and the final 'norm',
+        skips the GDN gated norm (no .eps), matches the HF formula at
+        decode shapes, and falls back to the original forward at prefill
+        width (seq_len > 1)."""
+        from deepspeed.module_inject.segment_ki import install_norm_modules
+        torch.manual_seed(0)
+        parent = torch.nn.Module()
+        parent.q_norm = _MiniQKNorm(256)
+        parent.k_norm = _MiniQKNorm(256)
+        parent.norm = _MiniQKNorm(32)
+        gdn = torch.nn.Module()
+        gdn.norm = torch.nn.Module()
+        gdn.norm.weight = torch.nn.Parameter(torch.ones(8, dtype=torch.bfloat16))
+        gdn.norm.variance_epsilon = 1e-5  # RMSNormGated surface: no .eps
+        parent.gdn = gdn
+        assert install_norm_modules(parent, _CPUFusedAddNormOp()) == 3
+        assert not hasattr(gdn.norm, "_ki_norm_op")
+
+        x = torch.randn(4, 1, 16, 256, dtype=torch.bfloat16)
+        with torch.no_grad():
+            got = parent.q_norm(x)
+            exp = parent.q_norm._ki_orig_norm_forward(x)
+        torch.testing.assert_close(got.float(), exp.float(), atol=5e-2, rtol=5e-2)
+
+        # prefill width: the patched forward must run the original forward
+        long_x = torch.randn(4, 8, 16, 256, dtype=torch.bfloat16)
+        with torch.no_grad():
+            got_long = parent.q_norm(long_x)
+            exp_long = parent.q_norm._ki_orig_norm_forward(long_x)
+        assert torch.equal(got_long, exp_long)
+
     def test_decode_attn_norms_track_live_parameters(self):
         """The fused decode-attention forward must hand the kernel the live
         1+q_norm/k_norm scale on every call. install_decode_attention used to
