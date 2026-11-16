@@ -1,0 +1,59 @@
+{
+  "scope": "Standalone port verification; no new end-to-end model accuracy or performance run.",
+  "gpu": "NVIDIA B300 SXM6 AC",
+  "visible_devices": "0",
+  "environment": {
+    "torch": "2.15.0+cu132",
+    "gpu": "NVIDIA B300 SXM6 AC",
+    "capability": [
+      10,
+      3
+    ],
+    "seed": 271828,
+    "method": "CUDA graph 64 calls; 7 repeats; same GPU sequentially"
+  },
+  "commands_passed": [
+    "python experiment.py",
+    "STATE_DTYPE=bf16 python experiment.py",
+    "STATE_DTYPE=bf16 MATCH_FLA=1 python stress_and_streaming.py"
+  ],
+  "checks": {
+    "correctness.json": {
+      "recorded_cases": 75,
+      "groups": {
+        "norm": 40,
+        "gdn": 10,
+        "gdn_triton": 20,
+        "gdn_existing_oracle": 5
+      }
+    },
+    "correctness_bf16.json": {
+      "recorded_cases": 35,
+      "groups": {
+        "gdn": 10,
+        "gdn_triton": 20,
+        "gdn_existing_oracle": 5
+      }
+    },
+    "long_recurrence_bf16_match.json": {
+      "recorded_cases": 15,
+      "groups": {
+        "cuda4": 5,
+        "triton32": 5,
+        "triton64": 5
+      }
+    }
+  },
+  "cuda_computation_unchanged_after_formatting_and_identifier_rename": true,
+  "triton_ast_unchanged_after_identifier_rename": true,
+  "corrected_baseline_diff_sha256_unchanged": "21d93b491b66f50aa34e68e0a0ca076444106ceb4c5a2ed6a7f0b6e48a355d2b",
+  "source_sha256": {
+    "experiment.py": "cf504f018a1be2a9847a1c8b7c2027f8423cb0f616cb2fa7c11140088e2660cb",
+    "kernels.cu": "eabc67234eb7d9f994e64b946783b6c6627a4c10b2851ef06f06bfe07f71a9bb",
+    "packed_triton.py": "a6bda2f594fd080e6145984d051884c4b0f079c770222edb4170ea066215dc49",
+    "run_candidate.py": "aee36fdf7e9528cd5bc24147bdd71ebfd1016103df363725cf110ecefe637953",
+    "stress_and_streaming.py": "572e1c841de0df2c50c92d624d8a9712a44a1677290dc06d85be9b7c8d7261a2"
+  },
+  "raw_results": "/fsx/mosajid/tmp/gdn-kernel-port-validation",
+  "a100_h200_runtime_tested": false
+}

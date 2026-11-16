@@ -1,0 +1,12 @@
+{
+  "compiled_sm": [
+    80,
+    86,
+    90,
+    103
+  ],
+  "runtime_tested_sm": [
+    103
+  ],
+  "source_sha256": "848be96af3ee40eb1c2ab73bd716f1334d27a7f260e64844cff14603a00549e0"
+}

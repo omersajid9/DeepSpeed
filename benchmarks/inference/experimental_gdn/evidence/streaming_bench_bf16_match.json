@@ -1,0 +1,74 @@
+[
+  {
+    "batch": 2,
+    "variant": "existing_chain",
+    "state_dtype": "torch.bfloat16",
+    "state_bytes": 50331648,
+    "median_us": 6.534666443864505,
+    "min_us": 6.501999994119008,
+    "max_us": 6.565333033601443
+  },
+  {
+    "batch": 2,
+    "variant": "cuda4",
+    "state_dtype": "torch.bfloat16",
+    "state_bytes": 50331648,
+    "median_us": 3.13533345858256,
+    "min_us": 3.124666710694631,
+    "max_us": 3.1746666257580123
+  },
+  {
+    "batch": 2,
+    "variant": "triton32",
+    "state_dtype": "torch.bfloat16",
+    "state_bytes": 50331648,
+    "median_us": 2.775333200891813,
+    "min_us": 2.766666623453299,
+    "max_us": 2.7886666357517242
+  },
+  {
+    "batch": 2,
+    "variant": "triton64",
+    "state_dtype": "torch.bfloat16",
+    "state_bytes": 50331648,
+    "median_us": 2.4733333848416805,
+    "min_us": 2.455333403001229,
+    "max_us": 2.488000007967154
+  },
+  {
+    "batch": 32,
+    "variant": "existing_chain",
+    "state_dtype": "torch.bfloat16",
+    "state_bytes": 805306368,
+    "median_us": 33.343332509199776,
+    "min_us": 33.29333414634069,
+    "max_us": 33.37800006071726
+  },
+  {
+    "batch": 32,
+    "variant": "cuda4",
+    "state_dtype": "torch.bfloat16",
+    "state_bytes": 805306368,
+    "median_us": 23.272665838400524,
+    "min_us": 23.229333261648815,
+    "max_us": 23.31800013780594
+  },
+  {
+    "batch": 32,
+    "variant": "triton32",
+    "state_dtype": "torch.bfloat16",
+    "state_bytes": 805306368,
+    "median_us": 18.23600009083748,
+    "min_us": 18.218666315078735,
+    "max_us": 18.266666680574417
+  },
+  {
+    "batch": 32,
+    "variant": "triton64",
+    "state_dtype": "torch.bfloat16",
+    "state_bytes": 805306368,
+    "median_us": 16.708667079607647,
+    "min_us": 16.682667036851246,
+    "max_us": 16.747333109378815
+  }
+]

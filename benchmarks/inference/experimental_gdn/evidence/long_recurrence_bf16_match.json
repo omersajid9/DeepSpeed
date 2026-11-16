@@ -1,0 +1,212 @@
+[
+  {
+    "step": 1,
+    "variant": "cuda4",
+    "output": {
+      "relative_l2": 0.001665276528967772,
+      "max_abs": 0.00012153290844471587,
+      "finite": true
+    },
+    "state": {
+      "relative_l2": 1.5956222386234132e-07,
+      "max_abs": 1.52587890625e-05,
+      "finite": true
+    }
+  },
+  {
+    "step": 1,
+    "variant": "triton32",
+    "output": {
+      "relative_l2": 0.001665276528967772,
+      "max_abs": 0.00012153290844471587,
+      "finite": true
+    },
+    "state": {
+      "relative_l2": 8.274574475839656e-06,
+      "max_abs": 0.00048828125,
+      "finite": true
+    }
+  },
+  {
+    "step": 1,
+    "variant": "triton64",
+    "output": {
+      "relative_l2": 0.001665276528967772,
+      "max_abs": 0.00012153290844471587,
+      "finite": true
+    },
+    "state": {
+      "relative_l2": 8.274574475839656e-06,
+      "max_abs": 0.00048828125,
+      "finite": true
+    }
+  },
+  {
+    "step": 32,
+    "variant": "cuda4",
+    "output": {
+      "relative_l2": 0.001658259160334259,
+      "max_abs": 0.00012045588364355958,
+      "finite": true
+    },
+    "state": {
+      "relative_l2": 2.6133528859485044e-06,
+      "max_abs": 0.000244140625,
+      "finite": true
+    }
+  },
+  {
+    "step": 32,
+    "variant": "triton32",
+    "output": {
+      "relative_l2": 0.0016582591601103176,
+      "max_abs": 0.00012045588364355958,
+      "finite": true
+    },
+    "state": {
+      "relative_l2": 6.934505744094445e-08,
+      "max_abs": 6.67572021484375e-06,
+      "finite": true
+    }
+  },
+  {
+    "step": 32,
+    "variant": "triton64",
+    "output": {
+      "relative_l2": 0.001658259183249298,
+      "max_abs": 0.00012045588364355958,
+      "finite": true
+    },
+    "state": {
+      "relative_l2": 6.934505744094445e-08,
+      "max_abs": 6.67572021484375e-06,
+      "finite": true
+    }
+  },
+  {
+    "step": 128,
+    "variant": "cuda4",
+    "output": {
+      "relative_l2": 0.0016640855009359091,
+      "max_abs": 0.00012056467268058146,
+      "finite": true
+    },
+    "state": {
+      "relative_l2": 9.178175510854548e-05,
+      "max_abs": 0.00390625,
+      "finite": true
+    }
+  },
+  {
+    "step": 128,
+    "variant": "triton32",
+    "output": {
+      "relative_l2": 0.0016608338657618427,
+      "max_abs": 0.00012056467268058146,
+      "finite": true
+    },
+    "state": {
+      "relative_l2": 7.305483436082438e-05,
+      "max_abs": 0.001953125,
+      "finite": true
+    }
+  },
+  {
+    "step": 128,
+    "variant": "triton64",
+    "output": {
+      "relative_l2": 0.0016608338657618427,
+      "max_abs": 0.00012056467268058146,
+      "finite": true
+    },
+    "state": {
+      "relative_l2": 7.30522010810331e-05,
+      "max_abs": 0.001953125,
+      "finite": true
+    }
+  },
+  {
+    "step": 512,
+    "variant": "cuda4",
+    "output": {
+      "relative_l2": 0.0020175272014784306,
+      "max_abs": 0.0007174171441021102,
+      "finite": true
+    },
+    "state": {
+      "relative_l2": 0.0007591145479317301,
+      "max_abs": 0.01953125,
+      "finite": true
+    }
+  },
+  {
+    "step": 512,
+    "variant": "triton32",
+    "output": {
+      "relative_l2": 0.001867393697888795,
+      "max_abs": 0.0003966637354669948,
+      "finite": true
+    },
+    "state": {
+      "relative_l2": 0.0009091190760395262,
+      "max_abs": 0.01953125,
+      "finite": true
+    }
+  },
+  {
+    "step": 512,
+    "variant": "triton64",
+    "output": {
+      "relative_l2": 0.0018745891499269566,
+      "max_abs": 0.0003966637354669948,
+      "finite": true
+    },
+    "state": {
+      "relative_l2": 0.0009377156259711397,
+      "max_abs": 0.01953125,
+      "finite": true
+    }
+  },
+  {
+    "step": 1024,
+    "variant": "cuda4",
+    "output": {
+      "relative_l2": 0.0021040028190268747,
+      "max_abs": 0.00047239632118629277,
+      "finite": true
+    },
+    "state": {
+      "relative_l2": 0.001781603134879186,
+      "max_abs": 0.0234375,
+      "finite": true
+    }
+  },
+  {
+    "step": 1024,
+    "variant": "triton32",
+    "output": {
+      "relative_l2": 0.00223669269017327,
+      "max_abs": 0.0006211800586890387,
+      "finite": true
+    },
+    "state": {
+      "relative_l2": 0.0019603840948871722,
+      "max_abs": 0.029296875,
+      "finite": true
+    }
+  },
+  {
+    "step": 1024,
+    "variant": "triton64",
+    "output": {
+      "relative_l2": 0.002259790100243896,
+      "max_abs": 0.0006211800586890387,
+      "finite": true
+    },
+    "state": {
+      "relative_l2": 0.0019767405480401305,
+      "max_abs": 0.029296875,
+      "finite": true
+    }
+  }
+]
