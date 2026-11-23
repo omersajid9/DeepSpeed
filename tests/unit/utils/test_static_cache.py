@@ -111,6 +111,22 @@ def test_static_layer_rejects_a_chunk_that_runs_past_the_cache():
         layer.update(keys, keys)
 
 
+def test_static_layer_advances_past_the_previous_write_without_a_position():
+    """A cache handed to ``generate()`` keeps appending instead of rewriting column zero."""
+    layer = DeepSpeedStaticLayer(max_cache_len=6)
+    chunk = torch.arange(4, dtype=torch.float32).reshape(1, 1, 4, 1)
+    token = torch.tensor([[[[9.0]]]])
+
+    layer.update(chunk, chunk)
+    assert layer.get_query_offset() == 4
+    assert layer.get_seq_length() == 4
+
+    layer.update(token, token)
+    assert layer.get_query_offset() == 5
+    assert layer.get_seq_length() == 5
+    assert layer.keys[0, 0, :6, 0].tolist() == [0.0, 1.0, 2.0, 3.0, 9.0, 0.0]
+
+
 def test_static_layer_per_row_positions_support_graph_replay():
     accelerator = get_accelerator()
     graph = accelerator.create_graph()
@@ -268,3 +284,26 @@ def test_static_cache_memory_skips_layers_without_kv():
 
     # Only layer 0 holds KV: 4 rows x 3 heads x 4 positions x (5 key + 7 value dims) x 2 bytes.
     assert cache.memory_bytes() == 4 * 3 * 4 * (5 + 7) * 2
+
+
+@pytest.mark.parametrize("per_row_decode", [False, True])
+def test_static_layer_accepts_values_in_a_different_dtype_than_keys(per_row_decode):
+    # Under autocast, rotary embeddings promote bf16 key projections to fp32 while the value
+    # projections stay bf16, so one update carries keys and values of different dtypes (#9102).
+    layer = DeepSpeedStaticLayer(max_cache_len=4)
+    seq_len = 1 if per_row_decode else 3
+    keys = torch.randn((2, 1, seq_len, 2), dtype=torch.float32)
+    values = torch.randn((2, 1, seq_len, 2), dtype=torch.bfloat16)
+    if per_row_decode:
+        layer.lazy_initialization(keys, values)
+        layer.set_write_position(torch.tensor([0, 2]))
+
+    cached_keys, cached_values = layer.update(keys, values)
+
+    assert cached_values.dtype == torch.float32
+    if per_row_decode:
+        written = cached_values[torch.arange(2), :, torch.tensor([0, 2]), :]
+        assert torch.equal(written, values[:, :, 0, :].float())
+    else:
+        assert torch.equal(cached_values[:, :, :seq_len, :], values.float())
+        assert torch.equal(cached_keys[:, :, :seq_len, :], keys)

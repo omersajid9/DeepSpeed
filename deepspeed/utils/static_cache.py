@@ -26,7 +26,9 @@ before each replay. ``pos`` may be a scalar (the existing fixed-batch behavior)
 or one position per cache row for continuous batching. Per-row positions cover
 both decode (one token per row) and chunked prefill (a chunk per row, written at
 ``[position_i, position_i + chunk)``), so rows can sit at different columns of
-their own prompts.
+their own prompts. Without an external position the layer advances
+the same cumulative length Transformers' ``StaticCache`` tracks, so a cache
+handed to ``generate()`` keeps appending tokens instead of rewriting column zero.
 """
 
 import torch
@@ -52,6 +54,9 @@ class DeepSpeedStaticLayer:
         self.values: torch.Tensor | None = None
         self.is_initialized = False
         self._write_position: torch.Tensor | None = None
+        # Transformers' own length counter: used when the caller drives no write positions,
+        # e.g. a prefill cache handed to ``generate()`` that keeps appending tokens.
+        self._cumulative_length = 0
 
     def set_write_position(self, pos: torch.Tensor):
         if not isinstance(pos, torch.Tensor) or pos.dim() not in (0, 1):
@@ -97,6 +102,10 @@ class DeepSpeedStaticLayer:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if not self.is_initialized:
             self.lazy_initialization(key_states, value_states)
+        # Under autocast, keys and values can arrive in different dtypes: rotary embeddings
+        # promote bf16 key projections to fp32 while value projections stay bf16.
+        key_states = key_states.to(self.dtype)
+        value_states = value_states.to(self.dtype)
 
         kv_length = key_states.shape[-2]
 
@@ -125,7 +134,8 @@ class DeepSpeedStaticLayer:
         if self._write_position is not None:
             cache_position = torch.arange(kv_length, device=self.device) + self._write_position
         else:
-            cache_position = torch.arange(kv_length, device=self.device)
+            cache_position = torch.arange(kv_length, device=self.device) + self._cumulative_length
+            self._cumulative_length += kv_length
 
         try:
             self.keys.index_copy_(2, cache_position, key_states)
@@ -145,7 +155,7 @@ class DeepSpeedStaticLayer:
     def get_query_offset(self) -> int | torch.Tensor:
         # Mask construction precedes the current KV write, unlike get_seq_length().
         if self._write_position is None:
-            return 0
+            return self._cumulative_length
         return self._write_position
 
     def get_seq_length(self) -> int | torch.Tensor:
@@ -160,7 +170,7 @@ class DeepSpeedStaticLayer:
             return 0
         if self._write_position is not None:
             return self._write_position + 1
-        return 0
+        return self._cumulative_length
 
     def get_max_cache_shape(self) -> int:
         return self.max_cache_len

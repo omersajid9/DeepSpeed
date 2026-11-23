@@ -1825,8 +1825,8 @@ class HybridEngineRollout(RolloutEngine):
                 batched_slots.append(target_slot)
                 continue
             prompt_attention = torch.ones_like(prompt_ids)
-            staging_cache = self._create_static_cache(static_cache_type, module.config, prompt_ids.shape[0],
-                                                      prompt_len, device, model_dtype)
+            staging_cache = self._create_prefill_cache(static_cache_type, module.config, prompt_ids.shape[0],
+                                                       prompt_len, device, model_dtype)
             prefill_chunks[request_id] = _PrefillChunk(slot=target_slot,
                                                        cache=staging_cache,
                                                        prompt_ids=prompt_ids,
@@ -2094,8 +2094,8 @@ class HybridEngineRollout(RolloutEngine):
         if max_cache_len is None:
             max_cache_len = prompt_len
         position_ids = self._prefill_position_ids(prompt_attention)
-        prefill_cache = self._create_static_cache(static_cache_type, module.config, prompt_ids.shape[0], max_cache_len,
-                                                  device, model_dtype)
+        prefill_cache = self._create_prefill_cache(static_cache_type, module.config, prompt_ids.shape[0],
+                                                   max_cache_len, device, model_dtype)
         output = None
         for start in range(0, prompt_len, chunk_size):
             end = min(prompt_len, start + chunk_size)
@@ -2217,8 +2217,8 @@ class HybridEngineRollout(RolloutEngine):
             logits = prefill_output.logits[-1]
         else:
             prompt_len = prompt_ids.shape[1]
-            prefill_cache = self._create_static_cache(static_cache_type, module.config, prompt_ids.shape[0],
-                                                      prompt_len, device, model_dtype)
+            prefill_cache = self._create_prefill_cache(static_cache_type, module.config, prompt_ids.shape[0],
+                                                       prompt_len, device, model_dtype)
             prefill_output = self._call_model(
                 module,
                 prompt_ids,
@@ -2335,6 +2335,27 @@ class HybridEngineRollout(RolloutEngine):
         if not accepts_kwargs:
             kwargs = {name: value for name, value in kwargs.items() if name in parameters}
         return module(input_ids, **kwargs)
+
+    @classmethod
+    def _create_prefill_cache(cls, static_cache_type, config, batch_size, max_cache_len, device, dtype):
+        """Cache for a single prefill forward whose KV is then copied into the decode cache.
+
+        Under autocast, keys and values can come out in different dtypes (rotary embeddings promote
+        bf16 key projections to fp32), which HF StaticCache rejects. DeepSpeedStaticCache accepts them,
+        but models every layer as full attention, so sliding-window and linear-attention models keep
+        HF StaticCache.
+        """
+        text_config = getattr(config, "text_config", config)
+        layer_types = getattr(text_config, "layer_types", None) or []
+        full_attention_only = (getattr(text_config, "sliding_window", None) is None
+                               and all(layer_type == "full_attention" for layer_type in layer_types))
+        if not full_attention_only:
+            return cls._create_static_cache(static_cache_type, config, batch_size, max_cache_len, device, dtype)
+
+        from deepspeed.utils.static_cache import DeepSpeedStaticCache
+
+        # Sized lazily from the prefill keys, as AutoTP shards KV heads.
+        return DeepSpeedStaticCache(config, max_cache_len=max_cache_len)
 
     @staticmethod
     def _create_static_cache(static_cache_type, config, batch_size, max_cache_len, device, dtype):
@@ -2607,7 +2628,7 @@ class HybridEngineRollout(RolloutEngine):
                                                         prompt_attn)
             return select_next_tokens(logits)
 
-        # --- Prefill with HF StaticCache (correct attention semantics) ---
+        # --- Prefill with a static cache (correct attention semantics) ---
         # Hybrid models take a per-type mask dict (GDN must see None; a 2D
         # mask corrupts its conv-state init); standard models take a tensor.
         is_hybrid = "linear_attention" in (getattr(getattr(module.config, "text_config", module.config), "layer_types",
@@ -2621,8 +2642,8 @@ class HybridEngineRollout(RolloutEngine):
                                                                       model_dtype, device, self.prefill_chunk_size)
             next_token = next_tokens(first_logits)
         else:
-            prefill_cache = self._create_static_cache(StaticCache, module.config, batch_size, max_len, device,
-                                                      model_dtype)
+            prefill_cache = self._create_prefill_cache(StaticCache, module.config, batch_size, max_len, device,
+                                                       model_dtype)
             prefill_out = module(
                 prompt_ids,
                 attention_mask=prefill_mask,
