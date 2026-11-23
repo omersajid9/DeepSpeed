@@ -130,6 +130,36 @@ single-GPU (batch-size 1 gets a fully fused decode step inside the captured
 graph; larger batches keep batched argmax in Python). Fused projections are
 never applied to layers carrying tensor-parallel collectives.
 
+Chunked prefill (experimental)
+-------------------------------
+
+``HybridEngineRolloutConfig(enable_chunked_prefill=True,
+prefill_chunk_size=512)`` stages a prompt whose effective length exceeds the
+chunk size in a private cache and advances it by at most ``prefill_chunk_size``
+tokens per forward, so rows that are already decoding keep producing tokens
+while a long prompt fills. Staging is decided on real tokens, so a batch padded
+to a wide common width does not stage prompts that are actually short, and a
+staged request holds its slot without spending its generation budget until its
+prompt is complete. The option is disabled by default, cannot be combined with
+aligned decode fronts or adaptive prefill, and a sampling rollout logs a warning
+and prefills in a single forward. Its cost is one staging cache per prompt being
+filled, sized to that prompt's effective length.
+
+The greedy routes of every generation path stage prompts: the eager and
+captured-graph continuous batches, the captured-graph static path (which stages
+before capture and decodes from the filled cache), and the plain
+``model.generate()`` path (which is handed a cache that already holds the
+prompt). On the captured continuous path the chunk forward is captured too:
+staged prompts advance in waves of ``prefill_chunk_size`` tokens, and each wave
+replays the smallest captured batch width that covers the staged rows, so a
+long prompt costs one narrow prefill replay per step instead of blocking the
+batch.
+
+``get_last_continuous_stats()`` on the continuous paths reports
+``chunked_prefill_chunks`` and ``chunked_prefill_staging_bytes`` when staging
+ran, plus ``prefill_bucket_steps``, ``prefill_padded_rows`` and
+``prefill_bucket_widths`` for the captured chunk forwards.
+
 Continuous batching (experimental)
 -----------------------------------
 
@@ -260,7 +290,7 @@ other budgets and recalibrate when the deployment configuration changes.
 
 ``prefill_max_tokens=65536`` limits padded token positions in each Forward;
 set it to ``None`` to remove this planning limit. A single prompt above the
-configured limit raises an error; this does not implement chunked prefill.
+configured limit raises an error unless chunked prefill stages it.
 Long prompts also need a model position limit covering the prompt and generation
 budget, sufficient static KV capacity, and enough temporary Forward memory.
 The token limit does not bound allocated Decode KV memory; reduce the configured

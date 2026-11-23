@@ -83,6 +83,34 @@ def test_scheduler_rejects_invalid_transitions():
         scheduler.schedule(finished_ids=("missing", ))
 
 
+def test_scheduler_prefilling_request_holds_its_generation_budget():
+    scheduler = ContinuousBatchScheduler(max_batch_size=2, max_new_tokens=2)
+    scheduler.submit(_request("staged"))
+    scheduler.submit(_request("decoding"))
+    scheduler.schedule()
+
+    # A request whose prompt is still being prefilled produces no token, so the
+    # step must not spend its budget.
+    update = scheduler.advance(prefilling_ids=("staged", ))
+    assert update.active_ids == ("staged", "decoding")
+    assert update.retired == ()
+
+    update = scheduler.advance()
+    assert update.retired == ("decoding", )
+
+    update = scheduler.advance()
+    assert update.retired == ("staged", )
+
+
+def test_scheduler_rejects_prefilling_request_that_is_not_active():
+    scheduler = ContinuousBatchScheduler(max_batch_size=1, max_new_tokens=3)
+    scheduler.submit(_request("a"))
+    scheduler.schedule()
+
+    with pytest.raises(ValueError, match="prefilling request is not active"):
+        scheduler.advance(prefilling_ids=("missing", ))
+
+
 @pytest.mark.parametrize("lengths,max_tokens", [([4, 1, 16, 4], None), ([2, 8, 3, 7, 1], 16)])
 def test_prefill_buckets_match_exhaustive_partition_cost(lengths, max_tokens):
 

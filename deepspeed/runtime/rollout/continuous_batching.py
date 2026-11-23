@@ -115,19 +115,32 @@ class ContinuousBatchScheduler:
             self._known_ids.discard(request_id)
         return ContinuousBatchUpdate(tuple(request for request, _ in survivors), keep_slots, retired, tuple(admitted))
 
-    def advance(self, finished_ids=()) -> ContinuousBatchUpdate:
+    def advance(self, finished_ids=(), prefilling_ids=()) -> ContinuousBatchUpdate:
+        """Represent one decode step for every generating request.
+
+        ``prefilling_ids`` names active requests that hold a slot but have not produced
+        a token yet, because their prompt is still being prefilled in chunks. They stay
+        active but do not spend their generation budget on a step that generated nothing.
+        Callers that prefill each prompt in a single forward pass pass no prefilling ids
+        and get the previous behaviour exactly.
+        """
         explicit_finished = set(finished_ids)
+        prefilling = set(prefilling_ids)
         active_ids = {request.request_id for request, _ in self._active}
         unknown = explicit_finished - active_ids
         if unknown:
             raise ValueError(f"finished request is not active: {next(iter(unknown))!r}")
+        unknown_prefilling = prefilling - active_ids
+        if unknown_prefilling:
+            raise ValueError(f"prefilling request is not active: {next(iter(unknown_prefilling))!r}")
         finished = set(explicit_finished)
         updated = []
         for request, generated in self._active:
-            generated += 1
-            self._generated[request.request_id] = generated
-            if generated >= self.max_new_tokens:
-                finished.add(request.request_id)
+            if request.request_id not in prefilling:
+                generated += 1
+                self._generated[request.request_id] = generated
+                if generated >= self.max_new_tokens:
+                    finished.add(request.request_id)
             updated.append((request, generated))
         self._active = updated
         return self.schedule(finished)
